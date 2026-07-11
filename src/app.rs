@@ -94,6 +94,45 @@ struct BenchState {
     frames_drawn: u32,
 }
 
+/// 起動直後 1 回だけ実行するウィンドウの微小リサイズ(白画面ワークアラウンド)。
+///
+/// eframe 0.35 のネイティブ(glow)バックエンドは「ウィンドウを非表示で
+/// 作成 → 初回フレームを描画 → `set_visible(true)` → swap_buffers」という
+/// 順序で起動時の白フラッシュを避けている(eframe
+/// `glow_integration.rs` の `with_visible(false)` と
+/// `EpiIntegration::post_rendering` 参照)。ところが Windows + NVIDIA 環境
+/// ではこの「表示直後の初回 present」が DWM のウィンドウ合成準備と競合
+/// することがあり、負けると DWM が初期状態の真っ白なサーフェスを保持した
+/// まま以後の present を一切反映しなくなる(タイトルバーは正常・プロセスは
+/// アイドルで健在・クライアント領域だけ真っ白)。この状態は追加の再描画・
+/// `InvalidateRect`・`SetForegroundWindow` では直らず、**ウィンドウの
+/// リサイズ(DWM がウィンドウサーフェスを作り直す操作)でのみ回復する**
+/// ことを実機の計装で確認済み。発生はタイミング依存(間欠的)。
+///
+/// そこで起動から約 300ms 後(初回フレームの提示とウィンドウ表示が確実に
+/// 完了した後)に内寸を +1pt → 100ms 後に元へ戻す、という 1 往復だけの
+/// リサイズを送って DWM にサーフェスを確実に作り直させる。ユーザーには
+/// 右端が 1〜2 物理ピクセルだけ一瞬伸縮するだけで、実質知覚されない。
+///
+/// 再描画ポリシー(ARCHITECTURE.md §3: 無条件 `request_repaint()` 禁止)に
+/// ついて: 本ワークアラウンドが要求する追加フレームは起動後最初の約 400ms
+/// 間の高々 2〜3 回のみで、`Done` に達した後は一切何もしない(恒久ループ
+/// なし・アイドル CPU 0% 要件は不変)。
+enum StartupNudge {
+    /// 期限が来たら +1pt のリサイズを送る。
+    Pending { deadline: Instant },
+    /// +1pt を送った。期限が来たら元の内寸 `size`(ポイント)へ戻す。
+    Restore { deadline: Instant, size: egui::Vec2 },
+    /// 完了(以後は何もしない)。
+    Done,
+}
+
+/// 起動からリサイズ実行までの待ち時間。初回フレーム提示より確実に後に
+/// なるよう十分長く、かつ起動体感を損なわない値。
+const STARTUP_NUDGE_DELAY: Duration = Duration::from_millis(300);
+/// +1pt してから元寸法へ戻すまでの待ち時間。
+const STARTUP_NUDGE_RESTORE_DELAY: Duration = Duration::from_millis(100);
+
 /// 選択ツールの進行中ドラッグ(ARCHITECTURE.md §7)。`Selection`/`Floating`
 /// 自体は複数フレームにまたがって保持する必要があるため `DaraskApp` の
 /// フィールドとして直接持つ(ARCHITECTURE.md §10 の状態機械どおり)が、
@@ -233,6 +272,13 @@ pub struct DaraskApp {
     /// ドキュメントを新規作成/読み込みし直すたびに 1 にリセットする。
     next_layer_number: u32,
 
+    /// 起動時白画面(DWM 合成の競合)ワークアラウンドの状態。
+    /// `StartupNudge` のドキュメントコメント参照。
+    startup_nudge: StartupNudge,
+    /// 直近フレームの `screen_rect`(ウィンドウ内寸変化の検出用。
+    /// `ui()` 冒頭の「追加提示」ワークアラウンドのコメント参照)。
+    last_screen_rect: egui::Rect,
+
     bench: Option<BenchState>,
 }
 
@@ -312,13 +358,62 @@ impl DaraskApp {
             toast: None,
             layer_rename: None,
             next_layer_number: 1,
+            // ベンチモードは 2 フレームで自動終了する決定的なスモーク
+            // テストなので、リサイズを送らない(SPEC §11)。
+            startup_nudge: if bench_mode {
+                StartupNudge::Done
+            } else {
+                StartupNudge::Pending {
+                    deadline: Instant::now() + STARTUP_NUDGE_DELAY,
+                }
+            },
+            last_screen_rect: egui::Rect::NOTHING,
             bench,
         };
         if let Some(message) = startup_error {
             app.show_toast(message);
         }
-        eprintln!("[DIAG] DaraskApp::new() done");
         app
+    }
+
+    /// 起動時白画面ワークアラウンドの 1 フレームぶんの処理
+    /// (`StartupNudge` のドキュメントコメント参照)。`ui()` の冒頭で毎
+    /// フレーム呼ぶが、`Done` に達した後は何もしない。
+    fn tick_startup_nudge(&mut self, ctx: &egui::Context) {
+        match self.startup_nudge {
+            StartupNudge::Pending { deadline } => {
+                let now = Instant::now();
+                if now < deadline {
+                    // アイドルでも期限に必ず 1 フレーム起きるよう予約する
+                    // (起動後 300ms 限定。恒久ループではない)。
+                    ctx.request_repaint_after(deadline - now);
+                } else if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+                    let size = rect.size();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        size + egui::vec2(1.0, 0.0),
+                    ));
+                    self.startup_nudge = StartupNudge::Restore {
+                        deadline: now + STARTUP_NUDGE_RESTORE_DELAY,
+                        size,
+                    };
+                    ctx.request_repaint_after(STARTUP_NUDGE_RESTORE_DELAY);
+                } else {
+                    // 内寸が取れない(理論上 Windows では起きない)場合は
+                    // 何もせず終了する。パニックしない(SPEC §12)。
+                    self.startup_nudge = StartupNudge::Done;
+                }
+            }
+            StartupNudge::Restore { deadline, size } => {
+                let now = Instant::now();
+                if now < deadline {
+                    ctx.request_repaint_after(deadline - now);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    self.startup_nudge = StartupNudge::Done;
+                }
+            }
+            StartupNudge::Done => {}
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1992,18 +2087,22 @@ impl DaraskApp {
 
 impl eframe::App for DaraskApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // TEMP DIAGNOSTIC (v2 white-screen regression investigation).
-        {
-            static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            eprintln!(
-                "[DIAG] ui() frame={n} ppp={} doc={}x{} layers={}",
-                ui.ctx().pixels_per_point(),
-                self.doc.width,
-                self.doc.height,
-                self.doc.layers.len()
-            );
+        // 起動時白画面(DWM 合成の競合)ワークアラウンド。`StartupNudge` の
+        // ドキュメントコメント参照。
+        self.tick_startup_nudge(ui.ctx());
+
+        // 同ワークアラウンドの後段: 初回フレーム直後とウィンドウ内寸の変化
+        // 直後は、合成器(DWM)のサーフェス作り直しと present が競合して
+        // 「描画は成功しているのに画面に反映されない」ことがある(実機で
+        // 確認)。競合の恐れがなくなった頃に 1 フレームだけ追加で提示して、
+        // 最後の present が確実に画面へ届くようにする。サイズ変化時限定の
+        // 一発予約であり、恒久ループではない(アイドル CPU 0% 要件は不変)。
+        let content_rect = ui.ctx().content_rect();
+        if content_rect != self.last_screen_rect {
+            self.last_screen_rect = content_rect;
+            ui.ctx().request_repaint_after(Duration::from_millis(150));
         }
+
         // ARCHITECTURE.md §12-9: rfd はブロッキングなので、直前のフレームで
         // 要求されたダイアログはここ(フレーム冒頭、まだパネル/painter を
         // 何も作っていない状態)で処理する。
@@ -2275,6 +2374,10 @@ mod tests {
             toast: None,
             layer_rename: None,
             next_layer_number: 1,
+            // テストにはウィンドウが無いため、ワークアラウンドは常に完了
+            // 状態にしておく。
+            startup_nudge: StartupNudge::Done,
+            last_screen_rect: egui::Rect::NOTHING,
             bench: None,
         }
     }

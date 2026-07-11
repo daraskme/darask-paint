@@ -18,36 +18,7 @@ use std::time::Instant;
 
 use eframe::egui;
 
-// TEMP DIAGNOSTIC (v2 white-screen regression): eframe/egui_glow/winit report
-// real errors (e.g. GL/swap-buffer/window failures) exclusively through the
-// `log` facade. Since this app installs no logger, those messages are
-// silently dropped by `log`'s no-op default logger, so any real failure is
-// invisible even though the process stays alive. Install a trivial logger
-// that writes straight to stderr so nothing is swallowed while we
-// investigate. Remove this together with the `log` dependency once the root
-// cause is confirmed (unless the eventual fix needs it).
-struct StderrLogger;
-impl log::Log for StderrLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-    fn log(&self, record: &log::Record) {
-        eprintln!(
-            "[DIAG log {} {}] {}",
-            record.level(),
-            record.target(),
-            record.args()
-        );
-    }
-    fn flush(&self) {}
-}
-
 fn main() -> eframe::Result {
-    // TEMP DIAGNOSTIC: see StderrLogger above.
-    log::set_logger(&StderrLogger).expect("logger install");
-    log::set_max_level(log::LevelFilter::Trace);
-    eprintln!("[DIAG] main() start");
-
     // SPEC §11: ベンチマークモードは main() 冒頭で計測を開始する。
     let process_start = Instant::now();
     let bench_mode = std::env::var_os("DARASK_BENCH").is_some();

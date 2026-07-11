@@ -8,11 +8,6 @@ arboard = "3.6.1"
 eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 rfd = "0.17.2"
-# TEMP DIAGNOSTIC (v2 white-screen regression investigation): pinned to the
-# version already present in Cargo.lock (transitive dep of eframe/winit) so
-# adding it does not change any other resolved version. Remove once the root
-# cause is fixed, unless the fix itself needs it.
-log = "=0.4.33"
 
 [profile.release]
 opt-level = 3

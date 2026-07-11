@@ -406,7 +406,6 @@ impl CanvasView {
                 [doc.width as usize, doc.height as usize],
                 &doc.composite,
             );
-            let created = self.texture.is_none();
             match &mut self.texture {
                 Some(tex) => tex.set(image, texture_options()),
                 None => {
@@ -415,14 +414,6 @@ impl CanvasView {
             }
             self.texture_size = size;
             doc.dirty = None;
-            // TEMP DIAGNOSTIC (v2 white-screen regression investigation).
-            eprintln!(
-                "[DIAG] ensure_texture: {} {}x{} tex_id={:?}",
-                if created { "CREATE" } else { "FULL-RESET" },
-                size.0,
-                size.1,
-                self.texture.as_ref().map(|t| t.id())
-            );
             return;
         }
 
@@ -438,7 +429,6 @@ impl CanvasView {
                 if let Some(tex) = &mut self.texture {
                     tex.set_partial([rect.x0 as usize, rect.y0 as usize], sub, texture_options());
                 }
-                eprintln!("[DIAG] ensure_texture: PARTIAL rect={rect:?}");
             }
         }
     }
