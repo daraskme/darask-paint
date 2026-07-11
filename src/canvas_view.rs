@@ -174,6 +174,24 @@ impl CanvasView {
         self.hover_img
     }
 
+    /// 直近の `show()` 時点のキャンバスビューポート(スクリーン論理ポイント、
+    /// ツールバー・右パネル・ステータスバーを含まない中央キャンバス領域の
+    /// み)。v3 §19: テキスト編集オーバーレイの `Area` をウィンドウ全域
+    /// ではなくこの矩形へ `constrain_to` するために使う(`app.rs::
+    /// draw_text_edit_overlay` 参照)。
+    pub fn viewport_rect(&self) -> Rect {
+        self.viewport
+    }
+
+    /// 現在パン中(Space/中ボタンドラッグ、または手のひらツール)かどうか。
+    /// SPEC §17: ブラシ半径の円カーソルは「OS カーソルは非表示」が前提
+    /// だが、パン中は OS カーソルが Grabbing に切り替わる
+    /// (`effective_cursor` 参照)ため、ブラシ円と二重表示にならないよう
+    /// `app.rs` がこれを見て円の描画を止める。
+    pub fn is_panning(&self) -> bool {
+        matches!(self.gesture, Some(Gesture { is_pan: true, .. }))
+    }
+
     /// 画像ピクセル座標をスクリーン論理ポイント座標に変換する
     /// (ARCHITECTURE.md §2)。直近の `show()` 呼び出し時点の `pixels_per_point`
     /// を使うため、同一フレーム内(`show()` の後、`Tool::draw_preview` から)
@@ -223,6 +241,17 @@ impl CanvasView {
         let anchor_img = screen_to_img(anchor_screen, self.viewport.min, self.pan, self.zoom, ppp);
         self.zoom = 1.0;
         self.pan = pan_for_anchor(anchor_img, anchor_screen, self.viewport.min, self.zoom, ppp);
+    }
+
+    /// v3 §18: ズームツール(Z)。画像座標 `anchor_img` を中心に `notches`
+    /// 段階ズームする(クリック=+1、Alt+クリック=-1、ARCHITECTURE.md
+    /// §15.2: 「既存のズーム関数を再利用」)。`zoom_in`/`zoom_out` はビュー
+    /// ポート中央をアンカーにするが、これは任意の画像座標をアンカーに
+    /// できる版。
+    pub fn zoom_at_point(&mut self, notches: i32, anchor_img: Pos2) {
+        let anchor_screen = self.img_to_screen_pos(anchor_img);
+        let ppp = self.last_ppp;
+        self.zoom_at(notches, anchor_screen, ppp);
     }
 
     /// 表示メニュー「ウィンドウに合わせる」(Ctrl+0、SPEC §10)。画像全体が
@@ -750,6 +779,45 @@ fn draw_dashed_segment(
 mod tests {
     use super::*;
 
+    // -- v3 レビューで発見・修正したバグ: ブラシ/消しゴム使用中の Space・
+    // 中ボタンパン中もブラシ円カーソルが描かれ、Grabbing カーソルと二重
+    // 表示になっていた。`app.rs` はこの `is_panning()` を見て円の描画を
+    // 止める(`effective_cursor` が `is_pan: true` のとき無条件に
+    // Grabbing を返すのと対になる)。--------------------------------------
+
+    #[test]
+    fn is_panning_reflects_active_pan_gesture() {
+        let mut view = CanvasView::new();
+        assert!(!view.is_panning(), "no gesture yet");
+
+        view.gesture = Some(Gesture {
+            button: PointerButton::Middle,
+            is_pan: true,
+        });
+        assert!(view.is_panning(), "middle-button drag is always a pan");
+
+        view.gesture = Some(Gesture {
+            button: PointerButton::Primary,
+            is_pan: false,
+        });
+        assert!(
+            !view.is_panning(),
+            "a normal drawing drag (not Space/force_pan) must not report panning"
+        );
+
+        view.gesture = Some(Gesture {
+            button: PointerButton::Primary,
+            is_pan: true,
+        });
+        assert!(
+            view.is_panning(),
+            "Space-held primary drag is a pan (force_pan/Space branch)"
+        );
+
+        view.gesture = None;
+        assert!(!view.is_panning(), "gesture ended");
+    }
+
     #[test]
     fn img_to_screen_screen_to_img_round_trip_identity() {
         let cases = [
@@ -797,6 +865,25 @@ mod tests {
         let anchor_screen_after = img_to_screen(anchor_img, viewport_min, new_pan, new_zoom, ppp);
         assert!((anchor_screen_after.x - anchor_screen.x).abs() < 1e-3);
         assert!((anchor_screen_after.y - anchor_screen.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zoom_at_point_keeps_the_image_point_under_the_original_screen_position() {
+        // v3 §18: ズームツール。画像座標をアンカーに渡しても、
+        // `zoom_at`(スクリーン座標アンカー)と同じ「アンカーが動かない」
+        // 性質を保つことを確認する。
+        let mut view = CanvasView::new();
+        view.viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        view.last_ppp = 1.0;
+        let anchor_img = pos2(120.0, 80.0);
+        let before = view.img_to_screen_pos(anchor_img);
+
+        view.zoom_at_point(1, anchor_img);
+
+        let after = view.img_to_screen_pos(anchor_img);
+        assert!((before.x - after.x).abs() < 1e-3);
+        assert!((before.y - after.y).abs() < 1e-3);
+        assert!(view.zoom > 1.0);
     }
 
     #[test]

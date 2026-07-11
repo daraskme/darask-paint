@@ -14,6 +14,7 @@
 use eframe::egui;
 
 use crate::document::{Document, MAX_LAYERS};
+use crate::keymap::{self, Action};
 
 /// 構造を変える(または「先に確定」が必要な)操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +29,19 @@ pub enum LayersPanelAction {
 }
 
 /// ダブルクリックで開始した名前編集の状態(`app.rs` が保持する)。
-/// `Some((layer_index, editing_text))`。
-pub type RenameState = Option<(usize, String)>;
+/// `Some((layer_index, editing_text, needs_focus))`。
+///
+/// `needs_focus` は編集開始直後の 1 フレームだけ `true`。egui 0.35 の
+/// `Response::lost_focus()` は「直近フレームでフォーカスを持っていた &&
+/// 現在フォーカスを持っていない」を照会する実装のため、`request_focus()` を
+/// 毎フレーム無条件に呼ぶと `Memory::request_focus` が `focused_widget` を
+/// 即座に同じ id へ再設定してしまい、`!has_focus(id)` が常に偽になって
+/// `lost_focus()` が恒久的に発火しなくなる(Enter/Esc/欄外クリックで
+/// リネームを確定・終了できず、フォーカスが居座り続けるため
+/// `ctx.egui_wants_keyboard_input()` も真のままになり全ショートカットが
+/// 効かなくなる)。`app.rs` の `TextEditState::needs_focus` と同じ
+/// 「編集開始フレームのみ `request_focus()` する」パターンで回避する。
+pub type RenameState = Option<(usize, String, bool)>;
 
 /// レイヤーパネルを描画する。クリックされた構造操作があれば返す。
 pub fn show(
@@ -58,14 +70,14 @@ pub fn show(
     ui.horizontal(|ui| {
         if ui
             .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("新規"))
-            .on_hover_text("新規レイヤー (Ctrl+Shift+N)")
+            .on_hover_text(keymap::menu_label("新規レイヤー", Action::LayerAdd))
             .clicked()
         {
             action = Some(LayersPanelAction::Add);
         }
         if ui
             .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("複製"))
-            .on_hover_text("レイヤーを複製")
+            .on_hover_text(keymap::menu_label("レイヤーを複製", Action::LayerDuplicate))
             .clicked()
         {
             action = Some(LayersPanelAction::Duplicate);
@@ -96,7 +108,10 @@ pub fn show(
         }
         if ui
             .add_enabled(layer_count > 1 && active > 0, egui::Button::new("下と結合"))
-            .on_hover_text("下のレイヤーと結合 (Ctrl+E)")
+            .on_hover_text(keymap::menu_label(
+                "下のレイヤーと結合",
+                Action::LayerMergeDown,
+            ))
             .clicked()
         {
             action = Some(LayersPanelAction::MergeDown);
@@ -156,23 +171,32 @@ fn show_layer_row(
             doc.modified = true;
         }
 
-        let is_editing = matches!(rename, Some((i, _)) if *i == idx);
+        let is_editing = matches!(rename, Some((i, _, _)) if *i == idx);
         if is_editing {
-            let (_, text) = rename.as_mut().expect("is_editing implies Some");
+            let (_, text, needs_focus) = rename.as_mut().expect("is_editing implies Some");
             let response = ui.add(
                 egui::TextEdit::singleline(text)
                     .desired_width(120.0)
                     .id(egui::Id::new(("darask_layer_rename", idx))),
             );
-            response.request_focus();
-            if response.lost_focus() {
-                let trimmed = text.trim().to_owned();
-                if !trimmed.is_empty() {
-                    if let Some(layer) = doc.layers.get_mut(idx) {
-                        layer.name = trimmed;
+            // 編集開始フレームのみフォーカスを要求する(`RenameState` の
+            // ドキュメントコメント参照)。
+            if *needs_focus {
+                response.request_focus();
+            }
+            let lost_focus = response.lost_focus();
+            if let Some((_, _, needs_focus)) = rename.as_mut() {
+                *needs_focus = false;
+            }
+            if lost_focus {
+                if let Some((_, text, _)) = rename.take() {
+                    let trimmed = text.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        if let Some(layer) = doc.layers.get_mut(idx) {
+                            layer.name = trimmed;
+                        }
                     }
                 }
-                *rename = None;
             }
         } else {
             let name = doc
@@ -188,9 +212,76 @@ fn show_layer_row(
             }
             if response.double_clicked() {
                 if let Some(layer) = doc.layers.get(idx) {
-                    *rename = Some((idx, layer.name.clone()));
+                    *rename = Some((idx, layer.name.clone(), true));
                 }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Background;
+
+    /// 回帰テスト: src/ui/layers_panel.rs:171(元)のバグ。編集中の
+    /// `TextEdit` に毎フレーム無条件で `request_focus()` を呼ぶと、
+    /// singleline `TextEdit` が Enter で内部的に `surrender_focus()` しても
+    /// 直後の `request_focus()` がフォーカスを奪い返してしまい
+    /// `Response::lost_focus()` が恒久的に発火しなくなる(egui 0.35
+    /// `Memory::lost_focus` は `!has_focus(id)` を必須条件に持つため)。
+    /// `egui::Context` はバックエンド不要で複数フレームを直接駆動できる
+    /// (`app.rs::ctx_with_key_event` と同じ手法)。
+    #[test]
+    fn layer_rename_textedit_loses_focus_on_enter_and_commits_name() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut rename: RenameState = Some((0, "old".to_owned(), true));
+
+        let ctx = egui::Context::default();
+
+        // フレーム1: 編集開始フレーム。needs_focus=true → request_focus() が
+        // 呼ばれ TextEdit がフォーカスを得る。
+        ctx.begin_pass(egui::RawInput::default());
+        egui::Area::new(egui::Id::new("test_area")).show(&ctx, |ui| {
+            show(ui, &mut doc, &mut rename);
+        });
+        let _ = ctx.end_pass();
+        assert!(
+            matches!(&rename, Some((_, _, needs_focus)) if !*needs_focus),
+            "needs_focus must be consumed after the first frame"
+        );
+        assert_eq!(doc.layers[0].name, "背景", "still editing, name unchanged");
+
+        // 編集中にテキストを変更してから Enter。singleline TextEdit は
+        // Enter で内部的に surrender_focus する(egui 0.35
+        // text_edit/builder.rs:1115)。
+        if let Some((_, text, _)) = rename.as_mut() {
+            *text = "new name".to_owned();
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        egui::Area::new(egui::Id::new("test_area")).show(&ctx, |ui| {
+            show(ui, &mut doc, &mut rename);
+        });
+        let _ = ctx.end_pass();
+
+        assert!(
+            rename.is_none(),
+            "Enter surrenders focus mid-frame; without the needs_focus fix the immediately \
+             following request_focus() would reclaim it every frame and lost_focus() would \
+             never fire, leaving the rename box (and keyboard shortcuts) stuck open forever"
+        );
+        assert_eq!(
+            doc.layers[0].name, "new name",
+            "lost_focus() firing must commit the edited name"
+        );
+    }
 }

@@ -14,60 +14,73 @@
 
 use eframe::egui;
 
+use crate::keymap;
 use crate::tools::ToolKind;
 use crate::ui::icons;
 
 struct ToolButton {
     name: &'static str,
-    shortcut: &'static str,
     kind: ToolKind,
 }
 
+/// ショートカット表記はここに埋め込まず、`keymap::tool_shortcut_label`
+/// (`keymap::KEYMAP` が唯一の情報源)から都度生成する(ARCHITECTURE.md
+/// §15.4: 「メニュー表記・ツールチップは KEYMAP から文字列生成」)。SPEC §20
+/// で直線/矩形/楕円が「U」1 本にまとめられた(旧 L/R/C は廃止)ことも、
+/// `tool_shortcut_label` が吸収するのでここでは意識しなくてよい。
 const TOOLS: &[ToolButton] = &[
     ToolButton {
-        name: "ペン",
-        shortcut: "B",
+        name: "ブラシ",
         kind: ToolKind::Pen,
     },
     ToolButton {
         name: "消しゴム",
-        shortcut: "E",
         kind: ToolKind::Eraser,
     },
     ToolButton {
         name: "直線",
-        shortcut: "L",
         kind: ToolKind::Line,
     },
     ToolButton {
         name: "矩形",
-        shortcut: "R",
         kind: ToolKind::Rect,
     },
     ToolButton {
         name: "楕円",
-        shortcut: "C",
         kind: ToolKind::Ellipse,
     },
     ToolButton {
         name: "塗りつぶし",
-        shortcut: "F",
         kind: ToolKind::Fill,
     },
     ToolButton {
         name: "スポイト",
-        shortcut: "I",
         kind: ToolKind::Picker,
+    },
+    // v3 §19: テキスト。SPEC §20 最終キーマップの並び(…I, T, U…)に合わせ、
+    // スポイトの直後・選択の前に置く(ツールバー全体の PS 準拠キーマップへの
+    // 総入れ替えは V3-M4 のスコープ、ARCHITECTURE.md §15.5)。
+    ToolButton {
+        name: "テキスト",
+        kind: ToolKind::Text,
     },
     ToolButton {
         name: "選択",
-        shortcut: "M",
         kind: ToolKind::Select,
+    },
+    // v3 §18: 移動・ズーム。選択(浮動化の仲間)の直後、手のひら(表示操作の
+    // 仲間)の後にそれぞれ加える。
+    ToolButton {
+        name: "移動",
+        kind: ToolKind::Move,
     },
     ToolButton {
         name: "手のひら",
-        shortcut: "H",
         kind: ToolKind::Pan,
+    },
+    ToolButton {
+        name: "ズーム",
+        kind: ToolKind::Zoom,
     },
 ];
 
@@ -87,8 +100,9 @@ pub fn show(ui: &mut egui::Ui, current: ToolKind) -> Option<ToolKind> {
             ui.vertical_centered(|ui| {
                 for tool in TOOLS {
                     let selected = current == tool.kind;
+                    let shortcut = keymap::tool_shortcut_label(tool.kind);
                     let response = tool_button(ui, tool.kind, selected)
-                        .on_hover_text(format!("{} ({})", tool.name, tool.shortcut));
+                        .on_hover_text(format!("{} ({shortcut})", tool.name));
                     if response.clicked() {
                         clicked = Some(tool.kind);
                     }

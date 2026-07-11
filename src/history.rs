@@ -47,11 +47,20 @@ pub enum HistoryOp {
     /// 部分パッチ(ストローク/図形/塗りつぶし/貼り付け確定など)。`layer` は
     /// このパッチが適用される `Document::layers` の添字(ARCHITECTURE.md
     /// §14.2)。
+    ///
+    /// v3 レビューで発見・修正したバグ: 以前は `rect`(触れたタイル群の
+    /// 外接矩形 1 個)/`before`/`after` の単一フィールドだった。離れた
+    /// 2 領域を触る操作(例: 4000×4000 ドキュメントで 10×10 の選択範囲を
+    /// 左上から右下へ移動)では、外接矩形がほぼ全面になり実際の変更画素数
+    /// (約 200px)に対して before+after 合計 128MB 級の `Patch` が積まれ、
+    /// 1 回の操作で 256MB 上限の半分を消費して既存の undo 履歴が大量破棄
+    /// されうる問題があった。実際に触れたタイル(256×256、
+    /// `StrokeRecorder::tiles`)ごとに `PatchRegion` を分けて持つことで、
+    /// メモリ使用量を「触れたタイルの合計サイズ」に比例させる(復元の
+    /// バイト正確性は不変、`history.rs` のテスト参照)。
     Patch {
         layer: usize,
-        rect: IRect,
-        before: Vec<u8>,
-        after: Vec<u8>,
+        regions: Vec<PatchRegion>,
     },
     /// 新規の空(透明)レイヤー追加(`layer_add`)。undo=`index` の削除、
     /// redo=`name` から空レイヤーを再構築(常に透明なので画素データは持たない)。
@@ -96,10 +105,21 @@ pub enum HistoryOp {
     },
 }
 
+/// `HistoryOp::Patch` の 1 タイルぶんの部分領域(`HistoryOp::Patch` の
+/// ドキュメントコメント参照)。`rect` は触れたタイルの矩形(256×256、画像
+/// 境界でクランプ済み)、`before`/`after` はその矩形内のピクセル。
+pub struct PatchRegion {
+    rect: IRect,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
 impl HistoryOp {
     fn byte_size(&self) -> usize {
         match self {
-            HistoryOp::Patch { before, after, .. } => before.len() + after.len(),
+            HistoryOp::Patch { regions, .. } => {
+                regions.iter().map(|r| r.before.len() + r.after.len()).sum()
+            }
             HistoryOp::AddLayer { name, .. } => name.len(),
             HistoryOp::DuplicateLayer { layer, .. } | HistoryOp::RemoveLayer { layer, .. } => {
                 layer.pixels.len()
@@ -131,8 +151,6 @@ struct StrokeRecorder {
     /// このストロークが対象とするレイヤー(開始時の `Document::active`)。
     layer: usize,
     tiles: HashMap<(i32, i32), TileSnapshot>,
-    /// これまでに `ensure_tiles_saved` に渡された矩形の外接矩形。
-    touched: Option<IRect>,
 }
 
 impl StrokeRecorder {
@@ -140,7 +158,6 @@ impl StrokeRecorder {
         Self {
             layer,
             tiles: HashMap::new(),
-            touched: None,
         }
     }
 
@@ -152,10 +169,6 @@ impl StrokeRecorder {
         if rect.is_empty() {
             return;
         }
-        self.touched = Some(match self.touched {
-            Some(existing) => existing.union(&rect),
-            None => rect,
-        });
 
         let tx0 = rect.x0.div_euclid(TILE_SIZE);
         let ty0 = rect.y0.div_euclid(TILE_SIZE);
@@ -181,39 +194,52 @@ impl StrokeRecorder {
     }
 
     /// ストローク確定。触れた領域がなければ `None`(1 px も塗らなかった等)。
-    fn finish(self, width: u32, height: u32, pixels: &[u8]) -> Option<HistoryOp> {
-        let bbox = self.touched?.clamp_to(width, height);
-        if bbox.is_empty() {
+    ///
+    /// `HistoryOp::Patch` のドキュメントコメント参照: 触れたタイル
+    /// (`self.tiles`)ごとに個別の `PatchRegion` を作る(離れた 2 領域を
+    /// 触る操作で外接矩形 1 個ぶんのメモリを浪費しないため)。
+    ///
+    /// ARCHITECTURE.md §15.2: 「空レイヤー(全透明)でも動作(確定時
+    /// before==after 抑制が効く)」。移動ツール/自由変形/選択ドラッグで
+    /// ドラッグしても実際には画素が 1 つも変わらなかった場合(全透明レイヤーの
+    /// 移動、元の位置に戻して確定、等)、タイルごとに `before` と `after` を
+    /// 比較し、バイト一致するタイルは region に含めない(そのタイルは真に
+    /// 無変化なので、undo 側で貼り戻す必要がない)。全タイルが無変化なら
+    /// `Patch` 自体を push しない(`doc.modified` も立てない)。
+    fn finish(self, width: u32, pixels: &[u8]) -> Option<HistoryOp> {
+        if self.tiles.is_empty() {
             return None;
         }
-        let after = copy_region(pixels, width, bbox);
-        // before は「現在のバッファ」から始め、退避済みタイルで上書きする。
-        // タイルが退避されていない = そのタイルは一度も書き込まれていない
-        // ということなので、現在値がそのまま元の値になる。
-        let mut before = after.clone();
-        let bbox_w = bbox.width() as usize;
-        for snap in self.tiles.values() {
-            let overlap = intersect(snap.rect, bbox);
-            if overlap.is_empty() {
+        let mut regions = Vec::with_capacity(self.tiles.len());
+        for snap in self.tiles.into_values() {
+            // `snap.rect` は退避時点(`ensure_saved`)で既に画像境界へ
+            // クランプ済み。ストローク中にドキュメント寸法が変わらないこと
+            // は v3 §15.6 落とし穴2 の不変条件(サイズ変更中はストロークが
+            // 開いていない)で保証されるため、ここでの再クランプは不要
+            // (むしろ `width`/`height` が万一食い違った場合に `snap.pixels`
+            // の寸法と `rect` の寸法がずれて `copy_region`/`paste_region` が
+            // 静かに破損したデータを作ってしまう方が危険)。
+            let rect = snap.rect;
+            if rect.is_empty() {
                 continue;
             }
-            let tile_w = snap.rect.width() as usize;
-            for y in overlap.y0..overlap.y1 {
-                let src_start = ((y - snap.rect.y0) as usize * tile_w
-                    + (overlap.x0 - snap.rect.x0) as usize)
-                    * 4;
-                let dst_start =
-                    ((y - bbox.y0) as usize * bbox_w + (overlap.x0 - bbox.x0) as usize) * 4;
-                let len = overlap.width() as usize * 4;
-                before[dst_start..dst_start + len]
-                    .copy_from_slice(&snap.pixels[src_start..src_start + len]);
+            let after = copy_region(pixels, width, rect);
+            if after == snap.pixels {
+                // このタイルは実質無変化(ARCHITECTURE.md §15.2)。
+                continue;
             }
+            regions.push(PatchRegion {
+                rect,
+                before: snap.pixels,
+                after,
+            });
+        }
+        if regions.is_empty() {
+            return None;
         }
         Some(HistoryOp::Patch {
             layer: self.layer,
-            rect: bbox,
-            before,
-            after,
+            regions,
         })
     }
 }
@@ -247,15 +273,6 @@ fn paste_region(pixels: &mut [u8], width: u32, height: u32, rect: IRect, data: &
             pixels[dst_start..dst_start + w * 4]
                 .copy_from_slice(&data[src_start..src_start + w * 4]);
         }
-    }
-}
-
-fn intersect(a: IRect, b: IRect) -> IRect {
-    IRect {
-        x0: a.x0.max(b.x0),
-        y0: a.y0.max(b.y0),
-        x1: a.x1.min(b.x1),
-        y1: a.y1.min(b.y1),
     }
 }
 
@@ -332,6 +349,32 @@ impl History {
             .map(|s| [s[0], s[1], s[2], s[3]])
     }
 
+    /// SPEC §18: Esc キャンセル(`app.rs::cancel_floating`)専用。進行中の
+    /// ストロークが対象とする `rect`(`ensure_tiles_saved`/
+    /// `ensure_tiles_saved_buf` 済みの領域であること)を、ストローク開始前の
+    /// 値へ復元して `doc` のアクティブレイヤーへ直接書き戻す。`commit_stroke`
+    /// と違い `HistoryOp` は一切 push しない(履歴には何も積まない、
+    /// SPEC §18)。ストローク自体もここでは消費しない(呼び出し側が続けて
+    /// `cancel_stroke()` で破棄すること)。ストローク記録中でなければ
+    /// 何もしない。
+    pub fn restore_stroke_region(&self, doc: &mut Document, rect: IRect) {
+        if self.stroke.is_none() {
+            return;
+        }
+        let rect = rect.clamp_to(doc.width, doc.height);
+        if rect.is_empty() {
+            return;
+        }
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                if let Some(px) = self.original_pixel(x, y) {
+                    doc.set_pixel(x, y, px);
+                }
+            }
+        }
+        doc.mark_dirty(rect);
+    }
+
     /// ストロークを確定し、触れた領域があれば 1 つの `Patch` として push する。
     ///
     /// `doc.modified` はここで実際に op が push されたときにだけ true にする
@@ -346,7 +389,7 @@ impl History {
                 return;
             };
             let pixels = &layer.pixels;
-            if let Some(op) = stroke.finish(doc.width, doc.height, pixels) {
+            if let Some(op) = stroke.finish(doc.width, pixels) {
                 doc.modified = true;
                 self.push(op);
             }
@@ -436,17 +479,14 @@ fn swap_layers(doc: &mut Document, a: usize, b: usize) {
 
 fn apply_before(doc: &mut Document, op: &HistoryOp) {
     match op {
-        HistoryOp::Patch {
-            layer,
-            rect,
-            before,
-            ..
-        } => {
+        HistoryOp::Patch { layer, regions } => {
             let (w, h) = (doc.width, doc.height);
-            if let Some(l) = doc.layers.get_mut(*layer) {
-                paste_region(&mut l.pixels, w, h, *rect, before);
+            for region in regions {
+                if let Some(l) = doc.layers.get_mut(*layer) {
+                    paste_region(&mut l.pixels, w, h, region.rect, &region.before);
+                }
+                doc.mark_dirty(region.rect);
             }
-            doc.mark_dirty(*rect);
         }
         HistoryOp::AddLayer {
             index,
@@ -505,14 +545,14 @@ fn apply_before(doc: &mut Document, op: &HistoryOp) {
 
 fn apply_after(doc: &mut Document, op: &HistoryOp) {
     match op {
-        HistoryOp::Patch {
-            layer, rect, after, ..
-        } => {
+        HistoryOp::Patch { layer, regions } => {
             let (w, h) = (doc.width, doc.height);
-            if let Some(l) = doc.layers.get_mut(*layer) {
-                paste_region(&mut l.pixels, w, h, *rect, after);
+            for region in regions {
+                if let Some(l) = doc.layers.get_mut(*layer) {
+                    paste_region(&mut l.pixels, w, h, region.rect, &region.after);
+                }
+                doc.mark_dirty(region.rect);
             }
-            doc.mark_dirty(*rect);
         }
         HistoryOp::AddLayer { index, name, .. } => {
             let (width, height) = (doc.width, doc.height);
@@ -588,6 +628,26 @@ mod tests {
     /// (raster 関数はいずれも `Surface` を要求するため)。
     fn surface(doc: &mut Document) -> Surface<'_> {
         doc.active_surface_mut()
+    }
+
+    /// テスト用: 単一領域だけの `Patch`(`HistoryOp::Patch` のリファクタ
+    /// (history.rs:189 のレビューで発見・修正したバグ: 複数タイルを持てる
+    /// `regions: Vec<PatchRegion>` になった)前と同じ形の `Patch` を、
+    /// 既存テストの記述をあまり変えずに組み立てるためのヘルパー。
+    fn single_region_patch(
+        layer: usize,
+        rect: IRect,
+        before: Vec<u8>,
+        after: Vec<u8>,
+    ) -> HistoryOp {
+        HistoryOp::Patch {
+            layer,
+            regions: vec![PatchRegion {
+                rect,
+                before,
+                after,
+            }],
+        }
     }
 
     #[test]
@@ -719,21 +779,21 @@ mod tests {
         let mut doc = Document::new(4, 4, Background::White);
         let mut history = History::new();
 
-        history.push(HistoryOp::Patch {
-            layer: 0,
+        history.push(single_region_patch(
+            0,
             rect,
-            before: vec![0, 0, 0, 0],
-            after: vec![1, 1, 1, 1],
-        });
+            vec![0, 0, 0, 0],
+            vec![1, 1, 1, 1],
+        ));
         history.undo(&mut doc);
         assert!(history.can_redo());
 
-        history.push(HistoryOp::Patch {
-            layer: 0,
+        history.push(single_region_patch(
+            0,
             rect,
-            before: vec![1, 1, 1, 1],
-            after: vec![2, 2, 2, 2],
-        });
+            vec![1, 1, 1, 1],
+            vec![2, 2, 2, 2],
+        ));
         assert!(!history.can_redo(), "new push must clear redo stack");
     }
 
@@ -750,12 +810,7 @@ mod tests {
         // それぞれ大きめの op を積んで 256MB を大きく超えさせる。
         let big = vec![0u8; 30 * 1024 * 1024]; // 30MB
         for _ in 0..15 {
-            history.push(HistoryOp::Patch {
-                layer: 0,
-                rect,
-                before: big.clone(),
-                after: vec![1, 1, 1, 1],
-            });
+            history.push(single_region_patch(0, rect, big.clone(), vec![1, 1, 1, 1]));
         }
 
         // 直近 10 件は必ず残る。
@@ -775,12 +830,7 @@ mod tests {
         // 直近10件だけで既に上限を超えるサイズにする。
         let huge = vec![0u8; 40 * 1024 * 1024]; // 40MB * 10 > 256MB
         for _ in 0..10 {
-            history.push(HistoryOp::Patch {
-                layer: 0,
-                rect,
-                before: huge.clone(),
-                after: vec![1],
-            });
+            history.push(single_region_patch(0, rect, huge.clone(), vec![1]));
         }
         assert_eq!(history.undo.len(), MIN_KEEP);
     }
@@ -808,6 +858,57 @@ mod tests {
         history.begin_stroke(0);
         // まだそのタイルを退避していなければ None。
         assert_eq!(history.original_pixel(5, 5), None);
+    }
+
+    // -- v3 §18: Esc キャンセル(`restore_stroke_region`) ------------------
+
+    #[test]
+    fn restore_stroke_region_reverts_to_pre_stroke_bytes_without_pushing_history() {
+        let mut doc = Document::new(20, 20, Background::White);
+        let original = doc.active_pixels().to_vec();
+
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+        let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
+        history.ensure_tiles_saved(&doc, bounds);
+        raster::stamp_round(
+            &mut surface(&mut doc),
+            10.0,
+            10.0,
+            4.0,
+            [255, 0, 0, 255],
+            false,
+        );
+        assert_ne!(doc.active_pixels(), original.as_slice());
+
+        history.restore_stroke_region(&mut doc, bounds);
+        history.cancel_stroke();
+
+        assert_eq!(
+            doc.active_pixels(),
+            original.as_slice(),
+            "restore must byte-exactly revert the touched region"
+        );
+        assert!(!history.can_undo(), "cancel must not push any undo entry");
+        assert!(!history.has_open_stroke());
+    }
+
+    #[test]
+    fn restore_stroke_region_is_a_no_op_without_an_open_stroke() {
+        let mut doc = Document::new(10, 10, Background::White);
+        let history = History::new();
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 10,
+            y1: 10,
+        };
+        // ストロークが開いていない状態で呼んでもパニックせず、何も変えない。
+        history.restore_stroke_region(&mut doc, rect);
+        assert!(doc
+            .active_pixels()
+            .chunks_exact(4)
+            .all(|p| p == [255, 255, 255, 255]));
     }
 
     #[test]
@@ -847,6 +948,157 @@ mod tests {
         raster::stamp_round(&mut surface(&mut doc), 5.0, 5.0, 2.0, [1, 2, 3, 4], false);
         history.commit_stroke(&mut doc);
         assert!(doc.modified, "a real edit must set modified");
+    }
+
+    // -- v3 レビューで発見・修正したバグ: ARCHITECTURE.md §15.2 の
+    // 「確定時 before==after 抑制」が未実装だった(移動ツール/自由変形で
+    // 全透明レイヤーを浮動化して無操作のまま確定すると、無意味な全面
+    // Patch が積まれ既存の undo 履歴を大量に破棄しうる、
+    // 消しゴム/ブラシでも実質変化なしのタッチで同じ問題が起きる)。
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn commit_stroke_suppresses_patch_when_before_equals_after() {
+        // 全透明レイヤーに透明を書く(erase=true → [0,0,0,0])のは、
+        // 移動ツール/自由変形が「触れたが実際には何も変えなかった」
+        // ケース(空レイヤーの浮動片を確定する等)の代表例。
+        let mut doc = Document::new(20, 20, Background::Transparent);
+        let mut history = History::new();
+
+        history.begin_stroke(doc.active);
+        let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
+        history.ensure_tiles_saved(&doc, bounds);
+        raster::stamp_round(&mut surface(&mut doc), 10.0, 10.0, 4.0, [0, 0, 0, 0], true);
+        history.commit_stroke(&mut doc);
+
+        assert!(
+            !history.can_undo(),
+            "a no-op stroke (before == after) must not push a history entry"
+        );
+        assert!(!doc.modified, "a no-op stroke must not set modified either");
+    }
+
+    #[test]
+    fn commit_stroke_still_pushes_patch_when_pixels_actually_change() {
+        // 抑制ロジックが実際の変更まで握りつぶさないことの対照テスト。
+        let mut doc = Document::new(20, 20, Background::White);
+        let mut history = History::new();
+
+        history.begin_stroke(doc.active);
+        let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
+        history.ensure_tiles_saved(&doc, bounds);
+        raster::stamp_round(
+            &mut surface(&mut doc),
+            10.0,
+            10.0,
+            4.0,
+            [10, 20, 30, 255],
+            false,
+        );
+        history.commit_stroke(&mut doc);
+
+        assert!(history.can_undo(), "a real edit must still push a patch");
+        assert!(doc.modified);
+    }
+
+    #[test]
+    fn drag_back_to_original_position_and_commit_is_suppressed() {
+        // ARCHITECTURE.md §15.2 の具体シナリオ: 選択/浮動片をドラッグして
+        // 元の位置へ戻して確定すると、切り出し元の透明化+貼り戻しで
+        // バイト単位では完全に元通りになる。1 ストロークとして扱うと
+        // before==after になり、抑制されるべき。
+        let mut doc = Document::new(20, 20, Background::White);
+        let mut history = History::new();
+
+        history.begin_stroke(doc.active);
+        let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
+        history.ensure_tiles_saved(&doc, bounds);
+        // 一旦別の色に変え、同じストローク内で元の白へ書き戻す
+        // (浮動片を動かしてから同じ場所へ戻す操作の簡略版)。
+        raster::stamp_round(&mut surface(&mut doc), 10.0, 10.0, 4.0, [1, 2, 3, 4], false);
+        raster::stamp_round(
+            &mut surface(&mut doc),
+            10.0,
+            10.0,
+            4.0,
+            [255, 255, 255, 255],
+            false,
+        );
+        history.commit_stroke(&mut doc);
+
+        assert!(
+            !history.can_undo(),
+            "restoring the exact original bytes within one stroke must not push a patch"
+        );
+        assert!(!doc.modified);
+    }
+
+    // -- v3 レビューで発見・修正したバグ: `Patch` が触れたタイル群の外接
+    // 矩形 1 個(union)だけを保持していたため、離れた 2 領域を触る操作
+    // (選択範囲を遠く離れた位置へ移動、等)で実際の変更画素数に対しメモリが
+    // 面積比で爆発していた。タイル単位で複数の `PatchRegion` に分けることで
+    // 解消した(`HistoryOp::Patch` のドキュメントコメント参照)。--------------
+
+    #[test]
+    fn patch_memory_scales_with_touched_tiles_not_the_bounding_box_union() {
+        // 4000×4000 ドキュメントで、左上と右下の離れた 10×10 領域だけを
+        // 触る(選択範囲を対角線上の反対側へ移動する操作の簡略版)。
+        let mut doc = Document::new(4000, 4000, Background::White);
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+
+        let top_left = raster::stamp_bounds(5.0, 5.0, 4.0);
+        let bottom_right = raster::stamp_bounds(3995.0, 3995.0, 4.0);
+        history.ensure_tiles_saved(&doc, top_left);
+        history.ensure_tiles_saved(&doc, bottom_right);
+        raster::stamp_round(&mut surface(&mut doc), 5.0, 5.0, 4.0, [1, 2, 3, 4], false);
+        raster::stamp_round(
+            &mut surface(&mut doc),
+            3995.0,
+            3995.0,
+            4.0,
+            [5, 6, 7, 8],
+            false,
+        );
+        history.commit_stroke(&mut doc);
+
+        assert!(history.can_undo(), "a real edit must still push a patch");
+
+        // 修正前(外接矩形 1 個)なら before+after だけで
+        // 4000*4000*4*2 = 128,000,000 バイト(約122MiB)。修正後は触れた
+        // タイル(高々 2×2 個 = 4 タイル、256×256 以下)ぶんだけなので
+        // 数百KB程度に収まるはず。1MiB を大きく下回ることを確認する
+        // (退行検知の閾値、正確な値は実装の内部詳細に依存させない)。
+        const OLD_BBOX_UNION_BYTES: usize = 4000 * 4000 * 4 * 2;
+        assert!(
+            history.bytes_used < 1024 * 1024,
+            "expected tile-granular memory (~a few hundred KB), got {} bytes \
+             (old bounding-box-union behavior would have used ~{} bytes)",
+            history.bytes_used,
+            OLD_BBOX_UNION_BYTES
+        );
+
+        // バイト正確性(復元)も両領域とも壊れていないことを確認する。
+        assert_eq!(doc.get_pixel(5, 5), Some([1, 2, 3, 4]));
+        assert_eq!(doc.get_pixel(3995, 3995), Some([5, 6, 7, 8]));
+        // 2 領域の間(未退避のタイル)は無変化のはず。
+        assert_eq!(doc.get_pixel(2000, 2000), Some([255, 255, 255, 255]));
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(
+            doc.get_pixel(5, 5),
+            Some([255, 255, 255, 255]),
+            "undo must byte-exactly restore the top-left region"
+        );
+        assert_eq!(
+            doc.get_pixel(3995, 3995),
+            Some([255, 255, 255, 255]),
+            "undo must byte-exactly restore the bottom-right region"
+        );
+
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc.get_pixel(5, 5), Some([1, 2, 3, 4]));
+        assert_eq!(doc.get_pixel(3995, 3995), Some([5, 6, 7, 8]));
     }
 
     // -- v2: レイヤー対応(ARCHITECTURE.md §14.2) ---------------------------

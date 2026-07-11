@@ -9,7 +9,9 @@ mod canvas_view;
 mod document;
 mod history;
 mod io;
+mod keymap;
 mod raster;
+mod text;
 mod tools;
 mod ui;
 

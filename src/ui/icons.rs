@@ -1,8 +1,9 @@
 //! ツールアイコンのベクター描画(SPEC §15、ARCHITECTURE.md §14.4)。
 //!
 //! 画像アセット・絵文字フォントは使わず、`egui::Painter` の図形プリミティブ
-//! だけで 9 ツール分のアイコンを組み立てる(画像アセットの追加禁止、CLAUDE.md
-//! 鉄則)。`rect` は正方形前提で、内部はすべて `rect` に対する相対座標
+//! だけでツール分のアイコンを組み立てる(画像アセットの追加禁止、CLAUDE.md
+//! 鉄則)。v1 の 9 ツールに加え、v3 §18(ARCHITECTURE.md §15.2)で移動・
+//! ズームを追加した。`rect` は正方形前提で、内部はすべて `rect` に対する相対座標
 //! (0.0..1.0)から組み立てる(ARCHITECTURE.md §14.4)ので、ボタンサイズが
 //! 変わっても比率を保ったまま描画できる。色は呼び出し側(`toolbar.rs`)が
 //! 選択状態に応じて渡す 1 色のみを使う(egui のテキスト色/アクセント色に
@@ -100,6 +101,9 @@ pub fn paint_tool_icon(kind: ToolKind, painter: &Painter, rect: Rect, color: Col
         ToolKind::Picker => picker_icon(painter, rect, color),
         ToolKind::Select => select_icon(painter, rect, color),
         ToolKind::Pan => pan_icon(painter, rect, color),
+        ToolKind::Move => move_icon(painter, rect, color),
+        ToolKind::Zoom => zoom_icon(painter, rect, color),
+        ToolKind::Text => text_icon(painter, rect, color),
     }
 }
 
@@ -235,6 +239,40 @@ fn pan_icon(painter: &Painter, rect: Rect, color: Color32) {
     arrow_head(painter, down, vec2(0.0, 1.0), head, color);
     arrow_head(painter, left, vec2(-1.0, 0.0), head, color);
     arrow_head(painter, right, vec2(1.0, 0.0), head, color);
+}
+
+/// 移動 = 矢印カーソル(v3 §18)。手のひらの十字矢印とは異なる意匠にして
+/// 一目で区別できるようにする(古典的な「矢じり」カーソルの輪郭、4 頂点)。
+fn move_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let tip = p(rect, 0.18, 0.14);
+    let tail = p(rect, 0.50, 0.86);
+    let notch = p(rect, 0.58, 0.58);
+    let barb = p(rect, 0.86, 0.46);
+    painter.add(Shape::closed_line(vec![tip, tail, notch, barb], st));
+}
+
+/// ズーム = 虫眼鏡(v3 §18: 「カーソルは虫眼鏡」と同じ意匠)。内側に
+/// 「+」を添えて拡大鏡であることを示す。
+fn zoom_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let center = p(rect, 0.42, 0.42);
+    let radius = rect.width() * 0.24;
+    painter.circle_stroke(center, radius, st);
+    let inner = radius * 0.5;
+    painter.line_segment([center - vec2(inner, 0.0), center + vec2(inner, 0.0)], st);
+    painter.line_segment([center - vec2(0.0, inner), center + vec2(0.0, inner)], st);
+    let dir = vec2(1.0, 1.0).normalized();
+    painter.line_segment([center + dir * radius, p(rect, 0.86, 0.86)], st);
+}
+
+/// テキスト = 「T」字(v3 §19)。横棒+縦棒の 2 本線だけの最小意匠。他の
+/// アイコンと同じ 1.5pt 線幅・単色で、フォント/絵文字は使わない(SPEC §15
+/// の「画像アセット・絵文字フォントは使わない」を v3 追加ツールにも適用)。
+fn text_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    painter.line_segment([p(rect, 0.20, 0.22), p(rect, 0.80, 0.22)], st);
+    painter.line_segment([p(rect, 0.5, 0.22), p(rect, 0.5, 0.82)], st);
 }
 
 #[cfg(test)]

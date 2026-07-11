@@ -33,9 +33,16 @@
 //!
 //! v2(ARCHITECTURE.md §14.8 V2-M1)で `Document`/`raster`/`history`/`tools`/
 //! `io` をレイヤー対応にリファクタした。UI は v1 のまま(常に「背景」1 枚)。
+//!
+//! v3 V3-M1(SPEC §17、ARCHITECTURE.md §15.5)でブラシ(旧ペン)/消しゴムを
+//! 共通のストロークエンジン(`tools/brush.rs`)に刷新した: 硬さ・不透明度
+//! (消しゴムは「強さ」)・鉛筆モード・Shift+クリック連結・ブラシ円カーソル・
+//! 数字キーでの不透明度設定。旧「アンチエイリアス」チェックボックスは廃止
+//! (ブラシは常時 AA になった)。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -46,6 +53,9 @@ use crate::canvas_view::CanvasView;
 use crate::document::{Background, Document, Interpolation, MAX_LAYERS};
 use crate::history::{History, HistoryOp};
 use crate::io::{self, SaveFormat};
+use crate::keymap::{self, Action};
+use crate::text;
+use crate::tools::color_to_straight_rgba;
 use crate::tools::eraser::EraserTool;
 use crate::tools::fill::FillTool;
 use crate::tools::pen::PenTool;
@@ -68,6 +78,18 @@ const MAX_RECENT_COLORS: usize = 8;
 const MIN_BRUSH_SIZE: f32 = 1.0;
 const MAX_BRUSH_SIZE: f32 = 64.0;
 
+/// SPEC §17: 硬さ 0–100%(デフォルト 100)。
+const MIN_BRUSH_HARDNESS: u8 = 0;
+const MAX_BRUSH_HARDNESS: u8 = 100;
+const DEFAULT_BRUSH_HARDNESS: u8 = 100;
+/// SPEC §17: 「Shift+[ / Shift+] で ±10」。
+const HARDNESS_STEP: u8 = 10;
+
+/// SPEC §17: 不透明度 1–100%(デフォルト 100。消しゴムは「強さ」として表示)。
+const MIN_BRUSH_OPACITY: u8 = 1;
+const MAX_BRUSH_OPACITY: u8 = 100;
+const DEFAULT_BRUSH_OPACITY: u8 = 100;
+
 /// SPEC §8: トーストは約 4 秒表示する。
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 
@@ -78,13 +100,20 @@ const DEFAULT_NEW_HEIGHT: u32 = 720;
 /// SPEC §8: JPEG 品質のデフォルト値。
 const DEFAULT_JPEG_QUALITY: u8 = 90;
 
-/// 日本語フォントの探索順(ARCHITECTURE.md §9)。最初に読めたものを使う。
-/// フォントはバンドルしない(バイナリサイズ・起動時間のため)。
-const JAPANESE_FONT_CANDIDATES: &[&str] = &[
-    r"C:\Windows\Fonts\YuGothM.ttc",
-    r"C:\Windows\Fonts\meiryo.ttc",
-    r"C:\Windows\Fonts\msgothic.ttc",
-];
+/// SPEC §19: フォントサイズ 8–144px(デフォルト 24。範囲そのものは
+/// `ui/options_bar.rs` のスライダーに直接持たせている、`brush_size`
+/// (1.0..=64.0)と同じ流儀)。日本語フォントの探索順自体(ARCHITECTURE.md §9)
+/// は `text::JAPANESE_FONT_CANDIDATES` に一本化した(UI 表示用フォント読み
+/// 込みとテキストツールのラスタライズが同じファイルを使う、SPEC §19:
+/// 「フォントは UI と同じシステム日本語フォント」)。
+const DEFAULT_TEXT_FONT_SIZE: f32 = 24.0;
+
+/// テキスト編集オーバーレイのプレビュー表示サイズ(論理ポイント)の上下限
+/// (ARCHITECTURE.md §15.3: 「表示フォントサイズ ≈ size × zoom / ppp
+/// (プレビューは近似で可、上限あり)」)。下限は極端なズームアウトでも
+/// 編集操作ができるように、上限は極端なズームインで UI を圧迫しないように。
+const TEXT_PREVIEW_MIN_PX: f32 = 6.0;
+const TEXT_PREVIEW_MAX_PX: f32 = 200.0;
 
 /// DARASK_BENCH=1 のときのみ存在する、起動計測用の状態(SPEC §11)。
 struct BenchState {
@@ -168,6 +197,26 @@ enum SelectDrag {
     },
 }
 
+/// v3 §19: テキストツールのインライン編集状態(ARCHITECTURE.md §15.3)。
+/// `DaraskApp::text_edit` が `Some` の間、`draw_text_edit_overlay` が毎フレーム
+/// `egui::TextEdit::multiline` のオーバーレイを表示する。確定(Ctrl+Enter/
+/// ボックス外クリック)でラスタライズして浮動片になり、この状態は消える
+/// (SPEC §19)。
+struct TextEditState {
+    /// クリック位置(画像座標)。SPEC §19: 「クリック位置=テキストボックスの
+    /// 左上」。
+    pos: Pos2,
+    buffer: String,
+    /// 生成直後の 1 フレームだけ `true`。そのフレームでのみ
+    /// `Response::request_focus()` を呼ぶ(SPEC §19 のクリック開始で
+    /// フォーカスを掴むため)。毎フレーム無条件に呼ぶと、egui の
+    /// 「フォーカス中ウィジェットの外側をクリックすると自動的にフォーカスを
+    /// 失う」判定(`SurrenderFocusOn::Clicks`)を直後に自前で上書きしてしまい、
+    /// `Response::lost_focus()` が「ボックス外クリック」を検知できなくなる
+    /// (`draw_text_edit_overlay` 参照)。
+    needs_focus: bool,
+}
+
 /// 未保存ガード(SPEC §8)が「保存/破棄を選んだ後に何をするか」を覚えておく
 /// ためのアクション(ARCHITECTURE.md §10: `pending_action: Option<PendingAction>`
 /// (New/Open(path?)/Close))。
@@ -218,6 +267,10 @@ pub struct DaraskApp {
     view: CanvasView,
     history: History,
     tool: ToolKind,
+    /// SPEC §20: 「U: 図形(直前に使った図形)」。`ToolKind::Line`/`Rect`/
+    /// `Ellipse` のいずれか(`set_tool` が唯一の更新箇所、`keymap::Action::
+    /// SelectLastShapeTool`/`CycleShapeTool` 参照)。
+    last_shape_tool: ToolKind,
     pen: PenTool,
     eraser: EraserTool,
     line: ShapeTool,
@@ -228,6 +281,14 @@ pub struct DaraskApp {
     primary: Color32,
     secondary: Color32,
     brush_size: f32,
+    /// SPEC §17: ブラシ/消しゴム共通の硬さ(0–100%)。`ToolCtx::hardness`
+    /// へ 0.0–1.0 に正規化して渡す。
+    brush_hardness: u8,
+    /// SPEC §17: ブラシ/消しゴム共通の不透明度(1–100%。消しゴムでは
+    /// 「強さ」として表示)。`ToolCtx::opacity` へ 0.0–1.0 に正規化して渡す。
+    brush_opacity: u8,
+    /// SPEC §17: 鉛筆モード(デフォルト OFF)。
+    pencil_mode: bool,
     /// 最近使った色(SPEC §5: 最大 8、先頭が最新)。
     recent_colors: VecDeque<Color32>,
     /// Alt+クリックによる一時スポイト(SPEC §4)の最中、対応するボタンの
@@ -249,6 +310,17 @@ pub struct DaraskApp {
     select_drag: Option<SelectDrag>,
     /// `Floating` のテクスチャキャッシュキー用の採番(canvas_view.rs 参照)。
     next_floating_id: u64,
+
+    // -- v3 §19: テキストツール(ARCHITECTURE.md §15.3) --------------------
+    /// UI と同じシステム日本語フォントのバイト列(`setup_japanese_fonts` が
+    /// 一度だけ読み込む)。`ab_glyph::FontRef` はこれを借用して呼び出しの
+    /// たびに軽量に構築し直す(`text::rasterize_text` 参照)。見つからなければ
+    /// `None`(テキストツールは使えないが、他機能はパニックせず動作する)。
+    text_font: Option<Arc<Vec<u8>>>,
+    /// SPEC §19: フォントサイズ 8–144px(デフォルト 24)。
+    text_font_size: f32,
+    /// 編集中のテキストボックス(`None` なら非編集中)。
+    text_edit: Option<TextEditState>,
 
     // -- M4: ダイアログ・未保存ガード(ARCHITECTURE.md §8, §10) -----------
     modal: Option<ModalState>,
@@ -292,13 +364,13 @@ impl DaraskApp {
         bench_mode: bool,
         cli_path: Option<PathBuf>,
     ) -> Self {
-        setup_japanese_fonts(&cc.egui_ctx);
+        let text_font = setup_japanese_fonts(&cc.egui_ctx);
 
         // M4 で発見・修正したバグ: egui 0.35 は `Options::zoom_with_keyboard`
         // がデフォルト `true` で、`Context::end_pass` が Ctrl+Plus/Ctrl+Equals/
         // Ctrl+Minus/Ctrl+Num0 を消費してアプリ全体の UI ズーム
         // (`pixels_per_point`)を変更してしまう。本アプリは SPEC §10 で
-        // キャンバス側の独自ズーム(`handle_view_shortcuts`)を持つため、
+        // キャンバス側の独自ズーム(`Action::ZoomIn`/`ZoomOut` 等)を持つため、
         // この egui 組み込みのグローバル UI ズームは無効化する(特に
         // Ctrl+=(Shift 不要の「+」)はどのショートカットにも束縛していない
         // ため、無効化しないと必ず egui 側に奪われ、UI 全体の拡大率が
@@ -327,6 +399,9 @@ impl DaraskApp {
             view: CanvasView::new(),
             history: History::new(),
             tool: ToolKind::Pen,
+            // SPEC §20: `U` の初期値。直線を最初の図形として扱う(SPEC §20:
+            // 「Shift+U で 直線→矩形→楕円 を巡回」の巡回順の先頭)。
+            last_shape_tool: ToolKind::Line,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
             line: ShapeTool::new_line(),
@@ -338,6 +413,9 @@ impl DaraskApp {
             primary: Color32::BLACK,
             secondary: Color32::WHITE,
             brush_size: 4.0,
+            brush_hardness: DEFAULT_BRUSH_HARDNESS,
+            brush_opacity: DEFAULT_BRUSH_OPACITY,
+            pencil_mode: false,
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
             color_wheel: ColorWheelState::new(),
@@ -349,6 +427,9 @@ impl DaraskApp {
             floating: None,
             select_drag: None,
             next_floating_id: 0,
+            text_font,
+            text_font_size: DEFAULT_TEXT_FONT_SIZE,
+            text_edit: None,
             modal: None,
             pending_action: None,
             pending_dialog: None,
@@ -420,258 +501,118 @@ impl DaraskApp {
     // ショートカット
     // -----------------------------------------------------------------
 
-    /// 単一キーのツールショートカット(SPEC §4)。テキスト入力中・モーダル
-    /// 表示中は無効(SPEC §4 最終行、ARCHITECTURE.md §10:
-    /// 「モーダル表示中はキャンバスへの入力を渡さない」の趣旨をショートカット
-    /// にも適用する)。
-    fn handle_tool_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        let mut requested = None;
-        ctx.input(|i| {
-            if i.key_pressed(Key::B) {
-                requested = Some(ToolKind::Pen);
-            } else if i.key_pressed(Key::E) {
-                requested = Some(ToolKind::Eraser);
-            } else if i.key_pressed(Key::L) {
-                requested = Some(ToolKind::Line);
-            } else if i.key_pressed(Key::R) {
-                requested = Some(ToolKind::Rect);
-            } else if i.key_pressed(Key::C) {
-                requested = Some(ToolKind::Ellipse);
-            } else if i.key_pressed(Key::F) {
-                requested = Some(ToolKind::Fill);
-            } else if i.key_pressed(Key::I) {
-                requested = Some(ToolKind::Picker);
-            } else if i.key_pressed(Key::M) {
-                requested = Some(ToolKind::Select);
-            } else if i.key_pressed(Key::H) {
-                requested = Some(ToolKind::Pan);
-            }
-        });
-        if let Some(tool) = requested {
-            self.set_tool(tool);
-        }
-    }
-
-    /// 色/ブラシサイズのショートカット(SPEC §5: X で入れ替え。SPEC §4:
-    /// `[`/`]` でブラシサイズ増減)。テキスト入力中・モーダル表示中は無効。
-    fn handle_color_and_brush_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        ctx.input(|i| {
-            if i.key_pressed(Key::X) {
-                std::mem::swap(&mut self.primary, &mut self.secondary);
-            }
-            if i.key_pressed(Key::OpenBracket) {
-                self.brush_size = (self.brush_size - 1.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
-            }
-            if i.key_pressed(Key::CloseBracket) {
-                self.brush_size = (self.brush_size + 1.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
-            }
-        });
-    }
-
-    /// アンドゥ/リドゥのショートカット(SPEC §9: Ctrl+Z / Ctrl+Y, Ctrl+Shift+Z)。
-    fn handle_undo_redo_shortcuts(&mut self, ctx: &egui::Context) {
-        // M4 で発見・修正したバグ: 他のショートカットハンドラ(ツール/色/
-        // 選択/表示/ファイル)はすべて `egui_wants_keyboard_input()` を確認
-        // しているのに、ここだけモーダルの有無しか見ていなかった。オプション
-        // バーのブラシサイズ/許容値スライダーの `DragValue` はモーダルでは
-        // ないため、その数値編集中に Ctrl+Z を押すとテキスト編集ではなく
-        // ドキュメントの undo が奪ってしまっていた(ARCHITECTURE.md §12-1
-        // 「Ctrl+Z 等がテキストフィールドと衝突しないよう消費順序に注意」に
-        // 違反)。
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        let redo_shortcut_alt = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::Z);
-        let redo_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Y);
-        let undo_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
-
-        let (undo, redo) = ctx.input_mut(|i| {
-            // egui::InputState::consume_shortcut は `matches_logically` で
-            // 判定するため、余分な Shift 修飾は無視される。つまり
-            // Ctrl+Shift+Z は Ctrl+Z にもマッチしてしまうので、最も限定的な
-            // ショートカットを先に消費する必要がある(そうしないと
-            // Ctrl+Shift+Z が常に「元に戻す」として誤消費されてしまう)。
-            // M4 で発見・修正したバグ: 以前は Ctrl+Z を先に判定していたため
-            // SPEC §7 の「やり直し (Ctrl+Y, Ctrl+Shift+Z)」の後者が機能して
-            // いなかった。
-            let redo_alt = i.consume_shortcut(&redo_shortcut_alt);
-            let redo = i.consume_shortcut(&redo_shortcut) || redo_alt;
-            let undo = i.consume_shortcut(&undo_shortcut);
-            (undo, redo)
-        });
-
-        // SPEC §13 最終項(v2 で修正): 「レイヤー操作・アンドゥは浮動片や
-        // ストローク進行中にはツール切替と同じ扱い(先に確定してから
-        // 実行)」。以前は `can_undo_redo_now()` で丸ごとブロックしていたが、
-        // それでは浮動片保持中(例: 貼り付け直後)に Ctrl+Z を押しても
-        // 「何も起きない」ように見え、SPEC の「先に確定してから実行」
-        // (=確定して、その確定を取り消す=実質キャンセル)という仕様に
-        // 反していた。`commit_open_gesture` で先に確定してしまえば
-        // ストロークは「進行中」ではなくなるため、旧コメントが懸念していた
-        // 「CoW タイルの退避時点とドキュメント実状態の食い違い」は起こらない。
-        if undo {
-            self.commit_open_gesture();
-            self.history.undo(&mut self.doc);
-        }
-        if redo {
-            self.commit_open_gesture();
-            self.history.redo(&mut self.doc);
-        }
-    }
-
-    /// 選択関連のショートカット(SPEC §6: Delete/Ctrl+X/Ctrl+C/Ctrl+V/
-    /// Ctrl+A、Enter/Esc は選択ツール使用中のみ)。
-    fn handle_selection_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        let delete_shortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
-        let cut_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::X);
-        let copy_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::C);
-        let paste_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::V);
-        let select_all_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::A);
-        let deselect_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::D);
-        let enter_shortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Enter);
-        let escape_shortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Escape);
-
-        let is_select = self.tool == ToolKind::Select;
-        let (delete, cut, copy, paste, select_all, deselect, commit) = ctx.input_mut(|i| {
-            let delete = i.consume_shortcut(&delete_shortcut);
-            let cut = i.consume_shortcut(&cut_shortcut);
-            let copy = i.consume_shortcut(&copy_shortcut);
-            let paste = i.consume_shortcut(&paste_shortcut);
-            let select_all = i.consume_shortcut(&select_all_shortcut);
-            let deselect = i.consume_shortcut(&deselect_shortcut);
-            let commit = is_select
-                && (i.consume_shortcut(&enter_shortcut) || i.consume_shortcut(&escape_shortcut));
-            (delete, cut, copy, paste, select_all, deselect, commit)
-        });
-
-        if delete {
-            self.delete_selection();
-        }
-        if cut {
-            self.cut_selection_to_clipboard();
-        }
-        if copy {
-            self.copy_selection_to_clipboard();
-        }
-        if paste {
-            self.paste_from_clipboard();
-        }
-        if select_all {
-            self.select_all();
-        }
-        if deselect {
-            self.commit_selection();
-        }
-        if commit {
-            self.commit_selection();
-        }
-    }
-
-    /// 表示メニューのショートカット(SPEC §10: Ctrl++/Ctrl+-/Ctrl+1/Ctrl+0)。
-    fn handle_view_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        let zoom_in_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Plus);
-        let zoom_out_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Minus);
-        let zoom_100_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num1);
-        let fit_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Num0);
-        let (zoom_in, zoom_out, zoom_100, fit) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&zoom_in_shortcut),
-                i.consume_shortcut(&zoom_out_shortcut),
-                i.consume_shortcut(&zoom_100_shortcut),
-                i.consume_shortcut(&fit_shortcut),
-            )
-        });
-        if zoom_in {
-            self.view.zoom_in();
-        }
-        if zoom_out {
-            self.view.zoom_out();
-        }
-        if zoom_100 {
-            self.view.zoom_to_100();
-        }
-        if fit {
-            self.view.fit_to_window(&self.doc);
-        }
-    }
-
-    /// ファイルメニューのショートカット(SPEC §7: Ctrl+N/Ctrl+O/Ctrl+S/
-    /// Ctrl+Shift+S)。Alt+F4 は OS/ウィンドウマネージャが `close_requested`
-    /// として通知するため、ここでは扱わない(`handle_close_request` 参照)。
-    fn handle_file_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
-            return;
-        }
-        // Ctrl+Shift+S を Ctrl+S より先に消費する(上の
-        // `handle_undo_redo_shortcuts` と同じ理由)。
-        let save_as_shortcut = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::S);
-        let save_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::S);
-        let new_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::N);
-        let open_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
-        let (save_as, save_doc, new_doc, open_doc) = ctx.input_mut(|i| {
-            let save_as = i.consume_shortcut(&save_as_shortcut);
-            let save_doc = i.consume_shortcut(&save_shortcut);
-            let new_doc = i.consume_shortcut(&new_shortcut);
-            let open_doc = i.consume_shortcut(&open_shortcut);
-            (save_as, save_doc, new_doc, open_doc)
-        });
-        if save_as {
-            self.begin_save_as();
-        } else if save_doc {
-            self.begin_save();
-        }
-        if new_doc {
-            self.request_action(PendingAction::New);
-        }
-        if open_doc {
-            self.request_action(PendingAction::Open(None));
-        }
-    }
-
-    /// レイヤーメニューのショートカット(SPEC §13: Ctrl+Shift+N 新規 /
-    /// Ctrl+E 下と結合 / Ctrl+Shift+E 画像の統合)。
+    /// SPEC §20(Photoshop 準拠ショートカット最終キーマップ)のショート
+    /// カットをここで一括ディスパッチする(ARCHITECTURE.md §15.4: 従来
+    /// バラバラだった `handle_tool_shortcuts`/`handle_color_and_brush_
+    /// shortcuts`/`handle_undo_redo_shortcuts`/`handle_selection_shortcuts`/
+    /// `handle_view_shortcuts`/`handle_file_shortcuts`/`handle_layer_
+    /// shortcuts` を `keymap::poll` 経由の単一ディスパッチへ集約した)。
+    /// キー割り当てそのもの(`Binding`)は `keymap::KEYMAP` が唯一の情報源
+    /// であり、消費順序(修飾キーの多いものから先に consume、
+    /// ARCHITECTURE.md §15.4 ②)も `keymap::poll` 側で一元的に保証する。
     ///
-    /// M4 で確立した「余分な Shift 修飾は無視されるため、より限定的な
-    /// ショートカットを先に消費する」規則(`handle_undo_redo_shortcuts` 参照)
-    /// をここでも守る: Ctrl+Shift+E を Ctrl+E より先に消費する。同じ理由で、
-    /// このハンドラは `handle_file_shortcuts`(Ctrl+N)より前に呼ぶ必要がある
-    /// (Ctrl+Shift+N が Ctrl+N として誤消費されないように、`ui()` 内の
-    /// 呼び出し順序で保証する)。
-    fn handle_layer_shortcuts(&mut self, ctx: &egui::Context) {
+    /// テキスト入力中・モーダル表示中は無効(SPEC §4 最終行、
+    /// ARCHITECTURE.md §10: 「モーダル表示中はキャンバスへの入力を渡さない」
+    /// の趣旨をショートカットにも適用する、ARCHITECTURE.md §15.4 ①)。
+    /// テキスト編集中専用の Ctrl+Enter/Esc だけは逆のガード(「編集中でな
+    /// ければ無効」)を持つため、この関数の対象外(`handle_text_edit_
+    /// shortcuts` が別枠のまま処理する、`keymap` モジュールドキュメント
+    /// コメント参照)。
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
             return;
         }
-        let add_layer_shortcut = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::N);
-        let flatten_shortcut = KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::E);
-        let merge_down_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::E);
+        // v3 §18: Enter(確定)/Esc(キャンセル)は選択/移動ツール使用中のみ
+        // 有効(移動ツールも選択と同じ `Selection`/`Floating` 浮動化パスを
+        // 使うため、`commit_open_gesture`/`move_down` と同じ扱い)。
+        let is_select_or_move = matches!(self.tool, ToolKind::Select | ToolKind::Move);
 
-        let (add_layer, flatten, merge_down) = ctx.input_mut(|i| {
-            let add_layer = i.consume_shortcut(&add_layer_shortcut);
-            let flatten = i.consume_shortcut(&flatten_shortcut);
-            let merge_down = i.consume_shortcut(&merge_down_shortcut);
-            (add_layer, flatten, merge_down)
-        });
+        for action in keymap::poll(ctx) {
+            match action {
+                Action::SelectTool(kind) => self.set_tool(kind),
+                // SPEC §20: 「U: 図形(直前に使った図形)」。
+                Action::SelectLastShapeTool => self.set_tool(self.last_shape_tool),
+                // SPEC §20: 「Shift+U で 直線→矩形→楕円 を巡回」。
+                Action::CycleShapeTool => self.cycle_shape_tool(),
 
-        if add_layer {
-            self.layer_add();
-        }
-        if flatten {
-            self.layer_flatten();
-        }
-        if merge_down {
-            self.layer_merge_down();
+                Action::SwapColors => std::mem::swap(&mut self.primary, &mut self.secondary),
+                // SPEC §20: 「D 初期色(黒・白)」。MS ペイント等と同じ初期値
+                // (`new()` の `primary`/`secondary` 初期化と揃える)。
+                Action::DefaultColors => {
+                    self.primary = Color32::BLACK;
+                    self.secondary = Color32::WHITE;
+                }
+                Action::SetBrushOpacity(pct) => {
+                    self.brush_opacity = pct.clamp(MIN_BRUSH_OPACITY, MAX_BRUSH_OPACITY);
+                }
+
+                Action::BrushSizeDec => {
+                    self.brush_size = (self.brush_size - 1.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+                }
+                Action::BrushSizeInc => {
+                    self.brush_size = (self.brush_size + 1.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+                }
+                Action::BrushHardnessDec => {
+                    self.brush_hardness = self
+                        .brush_hardness
+                        .saturating_sub(HARDNESS_STEP)
+                        .max(MIN_BRUSH_HARDNESS);
+                }
+                Action::BrushHardnessInc => {
+                    self.brush_hardness = self
+                        .brush_hardness
+                        .saturating_add(HARDNESS_STEP)
+                        .min(MAX_BRUSH_HARDNESS);
+                }
+
+                // SPEC §13 最終項/§9: 「レイヤー操作・アンドゥは浮動片や
+                // ストローク進行中にはツール切替と同じ扱い(先に確定してから
+                // 実行)」。`commit_open_gesture` で先に確定してしまえば
+                // ストロークは「進行中」ではなくなる(M4 で確立した規則)。
+                Action::Undo => {
+                    self.commit_open_gesture();
+                    self.history.undo(&mut self.doc);
+                }
+                Action::Redo => {
+                    self.commit_open_gesture();
+                    self.history.redo(&mut self.doc);
+                }
+
+                Action::Cut => self.cut_selection_to_clipboard(),
+                Action::Copy => {
+                    self.copy_selection_to_clipboard();
+                }
+                Action::Paste => self.paste_from_clipboard(),
+                Action::Delete => self.delete_selection(),
+                Action::SelectAll => self.select_all(),
+                Action::Deselect => self.commit_selection(),
+                Action::FreeTransform => self.free_transform(),
+                Action::CommitFloating => {
+                    if is_select_or_move {
+                        self.commit_selection();
+                    }
+                }
+                Action::CancelFloating => {
+                    if is_select_or_move {
+                        self.cancel_floating();
+                    }
+                }
+
+                Action::LayerAdd => self.layer_add(),
+                Action::LayerDuplicate => self.layer_duplicate(),
+                Action::LayerMergeDown => self.layer_merge_down(),
+                Action::LayerFlatten => self.layer_flatten(),
+
+                Action::New => self.request_action(PendingAction::New),
+                Action::Open => self.request_action(PendingAction::Open(None)),
+                Action::Save => self.begin_save(),
+                Action::SaveAs => self.begin_save_as(),
+
+                Action::ZoomIn => self.view.zoom_in(),
+                Action::ZoomOut => self.view.zoom_out(),
+                Action::Zoom100 => self.view.zoom_to_100(),
+                Action::FitWindow => self.view.fit_to_window(&self.doc),
+            }
         }
     }
 
@@ -680,7 +621,7 @@ impl DaraskApp {
     // -----------------------------------------------------------------
 
     /// ツール切り替えの唯一の入口(ツールバークリック・単一キー双方から
-    /// 呼ぶ)。選択ツールから離れるときは浮動片を確定させる
+    /// 呼ぶ)。選択・移動ツール(v3 §18)から離れるときは浮動片を確定させる
     /// (SPEC §6: 「ツール切替→浮動片をその位置に合成」)。それ以外の描画系
     /// ツールから離れるときも、進行中のジェスチャがあれば確定させる
     /// (M4 で発見・修正したバグ: `tools/mod.rs::Tool::cancel` のコメント
@@ -689,11 +630,44 @@ impl DaraskApp {
     /// 無警告で置き換えられ、既に描画済みのピクセルが undo 履歴に残らない
     /// まま失われていた)。
     fn set_tool(&mut self, new_tool: ToolKind) {
+        // SPEC §20: 「U: 図形(直前に使った図形)」。図形系ツールへ切り替える
+        // (または既にそれを使っている)たびに更新しておく。ツールバーの
+        // 直接クリック(`toolbar::show` の呼び出し元)とキーボード
+        // ショートカット(`Action::SelectTool`)は両方ここを通るため、この
+        // 1 箇所だけで「直前に使った図形」の不変条件を保てる。
+        if matches!(
+            new_tool,
+            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse
+        ) {
+            self.last_shape_tool = new_tool;
+        }
         if new_tool == self.tool {
             return;
         }
         self.commit_open_gesture();
         self.tool = new_tool;
+    }
+
+    /// SPEC §20: 「Shift+U で 直線→矩形→楕円 を巡回」。現在アクティブなのが
+    /// 図形系ツールならそこから、そうでなければ `last_shape_tool`(= `U` が
+    /// 選ぶツール)から次の図形へ進める。
+    fn cycle_shape_tool(&mut self) {
+        let current = if matches!(
+            self.tool,
+            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse
+        ) {
+            self.tool
+        } else {
+            self.last_shape_tool
+        };
+        let next = match current {
+            ToolKind::Line => ToolKind::Rect,
+            ToolKind::Rect => ToolKind::Ellipse,
+            // `ToolKind::Ellipse` はもちろん、`last_shape_tool` が図形以外
+            // (理論上は起きない初期値以外のケース)であっても直線へ戻す。
+            _ => ToolKind::Line,
+        };
+        self.set_tool(next);
     }
 
     /// 進行中のジェスチャ(選択ツールの浮動片、または他ツールのドラッグ中
@@ -703,7 +677,13 @@ impl DaraskApp {
     /// 一箇所に集約する。`set_tool` に加えて、レイヤー構造の変更・アクティブ
     /// レイヤーの切り替えの前にも呼ぶ)。
     fn commit_open_gesture(&mut self) {
-        if self.tool == ToolKind::Select {
+        // v3 §18: 移動(V)も選択と同じ `Selection`/`Floating` 浮動化パスを
+        // 使う(`move_down`/`handle_move_event` 参照)ため、ここでも
+        // `commit_selection` を経由させる必要がある。そうしないと、移動
+        // ツールでドラッグ中に他ツールへ切り替えたとき浮動片が確定されず
+        // 消えてしまう(M4 で選択ツールについて発見・修正したバグと同じ
+        // クラス、`Tool::cancel` のコメント参照)。
+        if matches!(self.tool, ToolKind::Select | ToolKind::Move) {
             self.commit_selection();
         } else {
             self.end_active_gesture();
@@ -713,6 +693,16 @@ impl DaraskApp {
     /// 現在のツールに進行中のジェスチャ(ドラッグ)があれば、`Up` が来た
     /// 場合と同様に確定して終了する(`set_tool` からのみ呼ぶ)。
     fn end_active_gesture(&mut self) {
+        // v3 §19: テキストは `ToolCtx`(`self.doc`/`self.history` の借用)を
+        // 経由しない独自の確定処理を持つ。`ToolCtx` を組み立てる前に分岐する
+        // 必要がある — 確定処理自体が `&mut self` を要求するメソッド
+        // (`commit_pending_text_edit_and_composite`)を呼ぶため、`ctx` が
+        // `self.doc`/`self.history` を借用したままだと借用チェッカーに
+        // 弾かれる。
+        if self.tool == ToolKind::Text {
+            self.commit_pending_text_edit_and_composite();
+            return;
+        }
         let mut used_colors = Vec::new();
         let mut ctx = ToolCtx {
             doc: &mut self.doc,
@@ -720,6 +710,9 @@ impl DaraskApp {
             primary: self.primary,
             secondary: self.secondary,
             brush_size: self.brush_size,
+            hardness: self.brush_hardness as f32 / 100.0,
+            opacity: self.brush_opacity as f32 / 100.0,
+            pencil: self.pencil_mode,
             used_colors: &mut used_colors,
         };
         match self.tool {
@@ -730,8 +723,17 @@ impl DaraskApp {
             ToolKind::Ellipse => self.ellipse.cancel(&mut ctx),
             // 塗りつぶし/スポイト/手のひらはドラッグ状態(進行中のジェス
             // チャ)を持たない(塗りつぶしは Down で即座に確定する 1 ショット
-            // のツール)。選択は上の分岐で別途扱う。
-            ToolKind::Fill | ToolKind::Picker | ToolKind::Select | ToolKind::Pan => {}
+            // のツール)。選択・移動は `commit_open_gesture` の分岐で別途
+            // 扱う(ここには来ない)。ズームもドラッグ状態を持たない。
+            // テキストは上で早期リターン済み(ここには来ない、網羅性のためだけ
+            // に列挙する)。
+            ToolKind::Fill
+            | ToolKind::Picker
+            | ToolKind::Select
+            | ToolKind::Pan
+            | ToolKind::Move
+            | ToolKind::Zoom
+            | ToolKind::Text => {}
         }
         for color in used_colors {
             self.push_recent_color(color);
@@ -739,19 +741,69 @@ impl DaraskApp {
     }
 
     /// 現在のツールに応じたカーソル形状(手のひらは `Tool` を持たないため
-    /// ここで直接返す、ARCHITECTURE.md §4)。
-    fn cursor_for_active_tool(&self) -> egui::CursorIcon {
+    /// ここで直接返す、ARCHITECTURE.md §4)。`alt_held` は v3 §18 のズーム
+    /// ツール用(Alt 押下中は縮小になるので `ZoomOut` を出す)。
+    fn cursor_for_active_tool(&self, alt_held: bool) -> egui::CursorIcon {
         match self.tool {
-            ToolKind::Pen => self.pen.cursor(),
-            ToolKind::Eraser => self.eraser.cursor(),
+            ToolKind::Pen | ToolKind::Eraser => self.brush_cursor_icon(),
             ToolKind::Line => self.line.cursor(),
             ToolKind::Rect => self.rect_tool.cursor(),
             ToolKind::Ellipse => self.ellipse.cursor(),
             ToolKind::Fill => self.fill.cursor(),
             ToolKind::Picker => self.picker.cursor(),
             ToolKind::Pan => egui::CursorIcon::Grab,
-            ToolKind::Select => self.select_cursor(),
+            ToolKind::Select | ToolKind::Move => self.select_cursor(),
+            // SPEC §18: 「カーソルは虫眼鏡」。ARCHITECTURE.md §15.2 は
+            // ZoomIn/ZoomOut を明示する。
+            ToolKind::Zoom => {
+                if alt_held {
+                    egui::CursorIcon::ZoomOut
+                } else {
+                    egui::CursorIcon::ZoomIn
+                }
+            }
+            // v3 §19: テキスト。
+            ToolKind::Text => egui::CursorIcon::Text,
         }
+    }
+
+    /// ブラシ半径(画像座標)をスクリーン論理ポイントへ換算する
+    /// (ARCHITECTURE.md §15.1: `半径 = brush_r × zoom / ppp`)。
+    fn brush_radius_screen(&self) -> f32 {
+        crate::tools::brush_radius(self.brush_size) * self.view.zoom / self.view.ppp()
+    }
+
+    /// SPEC §17: 「ブラシカーソル: キャンバス上ではブラシ半径の円アウトライン
+    /// …を表示し、OS カーソルは非表示。画面上の円が 3px 未満になる場合は
+    /// 十字カーソルにフォールバック」。円自体は `draw_brush_cursor` が描く。
+    fn brush_cursor_icon(&self) -> egui::CursorIcon {
+        if self.brush_radius_screen() < 3.0 {
+            egui::CursorIcon::Crosshair
+        } else {
+            egui::CursorIcon::None
+        }
+    }
+
+    /// ブラシ/消しゴム使用中にキャンバス上へ描く円カーソル(白 1.5pt の
+    /// 内側に黒 1pt の二重線、SPEC §17)。`cursor_for_active_tool` が
+    /// `CursorIcon::None` を返したときだけ意味を持つので、3px 未満の場合と
+    /// 同じ条件でここでも描かない(OS カーソル側は十字にフォールバック済み)。
+    fn draw_brush_cursor(&self, painter: &egui::Painter, hover_img: Pos2) {
+        let radius_screen = self.brush_radius_screen();
+        if radius_screen < 3.0 {
+            return;
+        }
+        let center = self.view.img_to_screen_pos(hover_img);
+        painter.circle_stroke(
+            center,
+            radius_screen,
+            egui::Stroke::new(3.0, egui::Color32::WHITE),
+        );
+        painter.circle_stroke(
+            center,
+            radius_screen,
+            egui::Stroke::new(1.0, egui::Color32::BLACK),
+        );
     }
 
     /// SPEC §16: 「ハンドルホバー時はリサイズカーソルを表示」。
@@ -775,7 +827,10 @@ impl DaraskApp {
     fn dispatch_canvas_events(&mut self, events: Vec<ToolEvent>) {
         for ev in events {
             if let ToolEvent::Down { img, button, mods } = ev {
-                if mods.alt {
+                // v3 §18: ズームツールは Alt+クリックに「縮小」という独自の
+                // 意味を持つ(SPEC §18)ため、他ツール共通の一時スポイト
+                // 横取りから除外する。
+                if mods.alt && self.tool != ToolKind::Zoom {
                     self.sample_eyedropper_color(img, button);
                     self.alt_eyedropper_active = true;
                     continue;
@@ -806,6 +861,43 @@ impl DaraskApp {
                 continue;
             }
 
+            // v3 §18: 移動ツールも選択と同じ `Selection`/`Floating` 機構を
+            // 使う(`move_down` のみ選択と異なる、それ以外は共有)。
+            if self.tool == ToolKind::Move {
+                self.handle_move_event(ev);
+                continue;
+            }
+
+            // v3 §18: ズームツール。クリック=+1 段階、Alt+クリック=-1 段階
+            // (SPEC §18)。右クリック・中クリックは何もしない(仕様に明記が
+            // ないため、独自の挙動を足さない)。
+            if self.tool == ToolKind::Zoom {
+                if let ToolEvent::Down { img, button, mods } = ev {
+                    if button == PointerButton::Primary {
+                        let notches = if mods.alt { -1 } else { 1 };
+                        self.view.zoom_at_point(notches, img);
+                    }
+                }
+                continue;
+            }
+
+            // v3 §19: テキストツール。編集中でなければクリックで新規編集を
+            // 開始する。編集中に届く Down は「ボックス外クリック」でしか
+            // 起こり得ない(ボックス内クリックは `draw_text_edit_overlay` の
+            // `Area` が占有するのでここまで届かない)ため、ここで新規編集を
+            // 始めてはいけない — その確定は `draw_text_edit_overlay` の
+            // `lost_focus()` 判定に任せる(SPEC §19: 「確定…ボックス外
+            // クリック」)。二重に処理すると同じクリックで「確定」と「新規
+            // 開始」が両方走ってしまう。
+            if self.tool == ToolKind::Text {
+                if self.text_edit.is_none() {
+                    if let ToolEvent::Down { img, .. } = ev {
+                        self.begin_text_edit(img);
+                    }
+                }
+                continue;
+            }
+
             let mut used_colors = Vec::new();
             let mut ctx = ToolCtx {
                 doc: &mut self.doc,
@@ -813,6 +905,9 @@ impl DaraskApp {
                 primary: self.primary,
                 secondary: self.secondary,
                 brush_size: self.brush_size,
+                hardness: self.brush_hardness as f32 / 100.0,
+                opacity: self.brush_opacity as f32 / 100.0,
+                pencil: self.pencil_mode,
                 used_colors: &mut used_colors,
             };
             match self.tool {
@@ -822,9 +917,14 @@ impl DaraskApp {
                 ToolKind::Rect => self.rect_tool.event(ev, &mut ctx),
                 ToolKind::Ellipse => self.ellipse.event(ev, &mut ctx),
                 ToolKind::Fill => self.fill.event(ev, &mut ctx),
-                // 手のひら(canvas_view が横取り)・選択・スポイトは上で
-                // 処理済み。
-                ToolKind::Select | ToolKind::Pan | ToolKind::Picker => {}
+                // 手のひら(canvas_view が横取り)・選択・移動・ズーム・
+                // スポイト・テキストは上で処理済み。
+                ToolKind::Select
+                | ToolKind::Pan
+                | ToolKind::Picker
+                | ToolKind::Move
+                | ToolKind::Zoom
+                | ToolKind::Text => {}
             }
             for color in used_colors {
                 self.push_recent_color(color);
@@ -874,6 +974,67 @@ impl DaraskApp {
             ToolEvent::Up { img, .. } => self.select_up(img),
             ToolEvent::Hover { .. } => {}
         }
+    }
+
+    // -----------------------------------------------------------------
+    // v3 §18: 移動ツール(ARCHITECTURE.md §15.2)
+    //
+    // 「Down 時に選択があれば選択範囲を、なければ全範囲を、既存の浮動化パス
+    // (`begin_floating_from_selection`)で浮動化し、以後は既存の浮動片
+    // ドラッグと同一コード」。ドラッグ更新(`select_drag_move`)・確定
+    // (`select_up`/`commit_selection`)・ハンドル拡縮は選択ツールと完全に
+    // 共有する。異なるのは Down の初手だけ: 選択ツールは「クリックが選択
+    // 矩形の外なら新規の矩形選択ドラッグを始める」が、移動ツールは矩形を
+    // ドラッグで作らず、既存の選択(あれば)またはアクティブレイヤー全体を
+    // 問答無用で浮動化して追従を始める(SPEC §18)。
+    // -----------------------------------------------------------------
+
+    fn handle_move_event(&mut self, ev: ToolEvent) {
+        match ev {
+            ToolEvent::Down { img, .. } => self.move_down(img),
+            ToolEvent::Drag { img, mods, .. } => self.select_drag_move(img, mods),
+            ToolEvent::Up { img, .. } => self.select_up(img),
+            ToolEvent::Hover { .. } => {}
+        }
+    }
+
+    /// アクティブレイヤー全体を覆う画像座標の矩形。
+    fn doc_full_rect(&self) -> crate::document::IRect {
+        crate::document::IRect {
+            x0: 0,
+            y0: 0,
+            x1: self.doc.width as i32,
+            y1: self.doc.height as i32,
+        }
+    }
+
+    fn move_down(&mut self, img: Pos2) {
+        if let Some(handle) = self.hit_resize_handle(img) {
+            self.begin_resize_handle(handle, img);
+            return;
+        }
+        if let Some(floating) = &self.floating {
+            // 既に浮動中(前フレームまでの移動が未確定): クリック位置に
+            // 関係なくそのまま追従を続ける(SPEC §18: ドラッグでレイヤー/
+            // 選択範囲全体を動かす、選択ツールのような「範囲外クリックは
+            // 選択扱いしない」という区別は移動ツールには無い)。
+            let offset = img - floating.pos;
+            self.select_drag = Some(SelectDrag::MoveFloating { offset });
+            return;
+        }
+        // SPEC §18: 「選択があればその範囲だけを移動。空レイヤー(全透明)
+        // でも動作(確定時 before==after 抑制が効く)」。`PendingFloating`
+        // 経由にすることで、実際にドラッグしなかった単クリックは選択ツール
+        // と同じく浮動化せず、undo エントリも積まない
+        // (`select_drag_move`/`select_up` の `PendingFloating` 分岐参照)。
+        let rect = self
+            .selection
+            .map(|s| s.rect)
+            .unwrap_or_else(|| self.doc_full_rect());
+        self.select_drag = Some(SelectDrag::PendingFloating {
+            rect,
+            down_img: img,
+        });
     }
 
     /// 選択矩形・浮動片の外周にある矩形(画像座標)。どちらも無ければ `None`
@@ -1151,9 +1312,9 @@ impl DaraskApp {
     }
 
     /// 浮動片を現在位置に合成して 1 つの undo 単位にし、選択を解除する
-    /// (SPEC §6: Enter/選択外クリック/ツール切替での確定、Ctrl+D、Esc)。
-    /// 浮動片が無い(単なる矩形選択だけ、または何も無い)場合は選択を
-    /// 解除するだけ。
+    /// (SPEC §6: Enter/選択外クリック/ツール切替での確定、Ctrl+D。v3 §18 で
+    /// Esc はここではなく `cancel_floating` に切り替わった)。浮動片が無い
+    /// (単なる矩形選択だけ、または何も無い)場合は選択を解除するだけ。
     fn commit_selection(&mut self) {
         self.select_drag = None;
         if let Some(floating) = self.floating.take() {
@@ -1163,6 +1324,59 @@ impl DaraskApp {
             self.history.commit_stroke(&mut self.doc);
         }
         self.selection = None;
+    }
+
+    /// SPEC §18(v1 §6 を上書き): Esc = キャンセル。浮動片を破棄して元の
+    /// 位置・内容に完全復元し(切り出し元も戻す)、選択を解除する。履歴には
+    /// 何も積まない。
+    ///
+    /// `commit_selection` と対になる終了経路: `commit_selection` は浮動片を
+    /// 現在位置へ合成して 1 undo 単位にするが、こちらは合成せずに捨てる。
+    /// `Floating::cut_from` が `Some` なら、浮動化した瞬間に
+    /// `ensure_tiles_saved` で退避しておいた CoW タイルから元ピクセルを
+    /// 書き戻す(`History::restore_stroke_region`)。クリップボードからの
+    /// 貼り付け(`cut_from == None`)は戻すべき元領域が無いので、単に
+    /// ストロークを破棄するだけでよい。
+    fn cancel_floating(&mut self) {
+        self.select_drag = None;
+        if let Some(floating) = self.floating.take() {
+            if let Some(cut_from) = floating.cut_from {
+                self.history.restore_stroke_region(&mut self.doc, cut_from);
+            }
+        }
+        self.history.cancel_stroke();
+        self.selection = None;
+    }
+
+    /// SPEC §18: Ctrl+T(自由変形)。選択範囲があれば浮動化してハンドル表示。
+    /// なければ全選択→アクティブレイヤーを浮動化してハンドル表示。以降は
+    /// §16(ハンドルドラッグ)・§18(Esc キャンセル)と同じ操作になる。
+    fn free_transform(&mut self) {
+        // 進行中のジェスチャを先に確定する。ただし選択/移動ツールで「まだ
+        // 浮動化していないプレーンな選択」がある場合は、Ctrl+T がまさに
+        // それを対象にするため、`commit_open_gesture`/`commit_selection`
+        // (常に `self.selection` をクリアしてしまう)を経由させずに残す
+        // (ARCHITECTURE.md §15.2: 「選択範囲があれば浮動化して」を壊さない
+        // ため)。
+        match self.tool {
+            ToolKind::Select | ToolKind::Move if self.floating.is_some() => {
+                self.commit_selection();
+            }
+            ToolKind::Select | ToolKind::Move => self.select_drag = None,
+            _ => self.end_active_gesture(),
+        }
+        self.tool = ToolKind::Select;
+
+        let rect = self
+            .selection
+            .map(|s| s.rect)
+            .unwrap_or_else(|| self.doc_full_rect());
+        let rect = rect.clamp_to(self.doc.width, self.doc.height);
+        if rect.is_empty() {
+            return;
+        }
+        let anchor = pos2(rect.x0 as f32, rect.y0 as f32);
+        self.begin_floating_from_selection(rect, anchor);
     }
 
     /// 選択領域(または浮動片)を消去する(SPEC §6: Delete)。浮動片がある
@@ -1340,8 +1554,28 @@ impl DaraskApp {
     fn begin_paste_floating(&mut self, w: u32, h: u32, pixels: Vec<u8>) {
         let center = self.view.view_center_img();
         let pos = pos2(center.x - w as f32 / 2.0, center.y - h as f32 / 2.0);
+        self.place_new_floating(pos, w, h, pixels);
+    }
+
+    /// 新規コンテンツ(クリップボード貼り付け・v3 §19 のテキストラスタライズ)
+    /// を「切り出し元を持たない」浮動片として配置する共通処理
+    /// (`begin_paste_floating` から抽出。挙動は元のコードと同一)。ツールを
+    /// 選択に切り替えることで、以後は既存の浮動片ハンドリング(移動・
+    /// ハンドル拡縮・Enter確定・Esc破棄)にそのまま乗る(上の
+    /// `begin_paste_floating` のコメント参照)。
+    ///
+    /// `self.tool = ToolKind::Select` は **`set_tool` 経由ではなく直接代入**
+    /// する。テキストツールの `commit_pending_text_edit`(Ctrl+Enter/ボックス
+    /// 外クリックの通常確定)はここを問題なく通れるが、もし将来
+    /// `end_active_gesture`(`set_tool`/`commit_open_gesture` の内側)から
+    /// 呼ばれる経路が増えた場合、`set_tool` 経由だと再入(`commit_open_
+    /// gesture` の呼び出し元が後で `self.tool = 元々要求されたツール` を
+    /// 上書きしてしまう)が起きる(`free_transform` が同じ理由で直接代入して
+    /// いるのと同じ落とし穴)。呼び出し側は既に先行ジェスチャを確定済みで
+    /// あることが前提。
+    fn place_new_floating(&mut self, pos: Pos2, w: u32, h: u32, pixels: Vec<u8>) {
         let id = self.alloc_floating_id();
-        self.set_tool(ToolKind::Select);
+        self.tool = ToolKind::Select;
         // 切り出し元が無いので `begin_stroke` するだけで `ensure_tiles_saved`
         // は呼ばない(confirm 時に合成先だけ保存すれば十分、
         // `commit_selection` 参照)。
@@ -1368,6 +1602,7 @@ impl DaraskApp {
         self.history.push(HistoryOp::ReplaceAll { before, after });
         self.layer_rename = None;
         self.next_layer_number = 1;
+        self.reset_tool_state_for_new_document();
     }
 
     fn draw_selection_overlay(&mut self, painter: &egui::Painter) {
@@ -1397,6 +1632,205 @@ impl DaraskApp {
         }
         self.selection
             .map(|s| (s.rect.width() as u32, s.rect.height() as u32))
+    }
+
+    // -----------------------------------------------------------------
+    // v3 §19: テキストツール(ARCHITECTURE.md §15.3)
+    // -----------------------------------------------------------------
+
+    /// キャンバスクリックで新規のテキスト編集を開始する(SPEC §19:
+    /// 「クリック位置=テキストボックスの左上」)。フォントが読み込めていない
+    /// (`self.text_font.is_none()`)場合は編集を始めても最終的に何もラスタ
+    /// ライズできないため、その場でトーストを出して編集自体を始めない
+    /// (パニックしない、CLAUDE.md 鉄則。編集を許してしまうと「打てるのに
+    /// 確定しても何も起きない」という分かりにくい行き止まりになる)。
+    fn begin_text_edit(&mut self, img: Pos2) {
+        if self.text_font.is_none() {
+            self.show_toast(
+                "日本語フォントが見つからないため、テキストツールを使用できません".to_owned(),
+            );
+            return;
+        }
+        self.text_edit = Some(TextEditState {
+            pos: img,
+            buffer: String::new(),
+            needs_focus: true,
+        });
+    }
+
+    /// SPEC §19: 「Esc は入力破棄」。ラスタライズせず、履歴にも何も積まない。
+    fn discard_pending_text_edit(&mut self) {
+        self.text_edit = None;
+    }
+
+    /// テキスト編集中の Ctrl+Enter(確定)/Esc(破棄)。`ctx.egui_wants_
+    /// keyboard_input()` を見る他のショートカットハンドラとは逆に、
+    /// 「編集中でなければ何もしない」だけをガードにする(編集中は
+    /// `TextEdit` がフォーカスを持つので `wants_keyboard_input()` は真になり
+    /// 他のハンドラは自動的に無効化される。ここはそのフォーカスを持つ本人
+    /// のためのハンドラなので、同じガードを使ってはいけない)。
+    fn handle_text_edit_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.text_edit.is_none() {
+            return;
+        }
+        let commit_shortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Enter);
+        let cancel_shortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Escape);
+        let (commit, cancel) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&commit_shortcut),
+                i.consume_shortcut(&cancel_shortcut),
+            )
+        });
+        // Ctrl+Enter を先に判定・消費する(素の Enter は複数行入力の改行に
+        // 使うため、`TextEdit` 自身に渡さなければならない。ここで消費するのは
+        // Ctrl 修飾つきの Enter イベントだけなので、素の改行入力は影響を
+        // 受けない)。
+        if commit {
+            self.commit_pending_text_edit();
+        } else if cancel {
+            self.discard_pending_text_edit();
+        }
+    }
+
+    /// テキスト編集の内容をラスタライズする(SPEC §19: 「空文字列の確定は
+    /// 何もしない」)。フォント未読み込み・レイアウト結果が空(空白のみ等)
+    /// なら `None`。色は確定時点の `self.primary`(編集中の色変更をそのまま
+    /// 反映する、`draw_text_edit_overlay` のプレビューと同じ色)。
+    fn rasterize_pending_text(&mut self, text: &str) -> Option<(u32, u32, Vec<u8>)> {
+        if text.is_empty() {
+            return None;
+        }
+        let Some(font_bytes) = self.text_font.clone() else {
+            self.show_toast(
+                "日本語フォントが見つからないため、テキストを描画できません".to_owned(),
+            );
+            return None;
+        };
+        let rgba = color_to_straight_rgba(self.primary);
+        let (w, h, pixels) = text::rasterize_text(&font_bytes, text, self.text_font_size, rgba);
+        if w == 0 || h == 0 {
+            None
+        } else {
+            Some((w, h, pixels))
+        }
+    }
+
+    /// SPEC §19 の通常確定(Ctrl+Enter または ボックス外クリック): ラスタ
+    /// ライズして**浮動片として配置**する(移動・ハンドル拡縮可、Enter 等で
+    /// 通常確定=1 undo 単位、既存の `Floating` 機構をそのまま使う)。
+    fn commit_pending_text_edit(&mut self) {
+        let Some(state) = self.text_edit.take() else {
+            return;
+        };
+        let Some((w, h, pixels)) = self.rasterize_pending_text(&state.buffer) else {
+            return;
+        };
+        self.place_new_floating(state.pos, w, h, pixels);
+        self.push_recent_color(self.primary);
+    }
+
+    /// ツール切替(ツールバークリック等)でテキスト編集が中断された場合の
+    /// 確定。SPEC §19 は「Ctrl+Enter またはボックス外クリック」でしか確定を
+    /// 定めていないが、他のツール(選択/移動の浮動片、ペン等のストローク)は
+    /// 「ツール切替=進行中のジェスチャを 1 undo 単位として確定する」という
+    /// 一貫した規則に従っている(`Tool::cancel` のドキュメントコメント参照)
+    /// ため、テキストもそれに合わせる。ただし通常確定と違い**浮動片にはせず
+    /// 直接レイヤーへ合成**する(ユーザーは既に別のツールへ意識を移して
+    /// いるので、宙ぶらりんの浮動片を残さない、選択/移動ツールでの
+    /// 「ツール切替=浮動片を確定」と同じ扱い、`commit_selection` 参照)。
+    ///
+    /// `end_active_gesture`(`set_tool`/`commit_open_gesture` の内側)からのみ
+    /// 呼ばれる。**`self.tool`/`set_tool` に一切触れてはいけない** —
+    /// 再入すると呼び出し元の `set_tool` が後で `self.tool` を上書きして
+    /// しまう(`place_new_floating` のコメントと同じ落とし穴)。そのため
+    /// ここは `place_new_floating` を経由せず、`Floating`/`select::
+    /// composite_floating` を直接使って合成する。
+    fn commit_pending_text_edit_and_composite(&mut self) {
+        let Some(state) = self.text_edit.take() else {
+            return;
+        };
+        let Some((w, h, pixels)) = self.rasterize_pending_text(&state.buffer) else {
+            return;
+        };
+        // id は合成後すぐ破棄する使い捨ての `Floating` なので値は問わない
+        // (`canvas_view` のテクスチャキャッシュには載らない)。
+        let floating = Floating::new(pixels, w, h, state.pos, None, 0);
+        let target = select::floating_target_rect(&floating);
+        self.history.begin_stroke(self.doc.active);
+        self.history.ensure_tiles_saved(&self.doc, target);
+        select::composite_floating(&mut self.doc, &floating);
+        self.history.commit_stroke(&mut self.doc);
+        self.doc.modified = true;
+        self.push_recent_color(self.primary);
+    }
+
+    /// テキスト編集中のインラインオーバーレイ(SPEC §19: 「クリック位置に
+    /// インラインのテキスト入力ボックス(egui TextEdit、複数行、IME
+    /// 対応)を表示」)。呼び出し順は `dispatch_canvas_events` の**後**
+    /// (`ui()` 内の呼び出し箇所のコメント参照)。
+    fn draw_text_edit_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.text_edit.take() else {
+            return;
+        };
+        let TextEditState {
+            pos,
+            mut buffer,
+            needs_focus,
+        } = state;
+        let screen_pos = self.view.img_to_screen_pos(pos);
+        // ARCHITECTURE.md §15.3: 「表示フォントサイズ ≈ size × zoom / ppp
+        // (プレビューは近似で可、上限あり)」。
+        let display_size = (self.text_font_size * self.view.zoom / self.view.ppp())
+            .clamp(TEXT_PREVIEW_MIN_PX, TEXT_PREVIEW_MAX_PX);
+        let color = self.primary;
+
+        let mut lost_focus = false;
+        let mut area = egui::Area::new(egui::Id::new("darask_text_edit_area"))
+            .fixed_pos(screen_pos)
+            // Foreground: キャンバス(Middle)より確実に上に描き、かつ
+            // その領域だけクリックを占有させる(SPEC §19: 「ボックス外
+            // クリック」で確定 ⇔ ボックス内クリックは編集続行)。
+            .order(egui::Order::Foreground);
+        let viewport = self.view.viewport_rect();
+        if viewport.width() > 0.0 && viewport.height() > 0.0 {
+            // v3 レビューで発見・修正したバグ: `constrain` を指定しないと
+            // egui 0.35 の既定 `constrain_to(ctx.content_rect())`
+            // (ウィンドウ全域)になり、キャンバス右端・下端付近をクリック
+            // するとボックスがクリック位置(=確定時のラスタライズ位置、
+            // SPEC §19「クリック位置=テキストボックスの左上」)から見た目
+            // 上ずれて表示され、ツールバー・右パネルの上にも被さり得る。
+            // 中央キャンバスの viewport だけへ constrain することで、常に
+            // キャンバス内に収まるようにする。
+            area = area.constrain_to(viewport);
+        }
+        area.show(ui.ctx(), |ui| {
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut buffer)
+                    .frame(egui::Frame::NONE)
+                    .font(egui::FontId::proportional(display_size))
+                    .text_color(color)
+                    // SPEC §19 のラスタライズは `\n` 区切りの明示的な
+                    // 改行のみで行う(自動折り返しはしない)。プレビュー
+                    // 側で意図しない折り返しが起きないよう十分広く取る。
+                    .desired_width(f32::INFINITY)
+                    .id(egui::Id::new("darask_text_edit_box")),
+            );
+            // 生成直後の 1 フレームだけフォーカスを要求する
+            // (`TextEditState::needs_focus` のコメント参照)。
+            if needs_focus {
+                response.request_focus();
+            }
+            lost_focus = response.lost_focus();
+        });
+
+        self.text_edit = Some(TextEditState {
+            pos,
+            buffer,
+            needs_focus: false,
+        });
+        if lost_focus {
+            self.commit_pending_text_edit();
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1442,7 +1876,19 @@ impl DaraskApp {
     /// §12-2)。変更が無ければキャンセルせずそのまま閉じさせる。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if !close_requested || !self.doc.modified {
+        if !close_requested {
+            return;
+        }
+        // v3 レビューで発見・修正したバグ: テキスト編集中(まだ確定して
+        // いない入力ボックス)は `begin_text_edit`/入力中のバッファ更新の
+        // どちらも `doc.modified` を立てないため、以前はここで即座に
+        // `!self.doc.modified` を見て未保存ガードを素通りし、確認なしに
+        // 入力中のテキストが失われていた(SPEC §8 の未保存ガードの趣旨に
+        // 反する)。他の「先に確定してから実行」規則(SPEC §13 最終項、
+        // `commit_open_gesture` のドキュメントコメント参照)と同じく、
+        // `doc.modified` を見る前にここで確定させる。
+        self.commit_open_gesture();
+        if !self.doc.modified {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1498,6 +1944,18 @@ impl DaraskApp {
 
     /// 未保存ガードを通してからアクションを実行する(SPEC §8)。
     fn request_action(&mut self, action: PendingAction) {
+        // v3 レビューで発見・修正したバグ: テキスト編集中は `doc.modified`
+        // が立たないため、以前はここで `!self.doc.modified` を素通りして
+        // しまい、特に D&D(`handle_dropped_files` はキーボードフォーカスを
+        // 問わないため、`ctx.egui_wants_keyboard_input()` でテキスト編集中
+        // 無効になる Ctrl+N/Ctrl+O のショートカットと違って素通しする)で
+        // 編集中のドキュメントごと差し替わってしまい、旧ドキュメントの
+        // 編集ボックスが新ドキュメント上に取り残されていた。ツール切替と
+        // 同じ「先に確定」規則(SPEC §13 最終項)をここでも適用し、
+        // `doc.modified` の判定より前に確定させる(確定した内容が実際に
+        // ドキュメントを変えていれば `doc.modified` が立ち、未保存ガードも
+        // 正しく発動するようになる)。
+        self.commit_open_gesture();
         if self.doc.modified {
             self.pending_action = Some(action);
             self.modal = Some(ModalState::ConfirmUnsaved);
@@ -1524,6 +1982,20 @@ impl DaraskApp {
         }
     }
 
+    /// ドキュメントを丸ごと差し替える(新規作成/開く/白紙貼り付け置換)前後で
+    /// 揃えてリセットすべき、ドキュメント本体以外のツール状態。
+    ///
+    /// v3 レビューで発見・修正したバグ: `pen`/`eraser` の `BrushEngine::
+    /// last_end`(SPEC §17 の Shift+クリック連結の終点)はここまでリセット
+    /// されておらず、旧ドキュメントの画像座標が残り続けていた。まだ一度も
+    /// 描いていない新ドキュメントで最初に Shift+クリックすると、存在しない
+    /// はずの「直前のストローク」の終点(旧ドキュメント上の座標)から新
+    /// キャンバスを横切る直線が引かれてしまう。
+    fn reset_tool_state_for_new_document(&mut self) {
+        self.pen.reset_for_new_document();
+        self.eraser.reset_for_new_document();
+    }
+
     fn open_path(&mut self, path: PathBuf) {
         match io::load_image(&path) {
             Ok(doc) => {
@@ -1535,6 +2007,7 @@ impl DaraskApp {
                 self.view = CanvasView::new();
                 self.layer_rename = None;
                 self.next_layer_number = 1;
+                self.reset_tool_state_for_new_document();
             }
             Err(e) => self.show_toast(format!("開けませんでした: {e}")),
         }
@@ -1635,6 +2108,7 @@ impl DaraskApp {
         self.view = CanvasView::new();
         self.layer_rename = None;
         self.next_layer_number = 1;
+        self.reset_tool_state_for_new_document();
     }
 
     // -----------------------------------------------------------------
@@ -1892,7 +2366,8 @@ impl DaraskApp {
             MenuAction::Exit => self.request_action(PendingAction::Close),
             MenuAction::Undo => {
                 // SPEC §13 最終項: 浮動片/ストローク進行中は先に確定してから
-                // 実行する(`handle_undo_redo_shortcuts` と同じ規則)。
+                // 実行する(`handle_shortcuts` の `Action::Undo`/`Redo` と
+                // 同じ規則)。
                 self.commit_open_gesture();
                 self.history.undo(&mut self.doc);
             }
@@ -2120,13 +2595,17 @@ impl eframe::App for DaraskApp {
         // いない)。
         self.handle_close_request(ui.ctx());
 
-        self.handle_tool_shortcuts(ui.ctx());
-        self.handle_color_and_brush_shortcuts(ui.ctx());
-        self.handle_undo_redo_shortcuts(ui.ctx());
-        self.handle_selection_shortcuts(ui.ctx());
-        self.handle_layer_shortcuts(ui.ctx());
-        self.handle_view_shortcuts(ui.ctx());
-        self.handle_file_shortcuts(ui.ctx());
+        // v3 §19: テキスト編集中の Ctrl+Enter(確定)/Esc(破棄)は、他の
+        // ショートカットと逆に「wants_keyboard_input なら無効」ではなく
+        // 「編集中でなければ何もしない」というガードなので、最優先で消費する
+        // (`handle_shortcuts` は `egui_wants_keyboard_input()` で自らを
+        // 無効化するため衝突しないが、消費順は明示的に最初にしておく、
+        // `keymap` モジュールドキュメントコメント参照)。
+        self.handle_text_edit_shortcuts(ui.ctx());
+        // ARCHITECTURE.md §15.4: SPEC §20 のショートカット群(ツール/色/
+        // ブラシ/編集/レイヤー/表示/ファイル)は `keymap::KEYMAP` を単一の
+        // 情報源とする 1 つのディスパッチに集約されている(`keymap::poll`)。
+        self.handle_shortcuts(ui.ctx());
         self.handle_dropped_files(ui.ctx());
 
         let title = self.compute_window_title();
@@ -2212,15 +2691,19 @@ impl eframe::App for DaraskApp {
                 OptionsBarCtx {
                     tool: self.tool,
                     brush_size: &mut self.brush_size,
-                    pen_aa: &mut self.pen.aa,
+                    brush_hardness: &mut self.brush_hardness,
+                    brush_opacity: &mut self.brush_opacity,
+                    pencil_mode: &mut self.pencil_mode,
                     shape_mode,
                     fill_tolerance: &mut self.fill.tolerance,
+                    text_font_size: &mut self.text_font_size,
                 },
             );
         }
 
         let force_pan = self.tool == ToolKind::Pan;
-        let cursor = self.cursor_for_active_tool();
+        let alt_held = ui.ctx().input(|i| i.modifiers.alt);
+        let cursor = self.cursor_for_active_tool(alt_held);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(64)))
             .show(ui, |ui| {
@@ -2262,10 +2745,42 @@ impl eframe::App for DaraskApp {
                         self.secondary,
                         self.brush_size,
                     ),
-                    ToolKind::Fill | ToolKind::Picker | ToolKind::Select | ToolKind::Pan => {}
+                    // 選択・移動は `draw_selection_overlay` が浮動片/ハンドルを
+                    // 描く(下記)。ズームはプレビューを持たない。テキストは
+                    // `draw_text_edit_overlay`(下記)が別枠で描く。
+                    ToolKind::Fill
+                    | ToolKind::Picker
+                    | ToolKind::Select
+                    | ToolKind::Pan
+                    | ToolKind::Move
+                    | ToolKind::Zoom
+                    | ToolKind::Text => {}
+                }
+                // SPEC §17: ブラシ/消しゴム使用中は OS カーソルの代わりに
+                // 円アウトラインを描く(ARCHITECTURE.md §15.6 落とし穴5:
+                // 「選択・移動・テキスト等では出さない」— ブラシ/消しゴム/
+                // 鉛筆モードのみ)。v3 レビューで発見・修正したバグ: Space/
+                // 中ボタンでのパンジェスチャ中も無条件に円を描いていたため、
+                // OS カーソルが Grabbing に切り替わる(`CanvasView::show` の
+                // `effective_cursor`)のと二重表示になっていた。パン中は
+                // 円を出さない(SPEC §17「円表示時は OS カーソル非表示」の
+                // 排他が崩れないようにする)。
+                if matches!(self.tool, ToolKind::Pen | ToolKind::Eraser) && !self.view.is_panning()
+                {
+                    if let Some(hover) = self.view.hover_img() {
+                        self.draw_brush_cursor(&output.painter, hover);
+                    }
                 }
                 self.draw_selection_overlay(&output.painter);
                 self.dispatch_canvas_events(output.events);
+                // v3 §19: テキスト編集オーバーレイ。`dispatch_canvas_events` の
+                // **後**に呼ぶこと — 先に呼ぶと、このフレームで「ボックス外
+                // クリック」による確定(`lost_focus()`)が起きた場合に
+                // `self.text_edit` が既に `None` になり、直後に処理される同じ
+                // フレームの Down イベントを「未編集」と誤認して同じ位置に
+                // 即座に新しい編集を開始してしまう(ARCHITECTURE.md §15.6-1
+                // と同種の確定順序の罠)。
+                self.draw_text_edit_overlay(ui);
             });
 
         self.show_modal(ui.ctx());
@@ -2295,37 +2810,40 @@ impl eframe::App for DaraskApp {
 /// ARCHITECTURE.md §9: egui のデフォルトフォントに日本語グリフは無いため、
 /// Windows システムフォントを実行時に読み込んで追加する。
 /// `App::new` 相当(ここでは `DaraskApp::new`)で一度だけ呼ぶ。
-fn setup_japanese_fonts(ctx: &egui::Context) {
-    for path in JAPANESE_FONT_CANDIDATES {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                ctx.add_font(FontInsert::new(
-                    "darask-jp",
-                    egui::FontData::from_owned(bytes),
-                    vec![
-                        InsertFontFamily {
-                            family: egui::FontFamily::Proportional,
-                            priority: FontPriority::Highest,
-                        },
-                        InsertFontFamily {
-                            family: egui::FontFamily::Monospace,
-                            priority: FontPriority::Highest,
-                        },
-                    ],
-                ));
-                return;
-            }
-            Err(_) => continue,
-        }
-    }
-
-    // ARCHITECTURE.md §9-4: 全部読めなければ警告ログだけ出して続行する
-    // (Win11 では起きない想定)。`log` crate は依存に追加しない方針
-    // (CLAUDE.md)のため `eprintln!` で代替する。`windows_subsystem = "windows"`
-    // によりコンソールが無い環境では単に出力先が失われるだけでパニックはしない。
-    eprintln!(
-        "警告: 日本語フォントが見つかりませんでした(YuGothM/meiryo/msgothic)。文字が正しく表示されない可能性があります。"
-    );
+///
+/// v3 §19(ARCHITECTURE.md §15.3)でテキストツールが同じバイト列を
+/// `ab_glyph::FontRef` の構築に使うため、読み込んだバイト列を `Arc<Vec<u8>>`
+/// として返す(見つからなければ `None`)。egui にはこのバイト列の複製を渡す
+/// (egui 側は `FontData` として所有権ごと消費するため、テキストツール用に
+/// 別途保持する分は 1 回だけメモリ上でクローンする — ディスク読み込みは
+/// 1 回きりで済み、読み込み自体を 2 度行う旧実装より効率的)。
+fn setup_japanese_fonts(ctx: &egui::Context) -> Option<Arc<Vec<u8>>> {
+    let Some(bytes) = text::load_font_bytes() else {
+        // ARCHITECTURE.md §9-4: 全部読めなければ警告ログだけ出して続行する
+        // (Win11 では起きない想定)。`log` crate は依存に追加しない方針
+        // (CLAUDE.md)のため `eprintln!` で代替する。
+        // `windows_subsystem = "windows"` によりコンソールが無い環境では
+        // 単に出力先が失われるだけでパニックはしない。
+        eprintln!(
+            "警告: 日本語フォントが見つかりませんでした(YuGothM/meiryo/msgothic)。文字が正しく表示されない可能性があります。"
+        );
+        return None;
+    };
+    ctx.add_font(FontInsert::new(
+        "darask-jp",
+        egui::FontData::from_owned(bytes.clone()),
+        vec![
+            InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: FontPriority::Highest,
+            },
+            InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: FontPriority::Highest,
+            },
+        ],
+    ));
+    Some(Arc::new(bytes))
 }
 
 #[cfg(test)]
@@ -2344,6 +2862,7 @@ mod tests {
             view: CanvasView::new(),
             history: History::new(),
             tool: ToolKind::Pen,
+            last_shape_tool: ToolKind::Line,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
             line: ShapeTool::new_line(),
@@ -2354,6 +2873,9 @@ mod tests {
             primary: Color32::BLACK,
             secondary: Color32::WHITE,
             brush_size: 4.0,
+            brush_hardness: DEFAULT_BRUSH_HARDNESS,
+            brush_opacity: DEFAULT_BRUSH_OPACITY,
+            pencil_mode: false,
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
             color_wheel: ColorWheelState::new(),
@@ -2365,6 +2887,9 @@ mod tests {
             floating: None,
             select_drag: None,
             next_floating_id: 0,
+            text_font: None,
+            text_font_size: DEFAULT_TEXT_FONT_SIZE,
+            text_edit: None,
             modal: None,
             pending_action: None,
             pending_dialog: None,
@@ -2380,6 +2905,167 @@ mod tests {
             last_screen_rect: egui::Rect::NOTHING,
             bench: None,
         }
+    }
+
+    // -- V3-M4: SPEC §20「U: 図形(直前に使った図形)」/「Shift+U で巡回」 ---
+
+    #[test]
+    fn set_tool_tracks_last_shape_tool_only_for_shape_kinds() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        assert_eq!(
+            app.last_shape_tool,
+            ToolKind::Line,
+            "initial default is Line"
+        );
+
+        app.set_tool(ToolKind::Rect);
+        assert_eq!(app.last_shape_tool, ToolKind::Rect);
+
+        // 図形以外へ切り替えても最後に使った図形は保持される。
+        app.set_tool(ToolKind::Pen);
+        assert_eq!(app.tool, ToolKind::Pen);
+        assert_eq!(app.last_shape_tool, ToolKind::Rect);
+
+        app.set_tool(ToolKind::Ellipse);
+        assert_eq!(app.last_shape_tool, ToolKind::Ellipse);
+    }
+
+    #[test]
+    fn cycle_shape_tool_goes_line_rect_ellipse_and_wraps() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::Line);
+
+        app.cycle_shape_tool();
+        assert_eq!(app.tool, ToolKind::Rect);
+        app.cycle_shape_tool();
+        assert_eq!(app.tool, ToolKind::Ellipse);
+        app.cycle_shape_tool();
+        assert_eq!(app.tool, ToolKind::Line, "cycle wraps back to Line");
+    }
+
+    #[test]
+    fn cycle_shape_tool_from_a_non_shape_tool_starts_from_last_shape_tool() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::Rect);
+        app.set_tool(ToolKind::Pen); // Rect が「直前に使った図形」のまま。
+
+        app.cycle_shape_tool();
+
+        assert_eq!(
+            app.tool,
+            ToolKind::Ellipse,
+            "cycling while on a non-shape tool advances from last_shape_tool, not from Pen"
+        );
+    }
+
+    // -- V3-M4: `handle_shortcuts` 経由の end-to-end ディスパッチ確認 --------
+    // egui は `Context::begin_pass` にバックエンド(ウィンドウ)を要求しない
+    // ため、実際のキー入力イベントを注入して `app.handle_shortcuts` を
+    // 直接駆動できる。`keymap::KEYMAP` のバインド自体は `keymap.rs` の
+    // 単体テストで確認済みなので、ここでは「バインドから `app.rs` の
+    // 実処理まで実際につながっているか」(結線)だけを確認する。
+
+    fn ctx_with_key_event(key: Key, modifiers: Modifiers) -> egui::Context {
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        ctx.begin_pass(raw_input);
+        ctx
+    }
+
+    #[test]
+    fn d_key_resets_colors_to_black_and_white() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.primary = Color32::from_rgb(10, 20, 30);
+        app.secondary = Color32::from_rgb(200, 150, 100);
+
+        // SPEC §20: 「D 初期色(黒・白)」。
+        let ctx = ctx_with_key_event(Key::D, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.primary, Color32::BLACK);
+        assert_eq!(app.secondary, Color32::WHITE);
+    }
+
+    #[test]
+    fn ctrl_j_duplicates_the_active_layer() {
+        // SPEC §20: 「Ctrl+J 複製」(旧 v2 はレイヤーパネル/メニューのみ)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let before = app.doc.layers.len();
+
+        let ctx = ctx_with_key_event(Key::J, Modifiers::CTRL);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.doc.layers.len(), before + 1);
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn g_key_selects_fill_tool_replacing_old_f() {
+        // SPEC §20: 「G 塗りつぶし(旧 F から変更)」。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Pen;
+
+        let ctx = ctx_with_key_event(Key::G, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+        assert_eq!(app.tool, ToolKind::Fill);
+    }
+
+    #[test]
+    fn old_l_r_c_f_keys_no_longer_change_the_tool() {
+        // SPEC §20: 「旧 L/R/C は廃止」。塗りつぶしは F→G に変わったので F も
+        // 含める。
+        for key in [Key::L, Key::R, Key::C, Key::F] {
+            let mut app = new_for_test(Document::new(4, 4, Background::White));
+            app.tool = ToolKind::Pen;
+
+            let ctx = ctx_with_key_event(key, Modifiers::NONE);
+            app.handle_shortcuts(&ctx);
+
+            assert_eq!(
+                app.tool,
+                ToolKind::Pen,
+                "{key:?} must no longer switch tools"
+            );
+        }
+    }
+
+    #[test]
+    fn u_key_selects_the_last_used_shape_tool() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.set_tool(ToolKind::Rect); // last_shape_tool = Rect
+        app.set_tool(ToolKind::Pen);
+
+        let ctx = ctx_with_key_event(Key::U, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tool, ToolKind::Rect);
+    }
+
+    #[test]
+    fn shift_u_cycles_without_also_triggering_bare_u() {
+        // ARCHITECTURE.md §15.6 落とし穴6: Shift+U は素の U より先に消費
+        // されなければならない。誤って両方発火すると「巡回してから直前の
+        // 図形に戻る」ような二重発火が起き、実質何も進まなくなる。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.set_tool(ToolKind::Line);
+
+        let ctx = ctx_with_key_event(Key::U, Modifiers::SHIFT);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(
+            app.tool,
+            ToolKind::Rect,
+            "Shift+U must cycle exactly once (Line -> Rect), not be swallowed by bare U too"
+        );
     }
 
     // -- 貼り付けが他ツールの begin_stroke に破棄されるバグ(修正済み) ------
@@ -3417,5 +4103,760 @@ mod tests {
         );
         // 内部(ハンドルから十分離れた点)ではハンドル判定に掛からない。
         assert_eq!(app.hit_resize_handle(pos2(10.0, 10.0)), None);
+    }
+
+    // -- v3 §18: 移動ツール(ARCHITECTURE.md §15.2 受け入れ基準) -------------
+
+    #[test]
+    fn move_tool_floats_and_moves_the_whole_active_layer_when_no_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Move;
+        app.doc.set_pixel(2, 2, [9, 9, 9, 255]);
+
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(3.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Drag {
+            img: pos2(8.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+
+        let floating = app
+            .floating
+            .as_ref()
+            .expect("dragging with no selection must float the whole active layer");
+        assert_eq!(
+            (floating.w, floating.h),
+            (20, 20),
+            "no selection -> whole active layer floats"
+        );
+        assert_eq!(
+            floating.pos,
+            pos2(5.0, 0.0),
+            "must track the pointer delta from the down position"
+        );
+        // 切り出し元(全面)は浮動化と同時に透明化されている(未確定)。
+        assert_eq!(app.doc.get_pixel(2, 2), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn move_tool_moves_only_the_existing_selection_rect() {
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Move;
+        app.selection = Some(Selection {
+            rect: IRect {
+                x0: 5,
+                y0: 5,
+                x1: 15,
+                y1: 15,
+            },
+        });
+
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(20.0, 20.0), // 選択の外だが、移動ツールはクリック位置を問わない。
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Drag {
+            img: pos2(25.0, 20.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+
+        let floating = app
+            .floating
+            .as_ref()
+            .expect("must float the existing selection");
+        assert_eq!(
+            (floating.w, floating.h),
+            (10, 10),
+            "must float only the selection rect, not the whole 40x40 layer"
+        );
+        assert_eq!(floating.pos, pos2(10.0, 5.0));
+    }
+
+    #[test]
+    fn move_tool_single_click_without_drag_does_not_float_or_push_undo() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Move;
+
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(10.0, 10.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Up {
+            img: pos2(10.0, 10.0),
+            button: PointerButton::Primary,
+        });
+
+        assert!(
+            app.floating.is_none(),
+            "a plain click (no drag) must not float the layer"
+        );
+        assert!(
+            !app.history.can_undo(),
+            "a no-op click must not push an undo entry (SPEC §18: before==after suppression)"
+        );
+    }
+
+    #[test]
+    fn switching_away_from_move_tool_mid_drag_commits_the_floating_piece() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Move;
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(3.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Drag {
+            img: pos2(8.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        assert!(app.floating.is_some());
+
+        app.set_tool(ToolKind::Pen);
+
+        assert!(
+            app.floating.is_none(),
+            "switching tools must commit the open floating (same rule as the select tool)"
+        );
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn layer_add_commits_an_open_floating_move_first() {
+        // `layer_add_commits_an_open_floating_selection_first` の移動ツール版
+        // (ARCHITECTURE.md §15.6 落とし穴1: 「自動確定は確定のまま」)。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Move;
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(3.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Drag {
+            img: pos2(8.0, 3.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        assert!(app.floating.is_some());
+
+        app.layer_add();
+
+        assert!(
+            app.floating.is_none(),
+            "the floating piece must be committed before the layer is added"
+        );
+        assert_eq!(app.doc.layers.len(), 2);
+    }
+
+    // -- v3 §18: Esc = キャンセル(ARCHITECTURE.md §15.2, §15.6 落とし穴1) ---
+
+    #[test]
+    fn cancel_floating_after_dragging_a_selection_restores_original_bytes_exactly() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Select;
+        app.doc.set_pixel(7, 7, [10, 20, 30, 255]);
+        let original = app.doc.active_pixels().to_vec();
+        app.selection = Some(Selection {
+            rect: IRect {
+                x0: 2,
+                y0: 2,
+                x1: 12,
+                y1: 12,
+            },
+        });
+
+        app.handle_select_event(ToolEvent::Down {
+            img: pos2(5.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Drag {
+            img: pos2(9.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        assert!(app.floating.is_some(), "drag must float the selection");
+        assert_ne!(
+            app.doc.active_pixels(),
+            original.as_slice(),
+            "the cut_from region must already be transparent while floating"
+        );
+
+        app.cancel_floating();
+
+        assert_eq!(
+            app.doc.active_pixels(),
+            original.as_slice(),
+            "Esc must byte-exactly restore the pre-float document"
+        );
+        assert!(app.floating.is_none());
+        assert!(app.selection.is_none());
+        assert!(
+            !app.history.can_undo(),
+            "cancel must not push any undo entry"
+        );
+        assert!(!app.history.has_open_stroke());
+    }
+
+    #[test]
+    fn cancel_floating_after_move_tool_restores_the_whole_layer() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Move;
+        app.doc.set_pixel(3, 3, [1, 2, 3, 255]);
+        let original = app.doc.active_pixels().to_vec();
+
+        app.handle_move_event(ToolEvent::Down {
+            img: pos2(1.0, 1.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_move_event(ToolEvent::Drag {
+            img: pos2(4.0, 1.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        assert!(app.floating.is_some());
+
+        app.cancel_floating();
+
+        assert_eq!(app.doc.active_pixels(), original.as_slice());
+        assert!(app.floating.is_none());
+        assert!(!app.history.can_undo());
+    }
+
+    #[test]
+    fn cancel_floating_after_paste_just_discards_without_touching_the_document() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.doc.modified = true; // 白紙ではない状態を再現する。
+        let original = app.doc.active_pixels().to_vec();
+
+        app.begin_paste_floating(3, 3, vec![1, 2, 3, 255].repeat(9));
+        assert!(app.floating.is_some());
+        assert_eq!(app.tool, ToolKind::Select);
+
+        app.cancel_floating();
+
+        assert_eq!(
+            app.doc.active_pixels(),
+            original.as_slice(),
+            "a pasted floating never touched the document before commit, so cancel leaves it untouched"
+        );
+        assert!(app.floating.is_none());
+        assert!(!app.history.can_undo());
+        assert!(!app.history.has_open_stroke());
+    }
+
+    // -- v3 §18: 自由変形(Ctrl+T、ARCHITECTURE.md §15.2) ---------------------
+
+    #[test]
+    fn free_transform_floats_the_existing_selection_and_preserves_its_rect() {
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Pen; // 直前のツールが何であっても働くことを示す。
+        app.selection = Some(Selection {
+            rect: IRect {
+                x0: 5,
+                y0: 5,
+                x1: 15,
+                y1: 15,
+            },
+        });
+
+        app.free_transform();
+
+        assert_eq!(app.tool, ToolKind::Select);
+        let floating = app
+            .floating
+            .as_ref()
+            .expect("Ctrl+T must float the existing selection");
+        assert_eq!((floating.w, floating.h), (10, 10));
+        assert_eq!(floating.pos, pos2(5.0, 5.0));
+    }
+
+    #[test]
+    fn free_transform_from_select_tool_with_a_plain_selection_does_not_lose_it() {
+        // 回帰テスト: 進行中ジェスチャの確定に無条件で `commit_selection`
+        // (常に `self.selection` をクリアする)を使うと、選択ツールで
+        // 「まだ浮動化していない」選択を持っている状態で Ctrl+T を押したとき
+        // にその選択自体が消えてしまい、変形対象がキャンバス全体に化けて
+        // しまうバグになる(`free_transform` 実装時に発見・回避)。
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Select;
+        app.selection = Some(Selection {
+            rect: IRect {
+                x0: 5,
+                y0: 5,
+                x1: 15,
+                y1: 15,
+            },
+        });
+
+        app.free_transform();
+
+        let floating = app.floating.as_ref().expect("must float");
+        assert_eq!(
+            (floating.w, floating.h),
+            (10, 10),
+            "the plain selection must survive and be the transform target, not the whole 40x40 layer"
+        );
+    }
+
+    #[test]
+    fn free_transform_without_a_selection_floats_the_whole_active_layer() {
+        let mut app = new_for_test(Document::new(12, 8, Background::White));
+        app.tool = ToolKind::Pen;
+
+        app.free_transform();
+
+        let floating = app
+            .floating
+            .as_ref()
+            .expect("Ctrl+T must float the whole layer when there is no selection");
+        assert_eq!((floating.w, floating.h), (12, 8));
+    }
+
+    #[test]
+    fn free_transform_can_be_cancelled_with_esc_restoring_the_original_document() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.doc.set_pixel(4, 4, [5, 6, 7, 255]);
+        let original = app.doc.active_pixels().to_vec();
+
+        app.free_transform();
+        assert!(app.floating.is_some());
+
+        app.cancel_floating();
+
+        assert_eq!(app.doc.active_pixels(), original.as_slice());
+        assert!(app.floating.is_none());
+        assert!(!app.history.can_undo());
+    }
+
+    // -- v3 §18: ズームツール(ARCHITECTURE.md §15.2) -------------------------
+
+    #[test]
+    fn zoom_tool_click_zooms_in_around_the_click_point() {
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.tool = ToolKind::Zoom;
+        let before_zoom = app.view.zoom;
+
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(30.0, 40.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+
+        assert!(app.view.zoom > before_zoom, "a plain click must zoom in");
+    }
+
+    #[test]
+    fn zoom_tool_alt_click_zooms_out_instead_of_sampling_a_color() {
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.tool = ToolKind::Zoom;
+        app.view.zoom = 2.0; // まず拡大しておき、縮小できることを確認する。
+        let before_zoom = app.view.zoom;
+        let before_primary = app.primary;
+
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(30.0, 40.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::ALT,
+        }]);
+
+        assert!(app.view.zoom < before_zoom, "Alt+click must zoom out");
+        assert_eq!(
+            app.primary, before_primary,
+            "Alt+click on the zoom tool must not trigger the temporary eyedropper (SPEC §18 overrides SPEC §4 here)"
+        );
+    }
+
+    // -- v3 §19: テキストツール(ARCHITECTURE.md §15.3) ----------------------
+
+    /// 開発機(Windows)のシステム日本語フォントを読み込む。無ければテストを
+    /// スキップする(`text.rs` のテストと同じ方針)。
+    fn test_font() -> Option<Arc<Vec<u8>>> {
+        text::load_font_bytes().map(Arc::new)
+    }
+
+    #[test]
+    fn begin_text_edit_without_font_shows_toast_and_does_not_start_editing() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Text;
+        assert!(app.text_font.is_none());
+
+        app.begin_text_edit(pos2(3.0, 4.0));
+
+        assert!(
+            app.text_edit.is_none(),
+            "without a loaded font, editing must not start at all"
+        );
+        assert!(app.toast.is_some(), "must toast why it refused to start");
+    }
+
+    #[test]
+    fn begin_text_edit_with_font_starts_editing_at_click_position() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+
+        app.begin_text_edit(pos2(3.0, 4.0));
+
+        let state = app.text_edit.as_ref().expect("editing must start");
+        assert_eq!(state.pos, pos2(3.0, 4.0));
+        assert!(state.buffer.is_empty());
+        assert!(state.needs_focus);
+    }
+
+    #[test]
+    fn discard_pending_text_edit_clears_state_without_touching_history() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(0.0, 0.0));
+        app.text_edit.as_mut().unwrap().buffer = "hello".to_owned();
+
+        app.discard_pending_text_edit();
+
+        assert!(app.text_edit.is_none());
+        assert!(
+            !app.history.can_undo(),
+            "SPEC §19: Esc discards without pushing any history"
+        );
+        assert!(app.floating.is_none());
+    }
+
+    #[test]
+    fn commit_pending_text_edit_with_empty_buffer_does_nothing() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(0.0, 0.0));
+        // buffer は空文字列のまま。
+
+        app.commit_pending_text_edit();
+
+        assert!(
+            app.text_edit.is_none(),
+            "the pending edit is consumed either way"
+        );
+        assert!(
+            app.floating.is_none(),
+            "SPEC §19: an empty-string commit must do nothing"
+        );
+        assert!(!app.history.can_undo());
+        assert_eq!(
+            app.tool,
+            ToolKind::Text,
+            "an empty commit must not switch tools"
+        );
+    }
+
+    #[test]
+    fn commit_pending_text_edit_creates_a_floating_and_switches_to_select() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.primary = Color32::from_rgb(200, 10, 10);
+        app.begin_text_edit(pos2(5.0, 6.0));
+        app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
+
+        app.commit_pending_text_edit();
+
+        assert!(app.text_edit.is_none());
+        let floating = app.floating.as_ref().expect("non-empty text must float");
+        assert_eq!(
+            floating.pos,
+            pos2(5.0, 6.0),
+            "SPEC §19: click position is the box's top-left"
+        );
+        assert_eq!(
+            app.tool,
+            ToolKind::Select,
+            "committed text reuses the selection tool's floating machinery"
+        );
+        assert!(
+            app.history.has_open_stroke(),
+            "not yet finalized until the floating itself is confirmed (Enter/outside click/Esc)"
+        );
+        assert_eq!(
+            app.recent_colors.front().copied(),
+            Some(app.primary),
+            "SPEC §5: committing text records the color used"
+        );
+    }
+
+    #[test]
+    fn commit_pending_text_edit_and_composite_writes_directly_without_leaving_a_floating() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(2.0, 2.0));
+        app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
+
+        app.commit_pending_text_edit_and_composite();
+
+        assert!(app.text_edit.is_none());
+        assert!(
+            app.floating.is_none(),
+            "a tool-switch interruption composites directly, no adjustable floating left behind"
+        );
+        assert_eq!(
+            app.tool,
+            ToolKind::Text,
+            "this helper must never touch self.tool (called from inside set_tool's own commit step)"
+        );
+        assert!(
+            app.history.can_undo(),
+            "must be exactly one finished undo unit"
+        );
+        assert!(!app.history.has_open_stroke());
+    }
+
+    #[test]
+    fn switching_tool_away_from_text_mid_edit_commits_it() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(2.0, 2.0));
+        app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
+
+        app.set_tool(ToolKind::Pen);
+
+        assert_eq!(
+            app.tool,
+            ToolKind::Pen,
+            "set_tool must end up on the tool that was actually requested, not get clobbered \
+             by the text-commit's own tool switching (the reentrancy pitfall documented on \
+             `place_new_floating`/`commit_pending_text_edit_and_composite`)"
+        );
+        assert!(app.text_edit.is_none());
+        assert!(app.floating.is_none());
+        assert!(app.history.can_undo());
+    }
+
+    #[test]
+    fn dispatch_canvas_events_text_tool_begins_edit_and_ignores_further_clicks_while_editing() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(4.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        let state = app.text_edit.as_ref().expect("click must start editing");
+        assert_eq!(state.pos, pos2(4.0, 5.0));
+
+        // A second click while already editing must not restart editing at a
+        // new position; the box-outside-click confirm path lives in
+        // `draw_text_edit_overlay`'s `lost_focus()` check, not here (double
+        // firing both would commit *and* immediately reopen a new box).
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(20.0, 20.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        assert_eq!(
+            app.text_edit.as_ref().unwrap().pos,
+            pos2(4.0, 5.0),
+            "a click while already editing must be ignored here, not start a new box"
+        );
+    }
+
+    // -- v3 レビューで発見・修正したバグ: `confirm_new`(新規作成)が
+    // `pen`/`eraser` の `BrushEngine::last_end`(Shift+クリック連結の終点)
+    // をリセットしていなかった(`reset_tool_state_for_new_document` 参照)。
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn confirm_new_resets_stale_shift_click_endpoint_from_the_previous_document() {
+        let mut app = new_for_test(Document::new(40, 10, Background::Transparent));
+        app.tool = ToolKind::Pen;
+
+        // 旧ドキュメントで (5,5) に単クリック(ドット)を打ち、
+        // last_end を (5,5) にする。
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(5.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(5.0, 5.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+
+        // 新規作成(SPEC §7: Ctrl+N のダイアログ確定に相当)。
+        app.confirm_new(40, 10, Background::Transparent);
+
+        // 新ドキュメントで最初の Shift+クリックを (35,5) に打つ。
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(35.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::SHIFT,
+            },
+            ToolEvent::Up {
+                img: pos2(35.0, 5.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+
+        assert_eq!(
+            app.doc.get_pixel(20, 5).unwrap()[3],
+            0,
+            "confirm_new must reset last_end; shift+click in the new document must not draw \
+             a line back to the stale endpoint from the document that was just replaced"
+        );
+        assert_ne!(
+            app.doc.get_pixel(35, 5).unwrap()[3],
+            0,
+            "the shift+click point itself must still be painted as a dot"
+        );
+    }
+
+    // -- v3 レビューで発見・修正したバグ: `request_action`/
+    // `handle_close_request` が進行中のテキスト編集を確定も破棄もせず
+    // `doc.modified` だけを見ていたため、D&D やウィンドウを閉じる操作が
+    // 未保存ガードをすり抜けて編集中の内容を失っていた
+    // (`request_action`/`handle_close_request` のドキュメントコメント参照)。
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn request_action_commits_pending_text_edit_before_checking_unsaved_guard() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(5.0, 5.0));
+        app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
+        assert!(
+            !app.doc.modified,
+            "typing alone must not mark the doc modified yet (sanity check on the bug's \
+             precondition)"
+        );
+
+        // D&D 経由の「開く」は `handle_dropped_files` → `request_action` を
+        // 通る(`process_pending_dialog` はブロッキングダイアログを要する
+        // ため、ここでは核心である `request_action` を直接駆動する)。
+        app.request_action(PendingAction::Open(Some(PathBuf::from("dummy.png"))));
+
+        assert!(
+            app.text_edit.is_none(),
+            "the pending text edit must have been committed, not left dangling on a \
+             document that's about to be replaced"
+        );
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
+            "a real committed edit must trigger the unsaved-changes guard instead of \
+             silently swapping the document out from under it"
+        );
+        assert_eq!(
+            app.doc.width, 40,
+            "the document must not have been replaced yet (still waiting on the modal)"
+        );
+    }
+
+    #[test]
+    fn request_action_executes_immediately_when_the_committed_edit_was_empty() {
+        // 対照テスト: 空文字列の確定は「何もしない」(SPEC §19)ので
+        // `doc.modified` は立たず、未保存ガードは(元から変更がなければ)
+        // 従来どおり素通りしてよい。
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(5.0, 5.0));
+        // buffer は空のまま。
+
+        app.request_action(PendingAction::New);
+
+        assert!(app.text_edit.is_none());
+        assert!(
+            app.modal.is_none() || matches!(app.modal, Some(ModalState::New { .. })),
+            "an empty text edit must not itself trigger the unsaved-changes guard"
+        );
+    }
+
+    #[test]
+    fn handle_close_request_commits_pending_text_edit_before_allowing_close() {
+        let Some(font) = test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Text;
+        app.text_font = Some(font);
+        app.begin_text_edit(pos2(5.0, 5.0));
+        app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        });
+
+        app.handle_close_request(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            app.text_edit.is_none(),
+            "the pending text edit must have been committed before deciding whether to \
+             allow the window to close"
+        );
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
+            "a real committed edit must arm the unsaved-changes guard so closing the \
+             window doesn't silently discard it"
+        );
     }
 }

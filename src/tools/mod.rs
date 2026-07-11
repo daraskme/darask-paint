@@ -11,11 +11,22 @@
 //! (ARCHITECTURE.md §4)。選択のデータ構造(`Selection`/`Floating`)と
 //! 純粋な計算部分は M4 で `select` モジュールに追加した。
 //!
+//! v3(SPEC §17, ARCHITECTURE.md §15.1)で `pen`/`eraser` は共通の
+//! ストロークエンジン(硬さ・不透明度・鉛筆モード・Shift+クリック連結)を
+//! 新設 `brush` モジュールへ切り出し、それぞれ薄いラッパーになった。
+//!
 //! スポイトの実際の色サンプリングは `app.rs::sample_eyedropper_color` に
 //! 集約している(Alt+クリックの一時スポイトと同じ経路)。`ToolCtx` は
 //! 色を読み取り専用の値として持つのみで書き込み手段を持たないため、
 //! 「色を変える」操作は `Tool::event` の外側(app.rs のディスパッチ層)で
 //! 行うという設計になっている。
+//!
+//! v3 V3-M2(SPEC §18, ARCHITECTURE.md §15.2)で `Move`(移動)/`Zoom`
+//! (ズーム)を追加した。どちらも選択・手のひら・スポイトと同様 `Tool` の
+//! 実体を持たず、app.rs が直接処理する: 移動は既存の `Selection`/`Floating`
+//! 浮動化パスを「選択があればそれを、無ければアクティブレイヤー全体を」
+//! 対象にして再利用し、ズームは `CanvasView` の既存ズーム関数をクリック
+//! 位置アンカーで呼ぶだけ。
 
 use eframe::egui::{self, Color32, Modifiers, PointerButton, Pos2};
 
@@ -23,6 +34,7 @@ use crate::canvas_view::CanvasView;
 use crate::document::Document;
 use crate::history::History;
 
+pub mod brush;
 pub mod eraser;
 pub mod fill;
 pub mod pen;
@@ -44,6 +56,20 @@ pub enum ToolKind {
     /// 手のひら(H)。`Tool` の実体は持たず、canvas_view がパン操作として
     /// 横取りする際の判定にのみ使う(ARCHITECTURE.md §4)。
     Pan,
+    /// v3 §18: 移動(V)。選択と同様 `Tool` の実体は持たず、`Selection`/
+    /// `Floating`(既存の浮動化パス)を app.rs が直接操作する
+    /// (ARCHITECTURE.md §15.2)。
+    Move,
+    /// v3 §18: ズーム(Z)。`Tool` の実体は持たず、クリック位置を中心に
+    /// `CanvasView` の既存ズーム関数を app.rs から直接呼ぶ
+    /// (ARCHITECTURE.md §15.2)。
+    Zoom,
+    /// v3 §19: テキスト(T)。`Tool` の実体は持たず、インライン編集状態
+    /// (`app.rs::TextEditState`)と確定後のラスタライズ・浮動片配置を
+    /// app.rs が直接扱う(ARCHITECTURE.md §15.3)。選択・移動と同様、
+    /// 確定後は既存の `Floating` 機構(移動・ハンドル拡縮・Enter確定・
+    /// Esc破棄)にそのまま乗る。
+    Text,
 }
 
 /// キャンバス上のポインタ入力(画像ピクセル座標系、ARCHITECTURE.md §4)。
@@ -83,6 +109,16 @@ pub struct ToolCtx<'a> {
     pub primary: Color32,
     pub secondary: Color32,
     pub brush_size: f32,
+    /// SPEC §17: ブラシ/消しゴム共通の硬さ。0.0–1.0(UI は 0–100%)。
+    /// 鉛筆モード中は無視される。`tools/brush.rs` のみが参照する。
+    pub hardness: f32,
+    /// SPEC §17: ブラシ/消しゴム共通の不透明度。0.0–1.0(UI は 1–100%。
+    /// 消しゴムでは「強さ」として表示)。`tools/brush.rs` のみが参照する。
+    pub opacity: f32,
+    /// SPEC §17: 鉛筆モード(デフォルト OFF)。ON の間はアンチエイリアス
+    /// なしの2値スタンプになり、硬さは無視される。`tools/brush.rs` のみが
+    /// 参照する。
+    pub pencil: bool,
     /// この呼び出しで実際に描画確定に使われた色(SPEC §5:
     /// 「描画確定時に使用色を先頭に追加」)。ツール側は確定時にここへ push する
     /// だけでよく、「最近使った色」リストへの反映(重複の先頭移動・上限8件)は
@@ -136,98 +172,10 @@ pub fn color_to_straight_rgba(color: Color32) -> [u8; 4] {
     color.to_srgba_unmultiplied()
 }
 
-/// ペン/消しゴムに共通するストローク処理(ARCHITECTURE.md §4:
-/// 「ポインタイベントの間隔が開いても線が途切れないよう…前回位置と今回位置を
-/// 線分で補間してスタンプする」)。`pen`/`eraser` の各 `Tool` 実装から使う。
-pub(crate) struct StrokeTool {
-    last: Option<(f32, f32)>,
-    button: Option<PointerButton>,
-}
-
-impl StrokeTool {
-    pub(crate) fn new() -> Self {
-        Self {
-            last: None,
-            button: None,
-        }
-    }
-
-    /// `erase == true` なら消しゴム(常に透明化・色は無視)、`false` なら
-    /// ペン(左ドラッグ=プライマリ色、右ドラッグ=セカンダリ色、SPEC §4)。
-    /// ストロークが実際にこの呼び出しで確定した(= Up で commit した)場合、
-    /// そのボタンを `Some` で返す(呼び出し側が「最近使った色」を記録するのに
-    /// 使う。消しゴムには色の概念がないため呼び出し側は無視してよい)。
-    pub(crate) fn handle(
-        &mut self,
-        ev: ToolEvent,
-        ctx: &mut ToolCtx,
-        erase: bool,
-    ) -> Option<PointerButton> {
-        match ev {
-            ToolEvent::Down { img, button, .. } => {
-                if !matches!(button, PointerButton::Primary | PointerButton::Secondary) {
-                    return None;
-                }
-                let color = color_bytes_for(ctx, button, erase);
-                let radius = brush_radius(ctx.brush_size);
-                let bounds = crate::raster::stamp_bounds(img.x, img.y, radius);
-                ctx.history.begin_stroke(ctx.doc.active);
-                ctx.history.ensure_tiles_saved(ctx.doc, bounds);
-                let touched = {
-                    let mut surface = ctx.doc.active_surface_mut();
-                    crate::raster::stamp_round(&mut surface, img.x, img.y, radius, color, erase)
-                };
-                ctx.doc.mark_dirty(touched);
-                self.last = Some((img.x, img.y));
-                self.button = Some(button);
-            }
-            ToolEvent::Drag { img, button, .. } => {
-                if self.button != Some(button) {
-                    return None;
-                }
-                let Some(last) = self.last else {
-                    return None;
-                };
-                let color = color_bytes_for(ctx, button, erase);
-                let radius = brush_radius(ctx.brush_size);
-                let to = (img.x, img.y);
-                let bounds = crate::raster::segment_bounds(last, to, radius);
-                ctx.history.ensure_tiles_saved(ctx.doc, bounds);
-                let touched = {
-                    let mut surface = ctx.doc.active_surface_mut();
-                    crate::raster::stroke_segment(&mut surface, last, to, radius, color, erase)
-                };
-                ctx.doc.mark_dirty(touched);
-                self.last = Some(to);
-            }
-            ToolEvent::Up { button, .. } => {
-                if self.button == Some(button) {
-                    ctx.history.commit_stroke(ctx.doc);
-                    self.last = None;
-                    self.button = None;
-                    return Some(button);
-                }
-            }
-            ToolEvent::Hover { .. } => {}
-        }
-        None
-    }
-
-    /// `Tool::cancel` の共通実装。進行中のストロークがあれば、`Up` が来た
-    /// 場合と同じく `History::commit_stroke` で確定する(ARCHITECTURE.md §6
-    /// の「1 ストローク = 1 undo 単位」を、ツール切替という中断経路でも
-    /// 守るため)。確定した場合はそのボタンを返す(呼び出し側が「最近使った
-    /// 色」に記録できるよう、`handle` の `Up` と同じ規約にする)。
-    pub(crate) fn cancel(&mut self, ctx: &mut ToolCtx) -> Option<PointerButton> {
-        let button = self.button.take();
-        if button.is_some() {
-            ctx.history.commit_stroke(ctx.doc);
-            self.last = None;
-        }
-        button
-    }
-}
-
+/// ボタンから描画色を決める(左ドラッグ=プライマリ色、右ドラッグ=
+/// セカンダリ色、SPEC §4)。`erase == true`(消しゴム)なら色自体は使われない
+/// ためダミー値を返す(呼び出し側のシグネチャを揃えるため)。`tools/brush.rs`
+/// (ブラシ/消しゴム共通エンジン)と `tools/shapes.rs` が共有する。
 pub(crate) fn color_bytes_for(ctx: &ToolCtx, button: PointerButton, erase: bool) -> [u8; 4] {
     if erase {
         // erase 時は stamp_round が alpha=0 を書くため色自体は使われないが、

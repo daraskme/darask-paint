@@ -38,11 +38,12 @@ pub struct Floating {
     /// クリップボードからの貼り付け(SPEC §6)で作られた浮動片は元領域を
     /// 持たないため `None`。
     ///
-    /// `app.rs` の実装では、この情報を後から読み返す代わりに、浮動化した
-    /// 瞬間(`begin_floating_from_selection`)に `History::ensure_tiles_saved`
-    /// を直接呼んで元ピクセルを退避しているため、フィールド自体は読まれない
-    /// (ARCHITECTURE.md §7 が定めるデータ構造としては保持する)。
-    #[allow(dead_code)]
+    /// v3 §18(Esc キャンセル、ARCHITECTURE.md §15.2)で `app.rs::
+    /// cancel_floating` から読まれるようになった: `Some(rect)` なら、
+    /// 浮動化した瞬間に `History::ensure_tiles_saved` で退避済みの CoW
+    /// タイル(`History::restore_stroke_region`)から `rect` の元ピクセルを
+    /// 書き戻してから浮動片を破棄する。`None`(クリップボード貼り付け)なら
+    /// 元に戻すべき領域自体が無いので、単に浮動片を破棄するだけでよい。
     pub cut_from: Option<IRect>,
     /// `canvas_view` がテクスチャをキャッシュ/再利用するための識別子。
     /// 生成時に一意な値を割り当てる。`pixels` の内容が変わったとき

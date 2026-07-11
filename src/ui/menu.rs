@@ -9,6 +9,8 @@
 
 use eframe::egui;
 
+use crate::keymap::{self, Action};
+
 /// クリックされたメニュー項目(まだ副作用は起こさない。`app.rs` が実行する)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -69,23 +71,36 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
     egui::Panel::top("menu_bar").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("ファイル", |ui| {
-                if ui.button("新規 (Ctrl+N)").clicked() {
+                if ui.button(keymap::menu_label("新規", Action::New)).clicked() {
                     action = Some(MenuAction::New);
                     ui.close();
                 }
-                if ui.button("開く (Ctrl+O)").clicked() {
+                if ui
+                    .button(keymap::menu_label("開く", Action::Open))
+                    .clicked()
+                {
                     action = Some(MenuAction::Open);
                     ui.close();
                 }
-                if ui.button("上書き保存 (Ctrl+S)").clicked() {
+                if ui
+                    .button(keymap::menu_label("上書き保存", Action::Save))
+                    .clicked()
+                {
                     action = Some(MenuAction::Save);
                     ui.close();
                 }
-                if ui.button("名前を付けて保存 (Ctrl+Shift+S)").clicked() {
+                if ui
+                    .button(keymap::menu_label("名前を付けて保存", Action::SaveAs))
+                    .clicked()
+                {
                     action = Some(MenuAction::SaveAs);
                     ui.close();
                 }
                 ui.separator();
+                // Alt+F4 は OS/ウィンドウマネージャが `close_requested` として
+                // 通知するものであり egui が消費するショートカットではない
+                // ため、`keymap::KEYMAP` の対象外(`keymap` モジュール
+                // ドキュメントコメント参照)。表記は固定文字列のままでよい。
                 if ui.button("終了 (Alt+F4)").clicked() {
                     action = Some(MenuAction::Exit);
                     ui.close();
@@ -93,7 +108,10 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
             });
             ui.menu_button("編集", |ui| {
                 if ui
-                    .add_enabled(state.can_undo, egui::Button::new("元に戻す (Ctrl+Z)"))
+                    .add_enabled(
+                        state.can_undo,
+                        egui::Button::new(keymap::menu_label("元に戻す", Action::Undo)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::Undo);
@@ -102,7 +120,7 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui
                     .add_enabled(
                         state.can_redo,
-                        egui::Button::new("やり直し (Ctrl+Y, Ctrl+Shift+Z)"),
+                        egui::Button::new(keymap::menu_label("やり直し", Action::Redo)),
                     )
                     .clicked()
                 {
@@ -111,37 +129,55 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(state.has_selection, egui::Button::new("切り取り (Ctrl+X)"))
+                    .add_enabled(
+                        state.has_selection,
+                        egui::Button::new(keymap::menu_label("切り取り", Action::Cut)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::Cut);
                     ui.close();
                 }
                 if ui
-                    .add_enabled(state.has_selection, egui::Button::new("コピー (Ctrl+C)"))
+                    .add_enabled(
+                        state.has_selection,
+                        egui::Button::new(keymap::menu_label("コピー", Action::Copy)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::Copy);
                     ui.close();
                 }
-                if ui.button("貼り付け (Ctrl+V)").clicked() {
+                if ui
+                    .button(keymap::menu_label("貼り付け", Action::Paste))
+                    .clicked()
+                {
                     action = Some(MenuAction::Paste);
                     ui.close();
                 }
                 if ui
-                    .add_enabled(state.has_selection, egui::Button::new("削除 (Delete)"))
+                    .add_enabled(
+                        state.has_selection,
+                        egui::Button::new(keymap::menu_label("削除", Action::Delete)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::Delete);
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("すべて選択 (Ctrl+A)").clicked() {
+                if ui
+                    .button(keymap::menu_label("すべて選択", Action::SelectAll))
+                    .clicked()
+                {
                     action = Some(MenuAction::SelectAll);
                     ui.close();
                 }
                 if ui
-                    .add_enabled(state.has_selection, egui::Button::new("選択解除 (Ctrl+D)"))
+                    .add_enabled(
+                        state.has_selection,
+                        egui::Button::new(keymap::menu_label("選択解除", Action::Deselect)),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::Deselect);
@@ -189,7 +225,7 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui
                     .add_enabled(
                         state.can_add_layer,
-                        egui::Button::new("新規レイヤー (Ctrl+Shift+N)"),
+                        egui::Button::new(keymap::menu_label("新規レイヤー", Action::LayerAdd)),
                     )
                     .clicked()
                 {
@@ -197,7 +233,13 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     ui.close();
                 }
                 if ui
-                    .add_enabled(state.can_add_layer, egui::Button::new("レイヤーを複製"))
+                    .add_enabled(
+                        state.can_add_layer,
+                        egui::Button::new(keymap::menu_label(
+                            "レイヤーを複製",
+                            Action::LayerDuplicate,
+                        )),
+                    )
                     .clicked()
                 {
                     action = Some(MenuAction::LayerDuplicate);
@@ -229,7 +271,10 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui
                     .add_enabled(
                         state.can_merge_layer_down,
-                        egui::Button::new("下のレイヤーと結合 (Ctrl+E)"),
+                        egui::Button::new(keymap::menu_label(
+                            "下のレイヤーと結合",
+                            Action::LayerMergeDown,
+                        )),
                     )
                     .clicked()
                 {
@@ -239,7 +284,7 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 if ui
                     .add_enabled(
                         state.can_flatten_layers,
-                        egui::Button::new("画像の統合 (Ctrl+Shift+E)"),
+                        egui::Button::new(keymap::menu_label("画像の統合", Action::LayerFlatten)),
                     )
                     .clicked()
                 {
@@ -248,19 +293,34 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                 }
             });
             ui.menu_button("表示", |ui| {
-                if ui.button("拡大 (Ctrl++)").clicked() {
+                if ui
+                    .button(keymap::menu_label("拡大", Action::ZoomIn))
+                    .clicked()
+                {
                     action = Some(MenuAction::ZoomIn);
                     ui.close();
                 }
-                if ui.button("縮小 (Ctrl+-)").clicked() {
+                if ui
+                    .button(keymap::menu_label("縮小", Action::ZoomOut))
+                    .clicked()
+                {
                     action = Some(MenuAction::ZoomOut);
                     ui.close();
                 }
-                if ui.button("100% (Ctrl+1)").clicked() {
+                if ui
+                    .button(keymap::menu_label("100%", Action::Zoom100))
+                    .clicked()
+                {
                     action = Some(MenuAction::Zoom100);
                     ui.close();
                 }
-                if ui.button("ウィンドウに合わせる (Ctrl+0)").clicked() {
+                if ui
+                    .button(keymap::menu_label(
+                        "ウィンドウに合わせる",
+                        Action::FitWindow,
+                    ))
+                    .clicked()
+                {
                     action = Some(MenuAction::FitWindow);
                     ui.close();
                 }

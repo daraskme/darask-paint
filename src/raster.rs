@@ -79,9 +79,33 @@ pub fn segment_bounds(from: (f32, f32), to: (f32, f32), radius: f32) -> IRect {
     stamp_bounds(from.0, from.1, radius).union(&stamp_bounds(to.0, to.1, radius))
 }
 
+/// ハードエッジ判定(`stamp_round`/`stamp_pencil_coverage` 共通)で保証する
+/// 実効最小半径(`tools/mod.rs` の「1px ブラシでも何かしら塗れるよう最小
+/// 半径を設ける」という意図、`MIN_BRUSH_SIZE`=1.0 → 最小半径 0.5 に対応)。
+///
+/// 画素中心 `(x+0.5, y+0.5)` は、クリック位置(任意の点)から最大で
+/// `√2/2 ≈ 0.7071`(画素セルの対角線の半分)離れうる。半径がこれ未満だと、
+/// 画素境界の交点付近(面積比で約 21%)をクリックしたとき最寄り画素の中心
+/// にすら届かず 1 画素も塗られない — それでも `stamp_bounds` は非空なので、
+/// 何も描かれないクリックで無意味な undo 単位・`modified` フラグだけが
+/// 立ってしまう。`stamp_soft_coverage` の `outer = r.max(inner + 0.5)` と
+/// 同じ考え方の下駄。`√2/2 ≈ 0.70710678` そのものだと最寄り画素中心が
+/// ちょうど境界上(`dist == radius`)になり f32 の丸め誤差で等号判定が
+/// 揺れうるため、わずかに大きい値にして安全マージンを持たせる。
+const MIN_HARD_EDGE_RADIUS: f32 = 0.708;
+
+/// ハードエッジ判定に使う実効半径(`MIN_HARD_EDGE_RADIUS` 未満を底上げする)。
+/// `stamp_bounds`(境界矩形の計算)は据え置いてよい — 境界は `ceil(...)+1`
+/// の余裕を持たせてあるため、この下駄で実効半径が最大 `√2/2` まで増えても
+/// 既存の矩形計算で十分にカバーされる(raster.rs のテストで確認)。
+fn hard_edge_radius(radius: f32) -> f32 {
+    radius.max(0.0).max(MIN_HARD_EDGE_RADIUS)
+}
+
 /// ハードエッジの丸筆スタンプ。`erase` なら alpha=0(透明)を書く。
 /// 中心 `(cx, cy)` は画像ピクセル座標(浮動小数)。ピクセル中心
-/// `(x+0.5, y+0.5)` と中心の距離が `radius` 以下なら塗る。
+/// `(x+0.5, y+0.5)` と中心の距離が `radius` 以下なら塗る(`radius` が
+/// `MIN_HARD_EDGE_RADIUS` 未満のときは底上げする、上記コメント参照)。
 /// 実際に触れた(境界クランプ済みの)矩形を返す(呼び出し側が `dirty` に
 /// マージする)。
 pub fn stamp_round(
@@ -96,7 +120,7 @@ pub fn stamp_round(
     if bounds.is_empty() {
         return bounds;
     }
-    let r2 = radius.max(0.0).powi(2);
+    let r2 = hard_edge_radius(radius).powi(2);
     let write = if erase { [0, 0, 0, 0] } else { color };
     for y in bounds.y0..bounds.y1 {
         for x in bounds.x0..bounds.x1 {
@@ -163,19 +187,52 @@ pub fn blend_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
 }
 
 // ---------------------------------------------------------------------------
-// M3: アンチエイリアス用カバレッジ(tools/pen.rs が使う)
+// v3 §17/ARCHITECTURE.md §15.1: ブラシ/消しゴム共通ストロークエンジンの
+// カバレッジ計算(tools/brush.rs が使う)。
 // ---------------------------------------------------------------------------
 
-/// 中心 `(cx, cy)` 半径 `radius` の円が画素 `(x, y)` の中心をどれだけ覆うかを
-/// 0–255 で返す(ARCHITECTURE.md §5 のペン AA モード用)。境界からおよそ 1px
-/// の帯で線形にフェザーする(いわゆる coverage アンチエイリアス)。
-pub fn stamp_coverage(cx: f32, cy: f32, radius: f32, x: i32, y: i32) -> u8 {
+/// ソフトブラシのカバレッジ(SPEC §17: 「硬さ 0–100%。半径 r に対し
+/// r×硬さ までカバレッジ 1、そこから外周 r までなめらかに減衰
+/// (smoothstep)」)。`hardness` は 0.0–1.0。
+///
+/// 硬さ 100% (`hardness == 1.0`) でも輪郭がジャギーにならないよう、減衰帯
+/// の幅は少なくとも 0.5px 確保する(ARCHITECTURE.md §15.1: 「ブラシは常時
+/// AA」。旧 `stamp_coverage` が `r + 0.5` を下限にしていたのと同じ考え方の
+/// 一般化)。
+pub fn stamp_soft_coverage(cx: f32, cy: f32, radius: f32, hardness: f32, x: i32, y: i32) -> u8 {
     let dx = x as f32 + 0.5 - cx;
     let dy = y as f32 + 0.5 - cy;
     let dist = (dx * dx + dy * dy).sqrt();
     let r = radius.max(0.0);
-    let coverage = (r + 0.5 - dist).clamp(0.0, 1.0);
-    (coverage * 255.0).round() as u8
+    let h = hardness.clamp(0.0, 1.0);
+    let inner = r * h;
+    let outer = r.max(inner + 0.5);
+    if dist <= inner {
+        return 255;
+    }
+    if dist >= outer {
+        return 0;
+    }
+    let t = ((dist - inner) / (outer - inner)).clamp(0.0, 1.0);
+    // smoothstep(1 -> 0): 3t^2 - 2t^3 を「255 から 0 へ」の向きで使う。
+    let smooth = t * t * (3.0 - 2.0 * t);
+    ((1.0 - smooth) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// 鉛筆モードの 2 値スタンプ(SPEC §17: 「アンチエイリアスなしの2値スタンプ
+/// (ピクセルアート用)。硬さ無視」)。`stamp_round` の判定式と同じ(半径の
+/// 底上げも含めて `hard_edge_radius` を共有する)だが、カバレッジ値
+/// (0 または 255)として返すため `tools/brush.rs` の不透明度合成ロジックを
+/// ブラシ/鉛筆で共通化できる。
+pub fn stamp_pencil_coverage(cx: f32, cy: f32, radius: f32, x: i32, y: i32) -> u8 {
+    let dx = x as f32 + 0.5 - cx;
+    let dy = y as f32 + 0.5 - cy;
+    let dist2 = dx * dx + dy * dy;
+    if dist2 <= hard_edge_radius(radius).powi(2) {
+        255
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +641,58 @@ mod tests {
         assert!(!touched.is_empty());
     }
 
+    // -- v3 レビューで発見・修正したバグ: 半径 0.5(1px ブラシ)の鉛筆/
+    // ハードスタンプは、クリック位置が全画素中心から 0.5px 超だと 1 画素も
+    // 塗らない(`hard_edge_radius` の下駄で解消)。-----------------------
+
+    #[test]
+    fn stamp_round_at_minimum_radius_still_paints_when_clicked_on_a_pixel_corner() {
+        // (10.0, 10.0) は画素の角(4 近傍の画素中心はすべて距離 √2/2 ≈
+        // 0.707)。半径 0.5(SPEC §17/tools/mod.rs の最小ブラシ半径)のまま
+        // だと dist² = 0.5 > radius² = 0.25 でどの画素も塗られなかった。
+        let mut buf = make_buffer(20, 20, [0, 0, 0, 0]);
+        let mut s = Surface {
+            width: 20,
+            height: 20,
+            pixels: &mut buf,
+        };
+        stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
+        let neighbors = [(9, 9), (10, 9), (9, 10), (10, 10)];
+        assert!(
+            neighbors
+                .iter()
+                .any(|&(x, y)| s.get_pixel(x, y) == Some([255, 0, 0, 255])),
+            "a click on a pixel corner with the minimum brush radius must still paint at \
+             least the nearest pixel, not silently do nothing"
+        );
+    }
+
+    #[test]
+    fn stamp_round_at_minimum_radius_does_not_paint_far_away_pixels() {
+        // 下駄を入れても暴走して離れた画素まで塗らないことの対照テスト。
+        let mut buf = make_buffer(20, 20, [0, 0, 0, 0]);
+        let mut s = Surface {
+            width: 20,
+            height: 20,
+            pixels: &mut buf,
+        };
+        stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
+        assert_eq!(s.get_pixel(13, 10), Some([0, 0, 0, 0]));
+        assert_eq!(s.get_pixel(10, 13), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn stamp_pencil_coverage_at_minimum_radius_covers_a_pixel_corner_click() {
+        let neighbors = [(9, 9), (10, 9), (9, 10), (10, 10)];
+        assert!(
+            neighbors
+                .iter()
+                .any(|&(x, y)| stamp_pencil_coverage(10.0, 10.0, 0.5, x, y) == 255),
+            "pencil mode at the minimum brush radius must still cover the nearest pixel \
+             when clicked exactly on a pixel corner"
+        );
+    }
+
     #[test]
     fn stroke_segment_paints_both_endpoints() {
         let mut buf = make_buffer(40, 40, [0, 0, 0, 0]);
@@ -690,26 +799,79 @@ mod tests {
         assert_eq!(out, [12, 34, 56, 78]);
     }
 
-    // -- stamp_coverage (AA) -------------------------------------------------
+    // -- stamp_soft_coverage / stamp_pencil_coverage (v3 §17 ストロークエンジン) --
 
     #[test]
-    fn stamp_coverage_is_full_at_center() {
-        let cov = stamp_coverage(10.0, 10.0, 4.0, 10, 10);
-        assert_eq!(cov, 255);
+    fn stamp_soft_coverage_is_full_at_exact_center_regardless_of_hardness() {
+        // 中心を画素中心(10.5, 10.5)ちょうどに合わせる(dist=0 を保証する
+        // ため。中心が画素境界からずれていると硬さ 0% では dist>inner=0 に
+        // なり得る)。
+        for hardness in [0.0, 0.3, 1.0] {
+            let cov = stamp_soft_coverage(10.5, 10.5, 4.0, hardness, 10, 10);
+            assert_eq!(cov, 255, "hardness={hardness}");
+        }
     }
 
     #[test]
-    fn stamp_coverage_is_zero_well_outside_radius() {
-        let cov = stamp_coverage(10.0, 10.0, 4.0, 20, 10);
+    fn stamp_soft_coverage_is_zero_well_outside_radius() {
+        let cov = stamp_soft_coverage(10.0, 10.0, 4.0, 1.0, 20, 10);
         assert_eq!(cov, 0);
     }
 
     #[test]
-    fn stamp_coverage_feathers_near_boundary() {
-        // 中心をピクセル中心(10.5, 10.5)に合わせ、半径ちょうど上の画素は
-        // 50% 前後のカバレッジになるはず。
-        let cov = stamp_coverage(10.5, 10.5, 4.0, 14, 10);
+    fn stamp_soft_coverage_feathers_near_boundary_at_full_hardness() {
+        // 硬さ 100% でも(ジャギー防止のため)輪郭付近は 0.5px 幅のフェザーが
+        // 残る(ARCHITECTURE.md §15.1: 「ブラシは常時 AA」)。フェザー帯は
+        // dist∈(4.0, 4.5) の狭い範囲なので、軸に沿った画素(整数距離になる)
+        // ではなく斜め方向の画素を使う。
+        let cov = stamp_soft_coverage(10.5, 10.5, 4.0, 1.0, 14, 11);
         assert!(cov > 0 && cov < 255, "expected partial coverage, got {cov}");
+    }
+
+    #[test]
+    fn stamp_soft_coverage_falloff_boundary_is_full_inside_inner_radius() {
+        // SPEC §17: 「半径 r に対し r×硬さ までカバレッジ 1」。硬さ 50% の
+        // ブラシは、内側半径(r*0.5=2px)のすぐ内側では常に満コート。
+        let cov = stamp_soft_coverage(10.0, 10.0, 4.0, 0.5, 11, 10);
+        assert_eq!(cov, 255);
+    }
+
+    #[test]
+    fn stamp_soft_coverage_falloff_decreases_monotonically_outward() {
+        // r*硬さ から外周 r にかけて、カバレッジは単調に減少するはず
+        // (smoothstep の性質、ARCHITECTURE.md §15.1)。
+        let mut prev = 255u8;
+        for x in 12..=18 {
+            let cov = stamp_soft_coverage(10.0, 10.0, 8.0, 0.25, x, 10);
+            assert!(cov <= prev, "coverage rose at x={x}: {cov} > {prev}");
+            prev = cov;
+        }
+    }
+
+    #[test]
+    fn stamp_soft_coverage_hardness_zero_still_covers_exact_center() {
+        // 硬さ 0% は「中心 1 点だけ完全不透明、そこから即座に減衰」になる
+        // (inner=0)。中心を画素中心(10.5, 10.5)ちょうどに合わせれば、その
+        // 画素は依然として満コート。
+        let cov = stamp_soft_coverage(10.5, 10.5, 4.0, 0.0, 10, 10);
+        assert_eq!(cov, 255);
+        let cov_edge = stamp_soft_coverage(10.5, 10.5, 4.0, 0.0, 14, 10);
+        assert_eq!(cov_edge, 0);
+    }
+
+    #[test]
+    fn stamp_pencil_coverage_is_binary_not_feathered() {
+        // SPEC §17: 「アンチエイリアスなしの2値スタンプ」。境界のすぐ内側/
+        // 外側で 0 か 255 のどちらかにしかならない。
+        for x in 5..15 {
+            let cov = stamp_pencil_coverage(10.0, 10.0, 4.0, x, 10);
+            assert!(
+                cov == 0 || cov == 255,
+                "expected binary coverage, got {cov}"
+            );
+        }
+        assert_eq!(stamp_pencil_coverage(10.0, 10.0, 4.0, 10, 10), 255);
+        assert_eq!(stamp_pencil_coverage(10.0, 10.0, 4.0, 20, 10), 0);
     }
 
     // -- rect / ellipse -------------------------------------------------------

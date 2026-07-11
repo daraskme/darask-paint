@@ -400,7 +400,7 @@ stamp_soft(mask, cx, cy, r, hardness): d≤r*h → 255、r*h<d≤r → smoothste
 
 ## 15.3 テキストツール
 
-- 依存追加: `ab_glyph`(**Cargo.lock の egui が使う版と同一に `=` 固定**。`cargo tree -i ab_glyph` で確認)。
+- 依存追加: `ab_glyph`(**`=0.2.32` に `=` 固定**。egui/epaint 0.35 は内部で ab_glyph を使っていない(skrifa/harfrust 系)ため「egui と同じ版に揃える」相手は存在しないが、再現性のためのバージョン固定自体は必須。`cargo tree -i ab_glyph` で darask-paint 単独の依存元であること・重複がないことを確認する)。
 - App はフォントバイト列(§9 で読んだものと同じファイル)を `Arc<Vec<u8>>` で保持し、`ab_glyph::FontRef`(ttc は index 付き)を作る。
 - 編集中: クリック画像座標に egui `TextEdit::multiline` をオーバーレイ(`Area`/`Window` 無枠)。表示フォントサイズ ≈ size × zoom / ppp(プレビューは近似で可、上限あり)。IME は egui/winit に任せる。
 - 確定: 行分割 → 各行を ab_glyph でレイアウト(h_advance + kerning、ベースライン = ascent、行送り = (ascent−descent+line_gap)×1.1 目安)→ カバレッジをプライマリ色でバッファに合成 → その画素群を**浮動片**として配置(以後は既存の移動/拡縮/確定/キャンセル機構)。
@@ -434,7 +434,7 @@ stamp_soft(mask, cx, cy, r, hardness): d≤r*h → 255、r*h<d≤r → smoothste
 1. Esc 意味論の変更は既存テスト・確定経路(Enter/外クリック/ツール切替/レイヤー操作前の自動確定)に波及する。「自動確定」は**確定のまま**(キャンセルにしない)こと — Esc だけがキャンセル。
 2. mask バッファはドキュメントのサイズ変更で再確保。サイズ変更中にストロークは開いていない(v1 のガードが保証)。
 3. 数字キー・単一キーは必ず wants_keyboard_input ガード(テキストツール編集中に B や 5 でツールが変わらないこと)。
-4. ab_glyph の版が egui とずれると重複コンパイル+サイズ増。`=` 固定を Cargo.toml に書き、`cargo tree -d` で重複がないこと。
+4. ab_glyph は egui/epaint 0.35 が内部で使っているものではない(skrifa/harfrust 系)ため、「egui とバージョンをずれさせない」という意味での重複コンパイルの心配はそもそも無い(egui 側に合わせるべき ab_glyph 依存が存在しない)。それでも再現性のため `=` 固定を Cargo.toml に書き、`cargo tree -d` で(darask-paint 自身の重複がないか)・`cargo tree -i ab_glyph` で(darask-paint 単独の依存元であること)を確認する。
 5. ブラシ円カーソルは選択・移動・テキスト等では出さない(ブラシ/消しゴム/鉛筆のみ)。
 6. Shift+U 巡回と Shift+[ ] は「Shift 付き単一キー」— egui の consume 順で素の U / [ ] より先に判定。
 7. 不透明度 <100 のストローク合成は毎フレーム「base からの再合成」— 直接レイヤーに blend を重ねると 1 ストローク内で濃度が累積してしまう(mask 方式を崩さない)。
