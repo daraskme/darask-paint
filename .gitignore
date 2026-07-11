@@ -1,0 +1,8 @@
+/target
+/bench.txt
+
+# ローカル専用の成果物・診断ファイル(コミットしない)
+/*.exe
+/diag_*.log
+/repro_*.png
+/shot*.png

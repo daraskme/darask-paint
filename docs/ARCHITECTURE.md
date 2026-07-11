@@ -1,0 +1,441 @@
+# Darask Paint — アーキテクチャ設計書 (v1)
+
+実装者へ: まず [SPEC.md](SPEC.md) を全部読むこと。本書は「どう作るか」を定める。
+egui の API はバージョンで変わる。本書のコード断片は**意図を示す擬似コード**であり、実際に解決されたバージョンの API(コンパイルエラーと docs.rs で確認)に合わせて書くこと。ただし**挙動の仕様は変えない**。
+
+## 1. モジュール構成
+
+```
+src/
+  main.rs        — エントリ。Instant記録、CLI引数、NativeOptions、フォント設定、App起動
+  app.rs         — DaraskApp (eframe::App)。全状態の所有、レイアウト、ショートカット、モーダル管理
+  document.rs    — Document(ピクセルバッファ)と全画像操作(resize/flip/rotate/crop)
+  canvas_view.rs — ズーム/パン状態、座標変換、テクスチャ管理、ポインタ→ToolEventディスパッチ
+  history.rs     — アンドゥ/リドゥ(タイルCoW + パッチ)
+  raster.rs      — 低レベル描画: スタンプ、線、矩形、楕円、flood fill、合成
+  io.rs          — 開く/保存、クリップボード、D&D、ファイルダイアログ
+  tools/
+    mod.rs       — Tool トレイト、ToolKind、ToolCtx
+    pen.rs eraser.rs shapes.rs fill.rs picker.rs select.rs pan.rs
+  ui/
+    toolbar.rs options_bar.rs status_bar.rs dialogs.rs menu.rs
+```
+
+## 2. 中核データ構造
+
+```rust
+/// RGBA8・行優先。座標は左上原点、x右・y下。
+pub struct Document {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,          // len == w*h*4
+    pub path: Option<PathBuf>,
+    pub modified: bool,
+    pub dirty: Option<IRect>,     // 前フレーム以降に変更された領域(テクスチャ部分更新用)
+}
+
+pub struct IRect { pub x0: i32, pub y0: i32, pub x1: i32, pub y1: i32 } // 半開区間 [x0,x1)
+```
+
+- ピクセルアクセスは必ず境界クランプ/チェックを通す。範囲外書き込みでパニックしないこと。
+- 描画関数は変更領域を `dirty` にマージする。
+
+### 座標系(重要・純関数としてテスト必須)
+
+3 つの座標系を厳密に区別する:
+1. **画像ピクセル座標** (f32) — ドキュメント上の位置
+2. **スクリーン論理ポイント** (egui Pos2)
+3. **物理ピクセル** = 論理ポイント × `pixels_per_point (ppp)`
+
+状態: `zoom: f32`(zoom=1.0 で画像1px=物理1px)、`pan: Vec2`(ビューポート原点から画像原点への論理ポイントオフセット)。
+
+```
+img_to_screen(p) = viewport.min + pan + p * (zoom / ppp)
+screen_to_img(s) = (s - viewport.min - pan) * (ppp / zoom)
+```
+
+- カーソル中心ズーム: カーソル下の画像点が不動になるよう `pan` を再計算。
+- 100% でくっきり表示するため、画像描画矩形の原点は物理ピクセル格子に丸める: `(x*ppp).round()/ppp`。
+
+## 3. キャンバス描画
+
+- egui の `TextureHandle` を 1 枚持つ(ドキュメント全体、RGBA)。
+- `TextureOptions { magnification: Nearest, minification: Linear, .. }`。
+- 毎フレーム: `doc.dirty` があればその矩形だけ `ImageDelta::partial(pos, sub_image, options)` で部分更新(`ctx.tex_manager()` 経由、または該当バージョンの部分更新 API)。**全面再アップロードは 新規/開く/サイズ変更時のみ**。
+- キャンバスウィジェット: 中央パネル全域を `ui.allocate_rect(rect, Sense::click_and_drag())`。`painter.image(...)` で市松模様(小さなリピートテクスチャか矩形塗り)→ 画像 → ツールプレビュー → 選択枠(破線)の順に描画。
+- 右クリック描画があるため、キャンバスにはコンテキストメニューを付けない。
+
+### 再描画ポリシー(アイドル 0% の要)
+
+egui はイベント駆動で再描画される。**無条件の `request_repaint()` を書かない**。例外はトーストの消滅タイマー(`request_repaint_after(残り時間)`)のみ。アニメーションなし。
+
+## 4. ツールシステム
+
+```rust
+pub enum ToolEvent {
+    Down { img: Pos2, button: PointerButton, mods: Modifiers },
+    Drag { img: Pos2, button: PointerButton, mods: Modifiers },
+    Up   { img: Pos2, button: PointerButton },
+    Hover{ img: Pos2 },
+}
+
+pub trait Tool {
+    fn event(&mut self, ev: ToolEvent, ctx: &mut ToolCtx);
+    /// ドキュメントに触れないプレビュー(直線/図形/選択のドラッグ中表示)
+    fn draw_preview(&self, painter: &egui::Painter, view: &CanvasView);
+    fn cursor(&self) -> egui::CursorIcon;
+}
+
+pub struct ToolCtx<'a> {
+    pub doc: &'a mut Document,
+    pub history: &'a mut History,
+    pub primary: Color32,
+    pub secondary: Color32,
+    pub brush_size: f32,
+    // ツール固有オプション(fill許容値、図形モード、AA)もここ経由
+}
+```
+
+- ポインタイベントの間隔が開いても線が途切れないよう、ペン/消しゴムは**前回位置と今回位置を線分で補間**してスタンプする。
+- Space 押下中・中ボタンは、現在のツールに関係なく canvas_view がパンとして横取りする。
+- Alt+クリックは描画ツール中でも一時スポイト。
+
+## 5. ラスタ演算 (raster.rs)
+
+すべて純関数的(Document とプリミティブ引数のみ)。ユニットテスト必須。
+
+- `stamp_round(doc, cx, cy, radius, color, erase: bool)` — ハードエッジ円。erase は alpha=0 を書く。
+- `stroke_segment(doc, from, to, radius, color, erase)` — 線分に沿ってスタンプ(間隔 ≤ max(1px, radius/2))。
+- `draw_rect / fill_rect / draw_ellipse / fill_ellipse` — 枠線は stroke_segment ベース(太さ=ブラシ)。楕円は媒介変数 or 中点法。
+- `flood_fill(doc, x, y, color, tolerance)` — スキャンライン法(スタック、再帰禁止)。tolerance は各チャンネル差の最大値で判定。開始色と塗色が同一なら no-op。4000×4000 全面でも 100ms 未満。
+- `blend_over(dst, src)` — straight-alpha の source-over 合成。
+- ペンの AA モード(オプション、M3): ストローク中は**カバレッジマスク**(ドキュメント寸法の `Vec<u8>`、遅延確保・再利用)に `max` で書き、undo 用に保存した CoW タイル(§6)を元画像として `out = blend(元, color, coverage)` で合成する。スタンプ重ね塗りによる縁の濃度ムラを防ぐため。ハードエッジ時はマスク不要で直接描いてよい。
+
+## 6. アンドゥ / リドゥ (history.rs)
+
+**タイル Copy-on-Write 方式**(タイル = 256×256):
+
+1. ストローク開始時に空の `HashMap<(u32,u32), Box<[u8]>>` を用意。
+2. raster 関数がタイルに初めて書く前に、そのタイルの元ピクセルを保存(ToolCtx 経由のフック、または「ストローク開始時に触れる予定はないので書き込み時に呼ぶ `ensure_tile_saved(tx,ty)`」)。
+3. ストローク確定時: 触れたタイル群の bbox から `Patch { rect, before, after }` を作って push(before はタイルから復元、after は現在の doc から複写)。
+
+```rust
+pub enum HistoryOp {
+    Patch { rect: IRect, before: Vec<u8>, after: Vec<u8> },
+    /// サイズが変わる操作(resize/crop/rotate/canvas resize)
+    Replace { before: (u32, u32, Vec<u8>), after: (u32, u32, Vec<u8>) },
+}
+```
+
+- undo スタックと redo スタック。新規 push で redo クリア。
+- メモリ会計: 全 op のバイト合計 ≤ 256MB。超過時は最古を破棄(ただし直近 10 件は保持)。
+- 適用/巻き戻しは `dirty` を設定すること。
+
+## 7. 選択・フローティング (tools/select.rs)
+
+```rust
+pub struct Selection { pub rect: IRect }
+pub struct Floating {
+    pub pixels: Vec<u8>, pub w: u32, pub h: u32,
+    pub pos: Pos2,              // 画像座標(f32、キャンバス外もはみ出し可)
+    pub cut_from: Option<IRect> // 浮動化時に透明で埋めた元領域(undo一体化用)
+}
+```
+
+- 浮動化(選択内ドラッグ開始時): 領域ピクセルを Floating に複写し、元領域を透明化。この透明化は**まだ履歴に積まない**。
+- 確定(Enter/外クリック/ツール切替/Esc): 浮動片を doc に合成し、「切り出し元の透明化+合成先」をまとめて 1 つの Patch にする(bbox = 両領域の合併)。
+- 浮動片の表示は独立した小テクスチャで canvas_view が描く。
+- 選択枠の破線は painter の線分で描く(点線はアニメーションさせない — 再描画ポリシー遵守)。
+
+## 8. I/O (io.rs)
+
+- `image` crate で読み込み → `to_rgba8()`。保存は拡張子で分岐。JPEG は白合成後 `image::codecs::jpeg::JpegEncoder::new_with_quality`。
+- ダイアログ: `rfd::FileDialog`(ブロッキングで良い。ネイティブモーダルなので UI スレッドで可)。フィルタ設定必須。
+- クリップボード: `arboard::Clipboard`、`get_image`/`set_image`(RGBA)。失敗はトーストで通知。
+- D&D: `ctx.input(|i| i.raw.dropped_files)` → 未保存ガードを通して open。
+- 未保存ガードは app.rs の `pending_action: Option<PendingAction>`(New/Open(path?)/Close)+確認モーダルの状態機械で一元化。
+
+## 9. フォント(日本語表示の必須要件)
+
+egui のデフォルトフォントに日本語グリフは**無い**。`App::new`(創建時に一度)で:
+
+1. 次の順で最初に読めたものを使う:
+   `C:\Windows\Fonts\YuGothM.ttc` → `C:\Windows\Fonts\meiryo.ttc` → `C:\Windows\Fonts\msgothic.ttc`
+2. `.ttc` はコレクションなので `FontData` の `index`(通常 0)を設定。
+3. `Proportional` と `Monospace` 両ファミリの**先頭**に挿入(欧文はデフォルトフォントが先でも可。tofu が出ない構成なら順序は任せる)。
+4. 全部読めなければ警告ログだけ出して続行(Win11 では起きない想定)。
+
+フォントは**バンドルしない**(バイナリサイズと起動時間のため)。
+
+## 10. app.rs の状態機械
+
+```rust
+pub struct DaraskApp {
+    doc: Document,
+    view: CanvasView,
+    history: History,
+    tool: ToolKind, tools: /* 各ツールの状態 */,
+    primary: Color32, secondary: Color32, brush_size: f32,
+    recent_colors: VecDeque<Color32>,     // 最大8
+    selection: Option<Selection>, floating: Option<Floating>,
+    modal: Option<ModalState>,            // New/Resize/CanvasResize/JpegQuality/ConfirmUnsaved
+    pending_action: Option<PendingAction>,
+    toast: Option<(String, Instant)>,
+    bench: Option<BenchState>,            // DARASK_BENCH=1 のとき
+}
+```
+
+- update() の順序: ①ベンチ処理 ②close_requested 検知 ③ショートカット処理(`consume_shortcut`、単一キーは `!ctx.wants_keyboard_input()` ガード)④メニュー ⑤オプションバー ⑥ツールバー ⑦中央キャンバス ⑧ステータスバー ⑨モーダル。
+- モーダル表示中はキャンバスへの入力を渡さない。
+
+## 11. マイルストーン(実装順序・各段階でビルド緑必須)
+
+### M1 — 骨組みとシェル
+- `cargo init`、依存追加(`cargo add eframe rfd arboard` と `cargo add image --no-default-features -F png,jpeg,bmp,gif,webp`)、リリースプロファイル設定。
+- main.rs(bench 計測開始、windows_subsystem、NativeOptions: 1280×800/最小640×480/タイトル/centered)。
+- フォント設定(§9)。**メニューバー・ツールバー・オプションバー・ステータスバーのレイアウトを日本語ラベルで表示**(中身は未配線でよい)。
+- document.rs の Document::new(白/透明)。
+- ベンチモード(SPEC §11)を完動させる。
+- 受け入れ: ビルド緑・`DARASK_BENCH=1` で起動→bench.txt が書かれ自動終了。日本語が tofu にならない。
+
+### M2 — キャンバスと描画コア
+- canvas_view.rs 完成: 座標変換(純関数+テスト)、ズーム/パン(Ctrl+ホイール、Space/中ボタン、H)、市松模様、テクスチャ部分更新、クランプ。
+- raster.rs: stamp_round / stroke_segment / blend_over(+テスト)。
+- ツール基盤(トレイト、ディスパッチ)+ ペン(ハードエッジ)/ 消しゴム。右ドラッグ=セカンダリ色。Alt+一時スポイト。
+- history.rs 完成(タイル CoW、メモリ上限、テスト)+ Ctrl+Z/Y。
+- 受け入れ: ズーム/パンした状態で描いてもカーソル直下に正しく描ける(座標変換テストで担保)。undo/redo が正しい。
+
+### M3 — 残りの描画ツールと色
+- 直線 / 矩形 / 楕円(プレビュー→確定、Shift 拘束、モード切替)。
+- flood fill(+許容値テスト、境界テスト)。スポイト。
+- 色 UI: スウォッチ+ピッカー、X 入替、最近使った色。ブラシサイズ UI と `[` `]`。
+- ペンの AA オプション(§5 のマスク方式)。
+- 受け入れ: 全ツールがオプションバー連動で動作。テスト緑。
+
+### M4 — ファイル I/O・選択・仕上げ
+- 開く/保存/名前を付けて保存/新規(ダイアログ)、JPEG 品質、CLI 引数、D&D、未保存ガード、タイトルバー表示。
+- 選択ツール一式(§7)+ クリップボード(コピー/切り取り/貼り付け、白紙時の置き換え貼り付け)。
+- 画像メニュー(サイズ変更/キャンバスサイズ/トリミング/反転/回転、Replace undo)。
+- 表示メニュー、ステータスバー実データ、全ショートカット総配線、トースト。
+- 受け入れ: SPEC の機能表・ショートカット表をすべて満たす。`cargo test` 緑、警告 0。
+
+## 12. egui 実装上の注意(既知の落とし穴)
+
+1. ショートカットは `ctx.input_mut(|i| i.consume_shortcut(...))`。Ctrl+Z 等がテキストフィールドと衝突しないよう消費順序に注意。
+2. `close_requested()` → `ViewportCommand::CancelClose` はフレーム内で即送ること。
+3. 部分テクスチャ更新の `pos` は物理テクスチャ座標(画像ピクセル)。dirty 矩形を画像境界にクランプしてから切り出す。
+4. `Sense::click_and_drag` の response では `drag_started_by / dragged_by / drag_stopped_by` でボタン別に分岐。`interact_pointer_pos()` を使う。
+5. ホイール値は `raw_scroll_delta` / `smooth_scroll_delta` の別・単位に注意。Ctrl 併用時は egui が `zoom_delta` に変換することがある(`zoom_delta()` も確認)。
+6. 高 DPI: `ctx.pixels_per_point()` を毎フレーム取得。キャッシュしない。
+7. 描画中(ドラッグ中)は入力イベントがフレームを駆動するので `request_repaint` は不要。
+8. `arboard` の ImageData は所有バイト(Cow)。寸法 0 チェック。
+9. rfd のダイアログ中はイベントループが止まる。ダイアログ呼び出しはフレーム処理の外側(update 内の最後や、フラグ経由の次フレーム冒頭)で行い、painter 借用と衝突させない。
+
+## 13. テスト方針
+
+`cargo test` で走るユニットテストのみ(GUI テスト不要):
+- 座標変換の往復(img→screen→img が恒等、複数の zoom/ppp/pan)。
+- stamp/segment: 端点が確実に塗られる、半径境界、画像端で OOB しない。
+- flood_fill: 閉領域を越えない、tolerance の閾値通り、同色 no-op。
+- history: patch 適用→undo で完全復元(バイト一致)、redo 一致、メモリ上限で最古破棄、直近10保持。
+- Document の flip/rotate/resize/crop の寸法とピクセル位置。
+- io: PNG 保存→読込ラウンドトリップ(temp dir 使用)。
+
+---
+
+# v2 設計(レイヤー / カラーパネル / アイコン / ハンドル)
+
+SPEC.md の「v2 拡張仕様」(§13〜§16)に対応する設計。v1 の不変条件(再描画ポリシー、パニック禁止、警告 0、依存 4 crate 固定)はすべて維持する。
+
+## 14.1 レイヤーデータモデルと合成
+
+```rust
+pub struct Layer {
+    pub name: String,
+    pub visible: bool,
+    pub opacity: u8,        // 0-255(UI 表示は %)
+    pub pixels: Vec<u8>,    // RGBA8、Document と同寸
+}
+
+pub struct Document {
+    pub width: u32,
+    pub height: u32,
+    pub layers: Vec<Layer>, // index 0 = 最下層
+    pub active: usize,
+    pub composite: Vec<u8>, // 可視レイヤーの合成キャッシュ(RGBA、チェッカー含まず)
+    pub dirty: Option<IRect>,
+    pub path: Option<PathBuf>,
+    pub modified: bool,
+}
+```
+
+- **raster.rs はレイヤーを知らない**: 描画関数はピクセルバッファ(`&mut [u8]` + 幅高、または軽量な Surface ビュー)を受け取る形にリファクタし、呼び出し側がアクティブレイヤーのバッファを渡す。既存テストは新シグネチャに追随させる(挙動は不変)。
+- `dirty` は「合成の再計算 + テクスチャ更新が必要な領域」。描画・レイヤー構造変更・表示/不透明度変更のすべてがここにマージする。
+- 毎フレーム: `dirty` があれば `recomposite(rect)`(rect 内を透明から始めて可視レイヤーを下から straight-alpha + レイヤー不透明度で合成)→ その rect をテクスチャ部分更新。全レイヤー合成は dirty 領域のみなのでストローク中のコストは v1 と同水準。
+- スポイトは `composite` を読む。塗りつぶし・選択・浮動片はアクティブレイヤーの `pixels` を読む。
+- 保存: `composite` を全再計算してから書き出し(JPEG/BMP は白合成)。開く/新規は「背景」1 枚。
+
+## 14.2 履歴の拡張
+
+```rust
+pub enum HistoryOp {
+    Patch { layer: usize, rect: IRect, before: Vec<u8>, after: Vec<u8> },
+    AddLayer { index: usize, name: String },                  // undo=削除
+    RemoveLayer { index: usize, layer: Layer },               // undo=復元(複製の undo は RemoveLayer で表現)
+    MoveLayer { from: usize, to: usize },
+    MergeDown { index: usize, upper: Layer, lower_before: Vec<u8> },
+    ReplaceAll { before: DocSnapshot, after: DocSnapshot },   // 全レイヤー+寸法(サイズ変更/回転/反転/トリミング/統合)
+}
+```
+
+- 各 op は `active` の変化も復元する(op 内に before/after の active を持たせてよい)。
+- 表示切替・不透明度は履歴に積まない(SPEC §13)。ただし変更時に dirty は立てる。
+- タイル CoW(StrokeRecorder)は「アクティブレイヤーのバッファ」に対して動く。ストローク開始時のレイヤー index を記録し、Patch に焼き込む。
+- レイヤー構造の変更・アンドゥは、浮動片/ストローク進行中は `end_active_gesture()`(v1 の修正で導入済み)で先に確定してから行う。**この確定順序を必ず守る**(v1 レビューで確定した破損パターンの再発防止)。
+
+## 14.3 カラーホイール(色相リング + SV 三角形)
+
+新規 `src/ui/color_wheel.rs`。純関数(テスト必須)と描画/入力を分離する:
+
+```
+角度系: 色相 h∈[0,360)。マーカー角 θ = h に対し 12時方向が 0°、時計回り。
+  pos_on_ring(center, radius, h) / hue_from_pos(center, pos) は往復一致をテスト。
+三角形(固定向き、内接円半径 r_in):
+  P_hue   = center + r_in * dir(0°)      (上)
+  P_black = center + r_in * dir(240°)    (左下)
+  P_white = center + r_in * dir(120°)    (右下)
+S/V ↔ 重心座標: a=S*V (P_hue), c=V*(1-S) (P_white), b=1-V (P_black)
+  逆変換: V = a + c, S = V>0 ? a/V : 0
+  クランプ: 三角形外のポインタは重心座標を負値切り捨て→正規化で最近傍に丸める。
+  roundtrip (S,V)→pos→(S,V) をテスト。
+```
+
+- 描画: リングは 72 分割の三角形ストリップ(egui `Mesh`、頂点色 = hsv(h,1,1))。三角形は頂点色(純色相/黒/白)1 枚のメッシュ(RGB 線形補間で標準的な見た目になる)。マーカーは白フチ+黒フチの小円。
+- 入力: `Sense::click_and_drag()`。ドラッグ開始位置がリング帯かどうかでモード(Hue/SV)を固定し、離すまで維持。
+- 色状態はアプリ全体で RGBA(Color32)が正。ホイールは編集中のみ HSV を保持し、**ドラッグ中は HSV を正としてドラッグ終了時に RGB へ確定**する(RGB↔HSV 往復での色相消失 — 例: 彩度 0 で h が失われる — を防ぐ)。
+- egui の `color_edit_button_srgba` ポップアップは廃止。HEX 欄は `TextEdit` + 確定時パース(#RGB 形式は非対応でよい、#RRGGBB / #RRGGBBAA のみ)。
+
+## 14.4 パレット / 14.5 アイコン / 14.6 ハンドル
+
+- パレット: `const PALETTE: [Color32; 24]`(SPEC §14 の色)+ `user_palette: Vec<Color32>`(App 状態、非永続)。スウォッチは 16×16、クリック=プライマリ/右クリック=セカンダリ。ユーザー色の削除は `Response::context_menu`(キャンバス外なので右クリックメニュー可)。
+- アイコン: 新規 `src/ui/icons.rs` に `pub fn paint_tool_icon(kind: ToolKind, painter: &egui::Painter, rect: Rect, color: Color32)`。線幅 1.5pt 基調、`rect` は正方形前提で相対座標(0..1)から組み立てる。ボタン側は `ui.allocate_response` + hover/selected の背景を自前で塗ってからアイコンを重ねる(egui Button の text 用 API に依存しない)。
+- ハンドル: 選択/浮動片の矩形をスクリーン座標に変換し、8 点の Rect を求める純関数 `handle_rects(screen_rect) -> [Rect; 8]` と、ヒットテスト `hit_handle(pos) -> Option<Handle>` をテスト付きで実装。ドラッグ中は `Floating { original: Vec<u8>, orig_w, orig_h, .. }` から `resample_bilinear(original, new_w, new_h)`(純関数・テスト付き)で作り直す。カーソルは対角/水平/垂直のリサイズアイコン。
+
+## 14.7 モジュール変更
+
+```
+src/ui/color_wheel.rs  (新規) ホイール+三角形ウィジェット
+src/ui/color_panel.rs  (新規) スウォッチ/ホイール/アルファ/HEX/パレット/最近色
+src/ui/layers_panel.rs (新規) レイヤー一覧+ボタン+不透明度
+src/ui/icons.rs        (新規) ツールアイコンのベクター描画
+src/ui/side_panel.rs   (新規・任意) 右パネルの枠(色+レイヤーを縦に配置、幅約210px)
+document.rs / history.rs / raster.rs / tools/* / io.rs — レイヤー対応リファクタ
+ui/options_bar.rs — 色関連を右パネルへ移設(サイズ・ツール固有オプションは残す)
+ui/menu.rs — 「レイヤー」メニュー追加
+```
+
+## 14.8 v2 マイルストーン(各段階でビルド緑・警告 0・テスト緑必須)
+
+### V2-M1 — レイヤー基盤(UI なし)
+- Document/raster/history/tools/io を §14.1〜14.2 の形にリファクタ。UI は従来のまま(常に 1 枚の「背景」で v1 と同挙動)。
+- recomposite の正しさ(不透明度・非表示・多層合成)、レイヤー付き Patch の undo/redo、ReplaceAll をテスト。
+- 受け入れ: 既存の全機能が 1 レイヤーで完全に従来どおり動く。テスト全緑(既存テストは新 API に追随)。ベンチ 300ms 以内。
+
+### V2-M2 — レイヤー UI
+- 右パネル骨格(side_panel + layers_panel)、レイヤーメニュー、全レイヤー操作(追加/複製/削除/上下移動/結合/統合)+ ショートカット、名前変更、表示/不透明度、複数レイヤー保存時のトースト。
+- 受け入れ: SPEC §13 の全項目。浮動片・ストローク進行中のレイヤー操作が先確定になること。
+
+### V2-M3 — カラーパネル
+- color_wheel(数式テスト付き)、color_panel(スウォッチ/アルファ/HEX/パレット/ユーザー色/最近色移設)、options_bar から色 UI を撤去、egui ポップアップピッカー廃止。
+- 受け入れ: SPEC §14 の全項目。ホイール往復テスト緑。ドラッグ中も 60fps(dirty 再合成は発生しない — 色変更はテクスチャに影響しない)。
+
+### V2-M4 — アイコンとスケールハンドル
+- icons.rs(9 ツール)+ ツールバー置き換え。選択/浮動片の 8 ハンドル(§14.6)、Shift 比率固定、bilinear 再サンプル、カーソル。README.md を v2 機能で更新。
+- 受け入れ: SPEC §15・§16 の全項目。テスト全緑・ベンチ 300ms 以内。
+
+## 14.9 v2 の落とし穴(v3 は §15 参照)
+
+1. **RGB↔HSV 往復**: S=0 や V=0 で色相が失われ、三角形ドラッグ中にマーカーが飛ぶ。ドラッグ中は HSV 状態を正とする(§14.3)。
+2. **合成キャッシュの整合**: レイヤー構造変更(削除/移動/結合/統合/不透明度)は必ず全面 dirty。描画は従来どおり局所 dirty。
+3. **アクティブレイヤーと浮動片**: 浮動片保持中にアクティブレイヤーを変えると確定先が変わってしまう。レイヤー切替も「先に確定」フックを通す。
+4. **削除で active が範囲外**になる off-by-one(最上位削除時)。
+5. **テクスチャは合成 1 枚のまま**(レイヤーごとにテクスチャを持たない)。浮動片テクスチャだけ v1 同様に別枠。
+6. **リングのヒット判定**は内外半径の間のみ。三角形ヒットは重心座標で判定(外周ぎわのデッドゾーンを作らない)。
+7. パネル追加で `CentralPanel` より先に右パネルを show する(egui のパネルは宣言順でレイアウトが決まる)。
+8. 不透明度スライダーのドラッグ中は毎フレーム全面 recomposite になる — 4000×4000 では重いので、**ドラッグ中はフレームごとに 1 回だけ**(値が変わったときのみ)再合成し、変わらなければ何もしない。
+
+---
+
+# v3 設計(ブラシエンジン / 移動・ズーム・テキスト / PS キーマップ)
+
+SPEC.md「v3 拡張仕様」(§17〜§20)に対応。**v2 マイルストーン実装中のエージェントはこの章を無視すること。** v3 は v2 完了後に着手する。
+
+## 15.1 ストロークエンジン(ブラシ/消しゴム/鉛筆の統一)
+
+v2 までの AA ペンの「カバレッジマスク + CoW タイル元画像」方式を全ストロークに一般化する:
+
+```
+mask: Vec<u8>(ドキュメント寸法、遅延確保・ストローク間で再利用、touched矩形リストでクリア)
+stamp_soft(mask, cx, cy, r, hardness): d≤r*h → 255、r*h<d≤r → smoothstep で 255→0、max 書き込み
+鉛筆: 2値スタンプ(d≤r → 255)
+毎フレーム、ストロークの dirty 領域について:
+  base = History の CoW タイル(ストローク開始時点のレイヤー画素)
+  ブラシ: out = blend_over(base, color × (mask/255 × opacity))
+  消しゴム: out.a = base.a × (1 − mask/255 × strength)
+```
+
+- これにより「1 ストローク内で重ねても不透明度上限を超えない」(PS opacity 意味論)が mask の max 合成から自然に出る。
+- スタンプ間隔: ソフト時 ≤ max(1px, r/4)。
+- Shift+クリック連結: ツールごとに直近ストローク終点(画像座標)を保持し、Shift+Down で終点→クリック点の segment を 1 ストロークとして実行。
+- ブラシ円カーソル: `CursorIcon::None` + painter で円2重線(白 1.5pt の内側に黒 1pt)。半径 = brush_r × zoom / ppp。3px 未満は Crosshair にフォールバック。UI パネル上では通常カーソル。
+- 数字キー: `!ctx.egui_wants_keyboard_input()` ガード付きで 1–9→10–90%、0→100%。
+
+## 15.2 移動・ズーム・自由変形・Esc キャンセル
+
+- **移動 (V)**: Down 時に「選択があれば選択範囲を、なければ全範囲を」既存の浮動化パス(begin_floating_from_selection 相当)で浮動化し、以後は既存の浮動片ドラッグと同一コード。空レイヤー(全透明)でも動作(確定時 before==after 抑制が効く)。
+- **ズーム (Z)**: click で apply_zoom_step(+1, クリック位置アンカー)、Alt+click で −1。既存のズーム関数を再利用。カーソル ZoomIn/ZoomOut。
+- **Ctrl+T**: `free_transform()` = 選択なし→全選択、以後 浮動化+ハンドル表示。既存機構の糊付けのみ。
+- **Esc = キャンセル**: `cancel_floating()` を新設 — 浮動片破棄、cut_from 領域に元画素を書き戻し(浮動化時に退避した元画素を Floating に保持しておく)、選択解除、履歴に積まない、dirty 設定。テキスト編集中の Esc は入力破棄。**既存の「Esc=確定」を前提にしたコード・テストを全て洗い出して更新すること。**
+- 浮動化時に「切り出し元の元画素」を Floating に保持する形にすると cancel が単純化する(現在は CoW タイル経由 — どちらでも良いが復元のバイト一致をテストすること)。
+
+## 15.3 テキストツール
+
+- 依存追加: `ab_glyph`(**Cargo.lock の egui が使う版と同一に `=` 固定**。`cargo tree -i ab_glyph` で確認)。
+- App はフォントバイト列(§9 で読んだものと同じファイル)を `Arc<Vec<u8>>` で保持し、`ab_glyph::FontRef`(ttc は index 付き)を作る。
+- 編集中: クリック画像座標に egui `TextEdit::multiline` をオーバーレイ(`Area`/`Window` 無枠)。表示フォントサイズ ≈ size × zoom / ppp(プレビューは近似で可、上限あり)。IME は egui/winit に任せる。
+- 確定: 行分割 → 各行を ab_glyph でレイアウト(h_advance + kerning、ベースライン = ascent、行送り = (ascent−descent+line_gap)×1.1 目安)→ カバレッジをプライマリ色でバッファに合成 → その画素群を**浮動片**として配置(以後は既存の移動/拡縮/確定/キャンセル機構)。
+- 純関数 `rasterize_text(font, text, px_size, color) -> (w, h, Vec<u8>)` としてテスト(空文字、複数行、日本語グリフが非ゼロ画素を生むこと)。
+
+## 15.4 keymap.rs(ショートカットの一元化)
+
+- 散在する handle_*_shortcuts を新規 `src/keymap.rs` に集約:
+  `enum Action { SelectTool(ToolKind), CycleShapeTool, SwapColors, DefaultColors, Undo, Redo, ... }` と
+  `const KEYMAP: &[(Binding, Action)]`(Binding = 修飾キー+キー or 単一キー)。
+- ディスパッチ規則: ①モーダル/テキスト編集中の除外(従来どおり)②**修飾キーが多いものから先に consume**(v1 の Ctrl+Shift+Z 教訓)③単一キーは `!wants_keyboard_input` ガード。
+- メニュー表記・ツールチップは KEYMAP から文字列生成(表記と実挙動の乖離を構造的に防ぐ)。
+- SPEC §20 の表と 1:1 であることをテスト(KEYMAP に SPEC の全項目が存在するか、少なくとも件数と主要キーの静的テスト)。
+
+## 15.5 v3 マイルストーン(各段階でビルド緑・警告 0・テスト緑・ベンチ 300ms 以内)
+
+### V3-M1 — ストロークエンジン刷新
+§15.1 の全部(硬さ/不透明度/鉛筆モード/消しゴム強さ/Shift+クリック連結/円カーソル/数字キー)。旧 AA チェックボックス廃止。オプションバー更新。エンジンの純関数テスト(falloff 境界、max 合成、opacity 上限、消しゴム減衰)。
+
+### V3-M2 — 移動・ズーム・自由変形・Esc キャンセル
+§15.2 の全部 + 移動/ズームツールのアイコン(icons.rs 拡張)+ ツールバー追加。Esc 挙動変更の全経路更新(テスト含む)。cancel_floating のバイト一致テスト。
+
+### V3-M3 — テキストツール
+§15.3 の全部 + テキストツールのアイコン + オプションバー(サイズ)。ab_glyph 追加(版固定)。rasterize_text テスト。
+
+### V3-M4 — PS キーマップ集約と総配線
+§15.4 の keymap.rs + SPEC §20 の完全適用(U 巡回含む)+ 旧キー(L/R/C/F)の削除 + メニュー/ツールチップ/README.md の全面追随 + Ctrl+J/D の配線。回帰: v1/v2 の全機能スモーク(テストで担保できる範囲)+ ベンチ。
+
+## 15.6 v3 の落とし穴
+
+1. Esc 意味論の変更は既存テスト・確定経路(Enter/外クリック/ツール切替/レイヤー操作前の自動確定)に波及する。「自動確定」は**確定のまま**(キャンセルにしない)こと — Esc だけがキャンセル。
+2. mask バッファはドキュメントのサイズ変更で再確保。サイズ変更中にストロークは開いていない(v1 のガードが保証)。
+3. 数字キー・単一キーは必ず wants_keyboard_input ガード(テキストツール編集中に B や 5 でツールが変わらないこと)。
+4. ab_glyph の版が egui とずれると重複コンパイル+サイズ増。`=` 固定を Cargo.toml に書き、`cargo tree -d` で重複がないこと。
+5. ブラシ円カーソルは選択・移動・テキスト等では出さない(ブラシ/消しゴム/鉛筆のみ)。
+6. Shift+U 巡回と Shift+[ ] は「Shift 付き単一キー」— egui の consume 順で素の U / [ ] より先に判定。
+7. 不透明度 <100 のストローク合成は毎フレーム「base からの再合成」— 直接レイヤーに blend を重ねると 1 ストローク内で濃度が累積してしまう(mask 方式を崩さない)。
+8. 移動ツールで浮動化した全レイヤーの Patch は全面矩形になる — 履歴メモリ会計(256MB)に正しく算入されること。
