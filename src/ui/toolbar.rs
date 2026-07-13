@@ -14,9 +14,22 @@
 
 use eframe::egui;
 
-use crate::keymap;
+use crate::keymap::{self, Action};
 use crate::tools::{LassoMode, ToolKind};
 use crate::ui::icons;
+
+/// クリックされた操作(まだ副作用は起こさない。`app.rs` が実行する。
+/// `ui/menu.rs::MenuAction`/`ui/tab_bar.rs::TabBarAction` と同じ流儀)。
+///
+/// v6 §33/§34(ARCHITECTURE.md §18.2): 設定(歯車)ボタンは `ToolKind` を
+/// 持たない(ツールを切り替えるのではなくモーダルを開くだけ)ため、従来の
+/// `Option<ToolKind>` では表現できず、この列挙体を新設した。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarAction {
+    SelectTool(ToolKind),
+    /// SPEC §34: 設定(環境設定)ダイアログを開く(Ctrl+K と同じ)。
+    OpenPreferences,
+}
 
 struct ToolButton {
     name: &'static str,
@@ -109,11 +122,16 @@ const TOOLS: &[ToolButton] = &[
 const BUTTON_SIZE: f32 = 30.0;
 const ICON_MARGIN: f32 = 5.0;
 
-/// 現在のツール `current` を表示する。クリックされたツールがあれば返す
+/// 現在のツール `current` を表示する。クリックされた操作があれば返す
 /// (`ToolKind` はここでは書き換えない、上記コメント参照)。`lasso_mode` は
 /// なげなわのツールチップに現在のモード(自由/多角形)を出すためだけに使う
 /// (ARCHITECTURE.md §16.10-10: 「巡回系はツールバー…の整合を忘れない」)。
-pub fn show(ui: &mut egui::Ui, current: ToolKind, lasso_mode: LassoMode) -> Option<ToolKind> {
+///
+/// v6 §33/§34(ARCHITECTURE.md §18.2): ツール一覧の下に区切り線を挟んで
+/// 設定(歯車)ボタンを 1 つ追加した(「ツールバーにも歯車アイコンのボタンを
+/// 1 つ」)。M4 のメニュー全展開アイコン化(SPEC §33)より先行するため、
+/// ここではこのボタン単体だけを追加する(メニュー全体の再設計はスコープ外)。
+pub fn show(ui: &mut egui::Ui, current: ToolKind, lasso_mode: LassoMode) -> Option<ToolbarAction> {
     let mut clicked = None;
     egui::Panel::left("tool_bar")
         .resizable(false)
@@ -130,8 +148,14 @@ pub fn show(ui: &mut egui::Ui, current: ToolKind, lasso_mode: LassoMode) -> Opti
                     };
                     let response = tool_button(ui, tool.kind, selected).on_hover_text(tooltip);
                     if response.clicked() {
-                        clicked = Some(tool.kind);
+                        clicked = Some(ToolbarAction::SelectTool(tool.kind));
                     }
+                }
+                ui.separator();
+                let shortcut = keymap::label_for(Action::OpenPreferences);
+                let response = settings_button(ui).on_hover_text(format!("設定 ({shortcut})"));
+                if response.clicked() {
+                    clicked = Some(ToolbarAction::OpenPreferences);
                 }
             });
         });
@@ -151,6 +175,22 @@ fn tool_button(ui: &mut egui::Ui, kind: ToolKind, selected: bool) -> egui::Respo
             .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
         let icon_rect = rect.shrink(ICON_MARGIN);
         icons::paint_tool_icon(kind, ui.painter(), icon_rect, visuals.fg_stroke.color);
+    }
+    response
+}
+
+/// SPEC §34(ARCHITECTURE.md §18.2): 設定ボタン。`tool_button` と同じ
+/// hover 背景の描き方だが、押しっぱなしのトグル状態(`selected`)を持たない
+/// (モーダルを開くだけの単発アクション、`ui/menu.rs` の各項目と同じ扱い)。
+fn settings_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(BUTTON_SIZE, BUTTON_SIZE);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter()
+            .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+        let icon_rect = rect.shrink(ICON_MARGIN);
+        icons::paint_settings_icon(ui.painter(), icon_rect, visuals.fg_stroke.color);
     }
     response
 }

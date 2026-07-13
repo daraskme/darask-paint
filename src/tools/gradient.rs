@@ -162,7 +162,8 @@ impl Tool for GradientTool {
                 };
                 drag.current = img;
                 self.apply(ctx, drag);
-                ctx.history.commit_stroke(ctx.doc);
+                // ARCHITECTURE.md §18.3 の対応表: 「グラデーション」。
+                ctx.history.commit_stroke(ctx.doc, "グラデーション");
                 ctx.used_colors.push(ctx.primary);
                 if self.colors == GradientColors::PrimaryToSecondary {
                     ctx.used_colors.push(ctx.secondary);
@@ -179,7 +180,7 @@ impl Tool for GradientTool {
         // 方針)。
         if let Some(drag) = self.drag.take() {
             self.apply(ctx, drag);
-            ctx.history.commit_stroke(ctx.doc);
+            ctx.history.commit_stroke(ctx.doc, "グラデーション");
         }
     }
 

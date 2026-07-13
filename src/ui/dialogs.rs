@@ -257,6 +257,34 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
     outcome
 }
 
+/// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログ。最小構成
+/// として「元に戻す履歴の保持数」(1–500、既定 50)の数値入力のみを持つ。
+/// `New`/`ImageResize` 等と同じ「ドラフト値を `&mut` で受け取り、OK/
+/// キャンセルで呼び出し側(app.rs)が確定/破棄する」パターン(`ModalState::
+/// Preferences` のドラフト値をそのまま渡す)。
+pub fn show_preferences(ctx: &egui::Context, draft_max_undo_steps: &mut u32) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Pending;
+    let modal = egui::Modal::new(egui::Id::new("darask_dialog_preferences")).show(ctx, |ui| {
+        ui.heading("設定");
+        ui.horizontal(|ui| {
+            ui.label("元に戻す履歴の保持数:");
+            let mut v = *draft_max_undo_steps;
+            if ui
+                .add(egui::DragValue::new(&mut v).range(1..=500))
+                .changed()
+            {
+                *draft_max_undo_steps = v.clamp(1, 500);
+            }
+        });
+        ui.separator();
+        confirm_buttons(ui, &mut outcome);
+    });
+    if modal.should_close() && outcome == DialogOutcome::Pending {
+        outcome = DialogOutcome::Cancelled;
+    }
+    outcome
+}
+
 /// v4 §26: 「ヘルプ > バージョン情報」。版数・リポジトリ URL を表示するだけの
 /// 小モーダル(閉じるだけなので `DialogOutcome::Cancelled` は使わず、
 /// `Confirmed` 1 本で「閉じた」を表す)。

@@ -8,6 +8,7 @@
 pub mod color_panel;
 pub mod color_wheel;
 pub mod dialogs;
+pub mod history_panel;
 pub mod icons;
 pub mod layers_panel;
 pub mod menu;

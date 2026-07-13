@@ -69,7 +69,8 @@ impl Tool for FillTool {
             })
         };
         ctx.doc.mark_dirty(touched);
-        ctx.history.commit_stroke(ctx.doc);
+        // ARCHITECTURE.md §18.3 の対応表: 「塗りつぶし」。
+        ctx.history.commit_stroke(ctx.doc, "塗りつぶし");
 
         // v4 §16.3: 選択(clip)の外をクリックした場合、塗りつぶしの連結探索が
         // 開始点自身で止まり `touched` が空になる(raster::flood_fill 参照)。

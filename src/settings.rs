@@ -63,6 +63,18 @@ pub const DEFAULT_BRUSH_HARDNESS: u8 = 100;
 pub const DEFAULT_BRUSH_OPACITY: u8 = 100;
 pub const DEFAULT_BRUSH_SMOOTHING: u8 = 0;
 
+/// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」(1–500、既定 50)。
+/// `history.rs::DEFAULT_MAX_STEPS`(`History::new()` の既定値)と同じ 50 だが、
+/// あちらは `usize`・こちら側は設定ファイルの値域を表す `u32` で、モジュールも
+/// 独立している(`history.rs` は `settings.rs` を知らない)ため、値としてだけ
+/// 揃える。どちらかを変えるときはもう片方も揃えること(このファイルの
+/// `default_max_undo_steps_is_50` と `history.rs` 側の
+/// `DEFAULT_MAX_STEPS` を使うテストの双方を確認する)。
+pub const DEFAULT_MAX_UNDO_STEPS: u32 = 50;
+/// SPEC §34: 「保持数」の入力範囲(1–500)。
+pub const MIN_MAX_UNDO_STEPS: u32 = 1;
+pub const MAX_MAX_UNDO_STEPS: u32 = 500;
+
 /// 永続化する設定(SPEC §26 の列挙そのもの。これ以外のフィールドを足さない
 /// こと — 「最近使った色」は同 SPEC の永続化対象リストに含まれていないため
 /// ここには無い)。
@@ -91,6 +103,11 @@ pub struct Settings {
     pub user_palette: Vec<Color32>,
     pub last_tool: ToolKind,
     pub show_pixel_grid: bool,
+    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」
+    /// (1–500、既定 50)。設定ダイアログ(v6-M2)の OK で更新され、開いている
+    /// 全タブの `History::set_max_steps` へ即座に反映される
+    /// (`app.rs::apply_preferences` 参照)。
+    pub max_undo_steps: u32,
 }
 
 impl Default for Settings {
@@ -118,6 +135,7 @@ impl Default for Settings {
             last_tool: ToolKind::Pen,
             // SPEC §25: 「デフォルト ON」。
             show_pixel_grid: true,
+            max_undo_steps: DEFAULT_MAX_UNDO_STEPS,
         }
     }
 }
@@ -133,6 +151,15 @@ impl Settings {
         self.window_height = self
             .window_height
             .clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_DIMENSION);
+    }
+
+    /// SPEC §34: 「保持数」を [1, 500] へクランプする(`clamp_window_dims` と
+    /// 同じ流儀。手編集・破損した設定ファイルからの防御、ARCHITECTURE.md
+    /// §16.10-5)。
+    fn clamp_max_undo_steps(&mut self) {
+        self.max_undo_steps = self
+            .max_undo_steps
+            .clamp(MIN_MAX_UNDO_STEPS, MAX_MAX_UNDO_STEPS);
     }
 }
 
@@ -375,6 +402,11 @@ pub fn parse(text: &str) -> Settings {
                     settings.show_pixel_grid = v;
                 }
             }
+            "history.max_steps" => {
+                if let Ok(v) = value.parse::<u32>() {
+                    settings.max_undo_steps = v;
+                }
+            }
             _ => {} // recent.N/palette.N は下で、未知キーはここで無視。
         }
     }
@@ -392,6 +424,7 @@ pub fn parse(text: &str) -> Settings {
         .collect();
 
     settings.clamp_window_dims();
+    settings.clamp_max_undo_steps();
     settings
 }
 
@@ -407,6 +440,7 @@ fn push_line(out: &mut String, key: &str, value: &str) {
 pub fn serialize(settings: &Settings) -> String {
     let mut s = settings.clone();
     s.clamp_window_dims();
+    s.clamp_max_undo_steps();
 
     let mut out = String::new();
     push_line(&mut out, "window.width", &s.window_width.to_string());
@@ -453,6 +487,7 @@ pub fn serialize(settings: &Settings) -> String {
     }
     push_line(&mut out, "last_tool", tool_kind_tag(s.last_tool));
     push_line(&mut out, "pixel_grid", bool_tag(s.show_pixel_grid));
+    push_line(&mut out, "history.max_steps", &s.max_undo_steps.to_string());
     out
 }
 
@@ -536,6 +571,7 @@ mod tests {
             ],
             last_tool: ToolKind::Gradient,
             show_pixel_grid: false,
+            max_undo_steps: 123,
         }
     }
 
@@ -671,6 +707,50 @@ palette.0\t#FF0000
         let parsed = parse(text);
         assert!(parsed.window_width <= MAX_WINDOW_DIMENSION);
         assert!(parsed.window_height <= MAX_WINDOW_DIMENSION);
+    }
+
+    // -- SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」 -------------
+
+    #[test]
+    fn default_max_undo_steps_is_50() {
+        assert_eq!(Settings::default().max_undo_steps, 50);
+    }
+
+    #[test]
+    fn max_undo_steps_round_trips() {
+        let text = "history.max_steps\t250\n";
+        let parsed = parse(text);
+        assert_eq!(parsed.max_undo_steps, 250);
+        assert_eq!(
+            parse(&serialize(&parsed)).max_undo_steps,
+            250,
+            "serialize→parse must preserve the value"
+        );
+    }
+
+    #[test]
+    fn max_undo_steps_is_clamped_to_1_500_on_parse() {
+        let parsed = parse("history.max_steps\t0\n");
+        assert_eq!(parsed.max_undo_steps, MIN_MAX_UNDO_STEPS);
+        let parsed = parse("history.max_steps\t999999\n");
+        assert_eq!(parsed.max_undo_steps, MAX_MAX_UNDO_STEPS);
+    }
+
+    #[test]
+    fn max_undo_steps_is_clamped_on_serialize_too() {
+        let settings = Settings {
+            max_undo_steps: 999_999,
+            ..Settings::default()
+        };
+        let text = serialize(&settings);
+        let parsed = parse(&text);
+        assert_eq!(parsed.max_undo_steps, MAX_MAX_UNDO_STEPS);
+    }
+
+    #[test]
+    fn garbage_max_undo_steps_value_falls_back_to_default() {
+        let parsed = parse("history.max_steps\tnot_a_number\n");
+        assert_eq!(parsed.max_undo_steps, Settings::default().max_undo_steps);
     }
 
     #[test]

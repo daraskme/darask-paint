@@ -186,6 +186,10 @@ pub enum Action {
     ZoomOut,
     Zoom100,
     FitWindow,
+
+    // -- v6 §34(ARCHITECTURE.md §18.2): 設定 ------------------------------
+    /// `Ctrl+K`(Photoshop 準拠): 設定(環境設定)ダイアログを開く。
+    OpenPreferences,
 }
 
 /// `KEYMAP` の 1 行。
@@ -332,6 +336,8 @@ pub const KEYMAP: &[Entry] = &[
     e(Modifiers::CTRL, Key::Minus, Action::ZoomOut),
     e(Modifiers::CTRL, Key::Num1, Action::Zoom100),
     e(Modifiers::CTRL, Key::Num0, Action::FitWindow),
+    // -- v6 §34: 設定 --------------------------------------------------------
+    e(Modifiers::CTRL, Key::K, Action::OpenPreferences),
 ];
 
 /// このフレームぶんのショートカットを消費し、発火した [`Action`] を
@@ -762,6 +768,16 @@ mod tests {
         );
     }
 
+    // -- v6 §34(V6-M2): 設定(Ctrl+K) -----------------------------------------
+
+    #[test]
+    fn open_preferences_key_matches_spec_34() {
+        assert_eq!(
+            binding_for(Action::OpenPreferences),
+            Some(Binding::new(Modifiers::CTRL, Key::K))
+        );
+    }
+
     #[test]
     fn ctrl_shift_tab_takes_priority_over_ctrl_tab() {
         // ARCHITECTURE.md §15.4 ②と同じ理由(Ctrl+Shift+Z が Ctrl+Z より先の
@@ -793,7 +809,8 @@ mod tests {
         // v5 §30/§32(V5-M2)でさらに 2 件追加: Ctrl+Tab(NextTab) +
         // Ctrl+Shift+Tab(PrevTab) = 59 + 2 = 61。
         // v5 §30/§32(V5-M3)でさらに 1 件追加: Ctrl+W(CloseTab) = 61 + 1 = 62。
-        assert_eq!(KEYMAP.len(), 62);
+        // v6 §34(V6-M2)でさらに 1 件追加: Ctrl+K(OpenPreferences) = 62 + 1 = 63。
+        assert_eq!(KEYMAP.len(), 63);
     }
 
     #[test]

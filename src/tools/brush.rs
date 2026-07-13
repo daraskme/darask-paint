@@ -341,7 +341,16 @@ impl BrushEngine {
                         &mut touched,
                     );
                 }
-                ctx.history.commit_stroke(ctx.doc);
+                // ARCHITECTURE.md §18.3 の対応表: ブラシ/消しゴムは同じ
+                // エンジンを共有するため `params.erase` でラベルを分ける。
+                ctx.history.commit_stroke(
+                    ctx.doc,
+                    if params.erase {
+                        "消しゴム"
+                    } else {
+                        "ブラシ"
+                    },
+                );
                 if let Some(bbox) = touched {
                     self.clear_mask_region(bbox);
                 }
@@ -355,9 +364,15 @@ impl BrushEngine {
     /// `Tool::cancel` の共通実装。進行中のストロークがあれば `Up` と同様に
     /// 確定する(ARCHITECTURE.md §6「1 ストローク = 1 undo 単位」を、
     /// ツール切替という中断経路でも守るため)。
-    pub fn cancel(&mut self, ctx: &mut ToolCtx) -> Option<PointerButton> {
+    ///
+    /// `label` は History に積む undo ラベル(ARCHITECTURE.md §18.3:
+    /// 「ブラシ」/「消しゴム」)。呼び出し元(`PenTool`/`EraserTool`)は
+    /// それぞれ固定のツール種別しか持たないため、`BrushParams` 経由ではなく
+    /// 呼び出し側から直接渡す(`handle` の `Up` 分岐が `params.erase` から
+    /// 選ぶのと同じ結果になる)。
+    pub fn cancel(&mut self, ctx: &mut ToolCtx, label: &'static str) -> Option<PointerButton> {
         let state = self.stroke.take()?;
-        ctx.history.commit_stroke(ctx.doc);
+        ctx.history.commit_stroke(ctx.doc, label);
         if let Some(bbox) = state.touched {
             self.clear_mask_region(bbox);
         }
@@ -1145,7 +1160,7 @@ mod tests {
             params,
         );
         assert!(c.history.has_open_stroke());
-        let button = engine.cancel(&mut c);
+        let button = engine.cancel(&mut c, "ブラシ");
         assert_eq!(button, Some(PointerButton::Primary));
         assert!(!c.history.has_open_stroke());
         assert!(c.history.can_undo());

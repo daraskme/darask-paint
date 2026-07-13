@@ -33,6 +33,12 @@ const MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// 上限を超えても必ず保持する直近の件数(SPEC §9)。
 const MIN_KEEP: usize = 10;
 
+/// v6 §34/ARCHITECTURE.md §18.2・§18.3: 「元に戻す履歴の保持数」の既定値。
+/// 設定ダイアログ(v6-M2)が `Settings::max_undo_steps` を注入するまでの
+/// `History::new()` の既定値としてここで定義する(v6-M1 時点では設定
+/// ダイアログ自体が無いため、`History` はこの既定のまま動く)。
+const DEFAULT_MAX_STEPS: usize = 50;
+
 /// 1 回のアンドゥ単位。
 ///
 /// v2(ARCHITECTURE.md §14.2)でレイヤー構造の変更用に軽量な op を追加した:
@@ -329,11 +335,42 @@ fn paste_region(pixels: &mut [u8], width: u32, height: u32, rect: IRect, data: &
     }
 }
 
+/// v6 §33〜35(ARCHITECTURE.md §18.3): 履歴パネル表示用に、1 回の undo 単位
+/// (`HistoryOp`)へ呼び出し元由来の短い日本語ラベル(例: 「ブラシ」「塗り
+/// つぶし」「画像サイズ変更」)を添えたもの。`push`/`commit_stroke` を
+/// 呼ぶすべての箇所がラベルを渡す(ARCHITECTURE.md §18.3 の対応表参照)。
+/// ラベル自体は表示専用でメモリ会計(`HistoryOp::byte_size`)には含めない
+/// (短い日本語文字列数バイト〜十数バイトであり、SPEC §9 の 256MB 上限は
+/// 元々ピクセルデータを対象にした値のため)。
+pub struct HistoryEntry {
+    pub op: HistoryOp,
+    /// v6-M3(ARCHITECTURE.md §18.4): `History::undo_labels`/
+    /// `redo_labels_reversed` 経由で履歴パネル(`ui/history_panel.rs`)が
+    /// 表示する日本語ラベル。
+    pub label: String,
+}
+
 /// アンドゥ/リドゥスタックとメモリ会計、進行中ストロークの記録を持つ。
+///
+/// v6 §34〜35(ARCHITECTURE.md §18.2・§18.3)で「元に戻す履歴の保持数」
+/// (`max_steps`)と、破棄の有無を示す `truncated` フラグを追加した:
+/// - `max_steps`: 設定ダイアログ(v6-M2、未実装)から `set_max_steps` で
+///   注入される上限件数(既定 `DEFAULT_MAX_STEPS` = 50)。
+/// - `truncated`: 保持数キャップまたは SPEC §9 のバイト上限で最古のエントリ
+///   を一度でも破棄したら `true` のまま(履歴パネル(v6-M3、未実装)の
+///   「(これ以前の履歴は破棄されました)」注記の表示判定に使う)。
 pub struct History {
-    undo: Vec<HistoryOp>,
-    redo: Vec<HistoryOp>,
+    undo_stack: Vec<HistoryEntry>,
+    redo_stack: Vec<HistoryEntry>,
     bytes_used: usize,
+    /// SPEC §34: 「元に戻す履歴の保持数」(1–500、既定 50)。値そのものの
+    /// 範囲クランプは設定側([1,500])が担うが、`History` 自身も 0 による
+    /// 除算・無限ループ的な事故を避けるため `set_max_steps` で `1` 未満には
+    /// ならないよう防御する(CLAUDE.md 鉄則: パニックしない)。
+    max_steps: usize,
+    /// 一度でも保持数/バイト上限で最古のエントリを破棄したら `true` の
+    /// まま戻らない(ARCHITECTURE.md §18.3 最終項)。
+    truncated: bool,
     stroke: Option<StrokeRecorder>,
 }
 
@@ -346,9 +383,11 @@ impl Default for History {
 impl History {
     pub fn new() -> Self {
         Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             bytes_used: 0,
+            max_steps: DEFAULT_MAX_STEPS,
+            truncated: false,
             stroke: None,
         }
     }
@@ -455,7 +494,10 @@ impl History {
     /// `apply_after` でしか `modified` を立てておらず、通常の編集
     /// (ペン/消しゴム/図形/塗りつぶし/選択の確定など、すべてこの関数を
     /// 経由する)ではタイトルバーの `*` や未保存ガードが働かなかった)。
-    pub fn commit_stroke(&mut self, doc: &mut Document) {
+    ///
+    /// v6 §33〜35(ARCHITECTURE.md §18.3): 呼び出し元由来の短い日本語ラベル
+    /// (対応表参照)を 1 つ追加で受け取り、そのまま `push` へ渡す。
+    pub fn commit_stroke(&mut self, doc: &mut Document, label: impl Into<String>) {
         if let Some(stroke) = self.stroke.take() {
             let layer_idx = stroke.layer;
             let Some(layer) = doc.layers.get(layer_idx) else {
@@ -464,7 +506,7 @@ impl History {
             let pixels = &layer.pixels;
             if let Some(op) = stroke.finish(doc.width, pixels) {
                 doc.modified = true;
-                self.push(op);
+                self.push(op, label);
             }
         }
     }
@@ -495,49 +537,140 @@ impl History {
     }
 
     /// 履歴に 1 op を積む。redo は新規 push でクリアする
-    /// (ARCHITECTURE.md §6)。メモリ上限を超えたら直近 `MIN_KEEP` 件を残して
-    /// 最古から破棄する(SPEC §9)。
-    pub fn push(&mut self, op: HistoryOp) {
-        for removed in self.redo.drain(..) {
-            self.bytes_used = self.bytes_used.saturating_sub(removed.byte_size());
+    /// (ARCHITECTURE.md §6)。メモリ上限(SPEC §9)・保持数上限(SPEC §34、
+    /// `max_steps`)のいずれかを超えたら、`min(MIN_KEEP, max_steps)` 件を
+    /// 残して最古から破棄する(ARCHITECTURE.md §18.3)。
+    ///
+    /// v6 §33〜35: `impl Into<String>` の日本語ラベルを 1 つ追加で受け取る
+    /// (ARCHITECTURE.md §18.3 の対応表参照。すべての呼び出し元がラベルを
+    /// 渡すようになった、機械的なシグネチャ変更)。
+    pub fn push(&mut self, op: HistoryOp, label: impl Into<String>) {
+        for removed in self.redo_stack.drain(..) {
+            self.bytes_used = self.bytes_used.saturating_sub(removed.op.byte_size());
         }
         self.bytes_used += op.byte_size();
-        self.undo.push(op);
+        self.undo_stack.push(HistoryEntry {
+            op,
+            label: label.into(),
+        });
+        self.trim_to_limits();
+    }
 
-        while self.bytes_used > MEMORY_LIMIT_BYTES && self.undo.len() > MIN_KEEP {
-            let removed = self.undo.remove(0);
-            self.bytes_used = self.bytes_used.saturating_sub(removed.byte_size());
+    /// SPEC §34/ARCHITECTURE.md §18.3: 保持数キャップ(`max_steps`)と
+    /// メモリ上限(SPEC §9、`MEMORY_LIMIT_BYTES`)のどちらかを超えている間、
+    /// 最古のエントリから破棄する。下限は `min(MIN_KEEP, max_steps)` 件
+    /// (v1 §9 の「直近10件は必ず保持」という floor を、`max_steps` 自体が
+    /// それより小さく設定された場合でも矛盾させないための最小値クランプ、
+    /// ARCHITECTURE.md §18.3)。破棄が実際に起きたら `truncated` を立てる
+    /// (一度立ったら戻らない、履歴パネル(v6-M3)の注記表示用)。
+    fn trim_to_limits(&mut self) {
+        let min_keep = MIN_KEEP.min(self.max_steps);
+        while self.undo_stack.len() > min_keep
+            && (self.undo_stack.len() > self.max_steps || self.bytes_used > MEMORY_LIMIT_BYTES)
+        {
+            let removed = self.undo_stack.remove(0);
+            self.bytes_used = self.bytes_used.saturating_sub(removed.op.byte_size());
+            self.truncated = true;
         }
+    }
+
+    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」の変更を
+    /// 即座に反映する。v6-M2 で配線済み: `app.rs::Tab::new`(新規タブに現在の
+    /// 上限を適用)と `app.rs::apply_preferences`(設定ダイアログの OK 時に
+    /// 開いている全タブへ適用)の 2 箇所から呼ばれる。`0` を渡されても
+    /// 無限ループ/パニックしないよう最低 `1` にクランプする(CLAUDE.md 鉄則。
+    /// 実際の UI 側の範囲クランプは `settings.rs` が `[1, 500]` で担う、
+    /// 二重の防御)。
+    pub fn set_max_steps(&mut self, max_steps: usize) {
+        self.max_steps = max_steps.max(1);
+        self.trim_to_limits();
+    }
+
+    /// 一度でも最古のエントリを破棄したことがあるか(ARCHITECTURE.md
+    /// §18.3・§18.4: 履歴パネル(`ui/history_panel.rs`)の「(これ以前の履歴は
+    /// 破棄されました)」注記の表示判定に使う)。
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// 履歴パネル(v6-M3、ARCHITECTURE.md §18.4)向け: 現在の `undo_stack` の
+    /// 長さ。パネルの「現在位置」ハイライト判定と、`redo_stack` 側の行が
+    /// クリックされたときの `jump_to` 目標長の計算基準に使う。
+    pub fn undo_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    /// 履歴パネル向け: `undo_stack` の各ラベルを先頭(最古)から順に返す
+    /// イテレータ(ARCHITECTURE.md §18.4: 「`undo_stack` の各
+    /// `HistoryEntry.label` を先頭(最古)から順に…表示」)。
+    pub fn undo_labels(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.undo_stack.iter().map(|entry| entry.label.as_str())
+    }
+
+    /// 履歴パネル向け: `redo_stack` の各ラベルを「逆順」(直近の undo ほど
+    /// 先)で返すイテレータ(ARCHITECTURE.md §18.4: 「続いて `redo_stack` の
+    /// 各 `HistoryEntry.label` を逆順(直近の undo ほど上)に淡色で表示」)。
+    /// `redo_stack` は undo するたびに末尾へ積むスタックなので、格納順を
+    /// そのまま逆転させるとちょうど「時系列順に現在位置の直後から続く」
+    /// 順序になる(`history.rs` のテスト参照)。
+    pub fn redo_labels_reversed(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.redo_stack
+            .iter()
+            .rev()
+            .map(|entry| entry.label.as_str())
     }
 
     /// 直近の op を取り消して `doc` に適用する。何も無ければ `false`。
     pub fn undo(&mut self, doc: &mut Document) -> bool {
-        let Some(op) = self.undo.pop() else {
+        let Some(entry) = self.undo_stack.pop() else {
             return false;
         };
-        apply_before(doc, &op);
-        self.redo.push(op);
+        apply_before(doc, &entry.op);
+        self.redo_stack.push(entry);
         true
     }
 
     /// 直近に取り消した op をやり直す。何も無ければ `false`。
     pub fn redo(&mut self, doc: &mut Document) -> bool {
-        let Some(op) = self.redo.pop() else {
+        let Some(entry) = self.redo_stack.pop() else {
             return false;
         };
-        apply_after(doc, &op);
-        self.undo.push(op);
+        apply_after(doc, &entry.op);
+        self.undo_stack.push(entry);
         true
     }
 
     /// メニューの「元に戻す」有効/無効表示(M4)や統合テストで使う。
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.undo_stack.is_empty()
     }
 
     /// メニューの「やり直し」有効/無効表示(M4)や統合テストで使う。
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        !self.redo_stack.is_empty()
+    }
+
+    /// ARCHITECTURE.md §18.3・§18.4: 履歴パネル(`ui/history_panel.rs`)の
+    /// クリックジャンプが使う薄いラッパー。「新しい仕組みを増やさない」
+    /// 方針どおり、既存の単発 `undo`/`redo` を `target_len`(ジャンプ後に
+    /// 望む `undo_stack.len()`)に達するまでループ呼び出しするだけ(最大
+    /// `max_steps` 回程度、既定 50 なら軽量)。`target_len` が現在の
+    /// undo+redo の合計件数を超えていても、`undo`/`redo` が `false` を
+    /// 返した時点で安全に打ち切る(パニックしない、CLAUDE.md 鉄則)。
+    /// 安全規則(進行中のストローク・浮動片は先に確定してから呼ぶこと)は
+    /// 呼び出し元(`app.rs::jump_history_to`)が `commit_open_gesture()` を
+    /// 経由して守る(ARCHITECTURE.md §18.6-1: ジャンプだけを特別扱いしない)。
+    pub fn jump_to(&mut self, doc: &mut Document, target_len: usize) {
+        while self.undo_stack.len() > target_len {
+            if !self.undo(doc) {
+                break;
+            }
+        }
+        while self.undo_stack.len() < target_len {
+            if !self.redo(doc) {
+                break;
+            }
+        }
     }
 }
 
@@ -740,7 +873,7 @@ mod tests {
             [255, 0, 0, 255],
             false,
         );
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         assert_ne!(
             doc.active_pixels(),
@@ -774,7 +907,7 @@ mod tests {
             [255, 0, 0, 255],
             false,
         );
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
         let after_stroke = doc.active_pixels().to_vec();
 
         history.undo(&mut doc);
@@ -808,7 +941,7 @@ mod tests {
             history.ensure_tiles_saved(&doc, bounds);
             raster::stroke_segment(&mut surface(&mut doc), from, to, 3.0, [1, 2, 3, 255], false);
         }
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         let after_stroke = doc.active_pixels().to_vec();
         assert_ne!(after_stroke, original);
@@ -829,7 +962,7 @@ mod tests {
         let mut doc = Document::new(10, 10, Background::White);
         let mut history = History::new();
         history.begin_stroke(doc.active);
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
         assert!(!history.can_undo());
     }
 
@@ -852,21 +985,17 @@ mod tests {
         let mut doc = Document::new(4, 4, Background::White);
         let mut history = History::new();
 
-        history.push(single_region_patch(
-            0,
-            rect,
-            vec![0, 0, 0, 0],
-            vec![1, 1, 1, 1],
-        ));
+        history.push(
+            single_region_patch(0, rect, vec![0, 0, 0, 0], vec![1, 1, 1, 1]),
+            "テスト1",
+        );
         history.undo(&mut doc);
         assert!(history.can_redo());
 
-        history.push(single_region_patch(
-            0,
-            rect,
-            vec![1, 1, 1, 1],
-            vec![2, 2, 2, 2],
-        ));
+        history.push(
+            single_region_patch(0, rect, vec![1, 1, 1, 1], vec![2, 2, 2, 2]),
+            "テスト2",
+        );
         assert!(!history.can_redo(), "new push must clear redo stack");
     }
 
@@ -882,12 +1011,15 @@ mod tests {
 
         // それぞれ大きめの op を積んで 256MB を大きく超えさせる。
         let big = vec![0u8; 30 * 1024 * 1024]; // 30MB
-        for _ in 0..15 {
-            history.push(single_region_patch(0, rect, big.clone(), vec![1, 1, 1, 1]));
+        for i in 0..15 {
+            history.push(
+                single_region_patch(0, rect, big.clone(), vec![1, 1, 1, 1]),
+                format!("op{i}"),
+            );
         }
 
         // 直近 10 件は必ず残る。
-        assert_eq!(history.undo.len(), MIN_KEEP);
+        assert_eq!(history.undo_stack.len(), MIN_KEEP);
         assert!(history.bytes_used <= MEMORY_LIMIT_BYTES.max(MIN_KEEP * (big.len() + 4)));
     }
 
@@ -902,10 +1034,13 @@ mod tests {
         let mut history = History::new();
         // 直近10件だけで既に上限を超えるサイズにする。
         let huge = vec![0u8; 40 * 1024 * 1024]; // 40MB * 10 > 256MB
-        for _ in 0..10 {
-            history.push(single_region_patch(0, rect, huge.clone(), vec![1]));
+        for i in 0..10 {
+            history.push(
+                single_region_patch(0, rect, huge.clone(), vec![1]),
+                format!("op{i}"),
+            );
         }
-        assert_eq!(history.undo.len(), MIN_KEEP);
+        assert_eq!(history.undo_stack.len(), MIN_KEEP);
     }
 
     #[test]
@@ -1053,7 +1188,7 @@ mod tests {
         history.begin_stroke(doc.active);
         assert!(history.has_open_stroke());
 
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
         assert!(!history.has_open_stroke());
     }
 
@@ -1072,14 +1207,14 @@ mod tests {
         let mut history = History::new();
 
         history.begin_stroke(doc.active);
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
         assert!(!doc.modified, "touching nothing must not set modified");
 
         history.begin_stroke(doc.active);
         let bounds = raster::stamp_bounds(5.0, 5.0, 2.0);
         history.ensure_tiles_saved(&doc, bounds);
         raster::stamp_round(&mut surface(&mut doc), 5.0, 5.0, 2.0, [1, 2, 3, 4], false);
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
         assert!(doc.modified, "a real edit must set modified");
     }
 
@@ -1102,7 +1237,7 @@ mod tests {
         let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
         history.ensure_tiles_saved(&doc, bounds);
         raster::stamp_round(&mut surface(&mut doc), 10.0, 10.0, 4.0, [0, 0, 0, 0], true);
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         assert!(
             !history.can_undo(),
@@ -1128,7 +1263,7 @@ mod tests {
             [10, 20, 30, 255],
             false,
         );
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         assert!(history.can_undo(), "a real edit must still push a patch");
         assert!(doc.modified);
@@ -1157,7 +1292,7 @@ mod tests {
             [255, 255, 255, 255],
             false,
         );
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         assert!(
             !history.can_undo(),
@@ -1193,7 +1328,7 @@ mod tests {
             [5, 6, 7, 8],
             false,
         );
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         assert!(history.can_undo(), "a real edit must still push a patch");
 
@@ -1248,7 +1383,7 @@ mod tests {
         let bounds = raster::stamp_bounds(2.0, 2.0, 1.0);
         history.ensure_tiles_saved(&doc, bounds);
         raster::stamp_round(&mut surface(&mut doc), 2.0, 2.0, 1.0, [9, 9, 9, 255], false);
-        history.commit_stroke(&mut doc);
+        history.commit_stroke(&mut doc, "テスト");
 
         // 下層(背景)は触れられていないはず。
         doc.active = 0;
@@ -1273,10 +1408,13 @@ mod tests {
         let after = doc.snapshot();
 
         let mut history = History::new();
-        history.push(HistoryOp::ReplaceAll {
-            before,
-            after: after.clone(),
-        });
+        history.push(
+            HistoryOp::ReplaceAll {
+                before,
+                after: after.clone(),
+            },
+            "テスト",
+        );
 
         assert!(history.undo(&mut doc));
         assert_eq!(doc.layers.len(), 1);
@@ -1296,7 +1434,7 @@ mod tests {
         let after = doc.snapshot();
 
         let mut history = History::new();
-        history.push(HistoryOp::ReplaceAll { before, after });
+        history.push(HistoryOp::ReplaceAll { before, after }, "テスト");
 
         assert!(history.undo(&mut doc));
         assert_eq!(doc.width, 4);
@@ -1322,11 +1460,14 @@ mod tests {
         let index = doc.active_index();
 
         let mut history = History::new();
-        history.push(HistoryOp::AddLayer {
-            index,
-            name: "レイヤー 1".to_owned(),
-            before_active,
-        });
+        history.push(
+            HistoryOp::AddLayer {
+                index,
+                name: "レイヤー 1".to_owned(),
+                before_active,
+            },
+            "レイヤーを追加",
+        );
 
         assert_eq!(doc.layers.len(), 2);
         assert!(history.undo(&mut doc));
@@ -1350,11 +1491,14 @@ mod tests {
         let layer = doc.layers[index].clone();
 
         let mut history = History::new();
-        history.push(HistoryOp::DuplicateLayer {
-            index,
-            layer,
-            before_active,
-        });
+        history.push(
+            HistoryOp::DuplicateLayer {
+                index,
+                layer,
+                before_active,
+            },
+            "レイヤーを複製",
+        );
 
         assert!(history.undo(&mut doc));
         assert_eq!(doc.layers.len(), 1);
@@ -1379,11 +1523,14 @@ mod tests {
         assert!(doc.remove_active_layer());
 
         let mut history = History::new();
-        history.push(HistoryOp::RemoveLayer {
-            index: 1,
-            layer: removed,
-            before_active,
-        });
+        history.push(
+            HistoryOp::RemoveLayer {
+                index: 1,
+                layer: removed,
+                before_active,
+            },
+            "レイヤーを削除",
+        );
 
         assert_eq!(doc.layers.len(), 1);
         assert!(history.undo(&mut doc));
@@ -1410,7 +1557,10 @@ mod tests {
         doc.active = 0;
 
         let mut history = History::new();
-        history.push(HistoryOp::MoveLayer { from: 1, to: 0 });
+        history.push(
+            HistoryOp::MoveLayer { from: 1, to: 0 },
+            "レイヤーの並び替え",
+        );
 
         assert!(history.undo(&mut doc));
         assert_eq!(doc.active, 1);
@@ -1437,11 +1587,14 @@ mod tests {
         assert_eq!(doc.layers.len(), 1);
 
         let mut history = History::new();
-        history.push(HistoryOp::MergeDown {
-            index: 1,
-            upper,
-            lower_before: lower_before.clone(),
-        });
+        history.push(
+            HistoryOp::MergeDown {
+                index: 1,
+                upper,
+                lower_before: lower_before.clone(),
+            },
+            "レイヤーの結合",
+        );
 
         assert!(history.undo(&mut doc));
         assert_eq!(doc.layers.len(), 2);
@@ -1510,5 +1663,320 @@ mod tests {
             "restore must byte-exactly revert the whole layer"
         );
         assert!(!history.can_undo(), "cancel must not push any undo entry");
+    }
+
+    // -- v6 §33〜35(ARCHITECTURE.md §18.3): ラベル付け・保持数キャップ・
+    // ジャンプ ------------------------------------------------------------
+
+    #[test]
+    fn push_records_the_given_label() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        history.push(
+            single_region_patch(0, rect, vec![0, 0, 0, 0], vec![1, 1, 1, 1]),
+            "レイヤーを追加",
+        );
+        assert_eq!(history.undo_stack.last().unwrap().label, "レイヤーを追加");
+    }
+
+    #[test]
+    fn commit_stroke_records_the_given_label() {
+        let mut doc = Document::new(20, 20, Background::White);
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+        let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
+        history.ensure_tiles_saved(&doc, bounds);
+        raster::stamp_round(&mut surface(&mut doc), 10.0, 10.0, 4.0, [1, 2, 3, 4], false);
+        history.commit_stroke(&mut doc, "ブラシ");
+        assert_eq!(history.undo_stack.last().unwrap().label, "ブラシ");
+    }
+
+    #[test]
+    fn default_max_steps_does_not_evict_below_the_documented_default() {
+        // SPEC §34: 「デフォルト 50」。既定のまま 50 件までは(バイト上限に
+        // 触れない限り)何も破棄されないはず。
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        for i in 0..DEFAULT_MAX_STEPS {
+            history.push(
+                single_region_patch(0, rect, vec![0], vec![1]),
+                format!("op{i}"),
+            );
+        }
+        assert_eq!(history.undo_stack.len(), DEFAULT_MAX_STEPS);
+        assert!(!history.is_truncated());
+    }
+
+    #[test]
+    fn set_max_steps_evicts_down_to_the_new_cap_immediately_keeping_the_most_recent() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        for i in 0..8 {
+            history.push(
+                single_region_patch(0, rect, vec![0], vec![1]),
+                format!("op{i}"),
+            );
+        }
+        assert_eq!(history.undo_stack.len(), 8);
+
+        history.set_max_steps(3);
+        assert_eq!(
+            history.undo_stack.len(),
+            3,
+            "lowering max_steps must immediately truncate to the new cap"
+        );
+        assert_eq!(history.undo_stack.first().unwrap().label, "op5");
+        assert_eq!(history.undo_stack.last().unwrap().label, "op7");
+        assert!(history.is_truncated());
+    }
+
+    #[test]
+    fn push_after_lowering_max_steps_keeps_enforcing_the_new_cap() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        history.set_max_steps(2);
+        for i in 0..5 {
+            history.push(
+                single_region_patch(0, rect, vec![0], vec![1]),
+                format!("op{i}"),
+            );
+        }
+        assert_eq!(history.undo_stack.len(), 2);
+        assert_eq!(history.undo_stack.last().unwrap().label, "op4");
+        assert_eq!(history.undo_stack.first().unwrap().label, "op3");
+    }
+
+    #[test]
+    fn set_max_steps_clamps_zero_to_one_instead_of_panicking() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        history.push(single_region_patch(0, rect, vec![0], vec![1]), "a");
+        history.push(single_region_patch(0, rect, vec![0], vec![1]), "b");
+        // CLAUDE.md 鉄則: パニックしない。0 は 1 にクランプされる
+        // (`settings.rs` の [1,500] クランプと二重の防御、ARCHITECTURE.md
+        // §18.3)。
+        history.set_max_steps(0);
+        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.undo_stack.last().unwrap().label, "b");
+    }
+
+    #[test]
+    fn min_keep_floor_is_the_smaller_of_ten_and_max_steps() {
+        // ARCHITECTURE.md §18.3: 「下限は min(MIN_KEEP, max_steps) 件を必ず
+        // 保持」。max_steps を MIN_KEEP(10)より大きく下げても(ここでは 20)、
+        // 通常の保持数キャップがそのまま効く(floor は 10 のまま)ことを
+        // 確認する対照テスト。
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        history.set_max_steps(20);
+        for i in 0..25 {
+            history.push(
+                single_region_patch(0, rect, vec![0], vec![1]),
+                format!("op{i}"),
+            );
+        }
+        assert_eq!(
+            history.undo_stack.len(),
+            20,
+            "capped at max_steps, not at MIN_KEEP"
+        );
+    }
+
+    #[test]
+    fn truncated_flag_starts_false_and_becomes_true_after_any_eviction_and_stays_true() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        assert!(!history.is_truncated());
+
+        history.set_max_steps(2);
+        history.push(single_region_patch(0, rect, vec![0], vec![1]), "a");
+        assert!(
+            !history.is_truncated(),
+            "no eviction yet with only one entry"
+        );
+        history.push(single_region_patch(0, rect, vec![0], vec![1]), "b");
+        assert!(
+            !history.is_truncated(),
+            "exactly at the cap, nothing evicted yet"
+        );
+
+        history.push(single_region_patch(0, rect, vec![0], vec![1]), "c");
+        assert!(
+            history.is_truncated(),
+            "pushing past the cap must evict the oldest entry and set the flag"
+        );
+
+        // undo/redo は「破棄されたことがある」という事実を消さない。
+        let mut doc = Document::new(4, 4, Background::White);
+        history.undo(&mut doc);
+        assert!(history.is_truncated());
+        history.redo(&mut doc);
+        assert!(history.is_truncated());
+    }
+
+    #[test]
+    fn jump_to_moves_across_multiple_undo_redo_steps_reusing_undo_and_redo() {
+        let mut doc = Document::new(20, 20, Background::White);
+        let mut history = History::new();
+        let original = doc.active_pixels().to_vec();
+
+        // 3 個の独立したストローク(別々の位置)を積む。
+        for (i, (cx, cy)) in [(3.0, 3.0), (10.0, 10.0), (16.0, 16.0)]
+            .into_iter()
+            .enumerate()
+        {
+            history.begin_stroke(doc.active);
+            let bounds = raster::stamp_bounds(cx, cy, 2.0);
+            history.ensure_tiles_saved(&doc, bounds);
+            raster::stamp_round(
+                &mut surface(&mut doc),
+                cx,
+                cy,
+                2.0,
+                [10, 20, 30, 255],
+                false,
+            );
+            history.commit_stroke(&mut doc, format!("stroke{i}"));
+        }
+        let after_all = doc.active_pixels().to_vec();
+        assert_eq!(history.undo_stack.len(), 3);
+
+        // target_len=1: 1 個目のストロークだけが適用された状態まで戻る。
+        history.jump_to(&mut doc, 1);
+        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.redo_stack.len(), 2);
+        assert_ne!(
+            doc.get_pixel(3, 3),
+            Some([255, 255, 255, 255]),
+            "the first stroke must still be applied"
+        );
+        assert_eq!(
+            doc.get_pixel(10, 10),
+            Some([255, 255, 255, 255]),
+            "the second stroke must not be applied yet at target_len=1"
+        );
+
+        // target_len=3: 最新状態まで一気に進む。
+        history.jump_to(&mut doc, 3);
+        assert_eq!(doc.active_pixels(), after_all.as_slice());
+        assert_eq!(history.undo_stack.len(), 3);
+        assert!(history.redo_stack.is_empty());
+
+        // target_len=0: 完全に未編集の状態まで一気に戻る。
+        history.jump_to(&mut doc, 0);
+        assert_eq!(doc.active_pixels(), original.as_slice());
+        assert_eq!(history.undo_stack.len(), 0);
+
+        // 範囲外の target_len を渡してもパニックせず、可能な限りで打ち切る
+        // (CLAUDE.md 鉄則)。
+        history.jump_to(&mut doc, 999);
+        assert_eq!(history.undo_stack.len(), 3);
+        assert_eq!(doc.active_pixels(), after_all.as_slice());
+    }
+
+    #[test]
+    fn jump_to_is_a_no_op_when_already_at_the_target_length() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        history.push(
+            single_region_patch(0, rect, vec![255, 255, 255, 255], vec![1, 1, 1, 1]),
+            "a",
+        );
+        history.jump_to(&mut doc, 1);
+        assert_eq!(history.undo_stack.len(), 1);
+        assert!(history.redo_stack.is_empty());
+    }
+
+    // -- v6-M3(ARCHITECTURE.md §18.4): 履歴パネル向けアクセサ ---------------
+
+    #[test]
+    fn undo_labels_returns_oldest_to_newest() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut history = History::new();
+        for label in ["ブラシ", "塗りつぶし", "矩形"] {
+            history.push(single_region_patch(0, rect, vec![0], vec![1]), label);
+        }
+        assert_eq!(history.undo_len(), 3);
+        let labels: Vec<&str> = history.undo_labels().collect();
+        assert_eq!(labels, ["ブラシ", "塗りつぶし", "矩形"]);
+    }
+
+    #[test]
+    fn redo_labels_reversed_continues_chronologically_after_the_current_position() {
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        for label in ["op0", "op1", "op2"] {
+            history.push(single_region_patch(0, rect, vec![0], vec![1]), label);
+        }
+        // 2 回 undo する: 最初の undo は "op2" を、2 回目は "op1" を
+        // redo_stack へ積む(格納順は [op2, op1])。
+        history.undo(&mut doc);
+        history.undo(&mut doc);
+        assert_eq!(history.undo_len(), 1);
+
+        // 逆順にすると、時系列どおり「現在位置(op0)の直後」から続く
+        // [op1, op2] になる(op1 が直近の undo、op2 がその前の undo)。
+        let reversed: Vec<&str> = history.redo_labels_reversed().collect();
+        assert_eq!(reversed, ["op1", "op2"]);
+    }
+
+    #[test]
+    fn undo_labels_and_redo_labels_reversed_are_empty_on_fresh_history() {
+        let history = History::new();
+        assert_eq!(history.undo_len(), 0);
+        assert_eq!(history.undo_labels().count(), 0);
+        assert_eq!(history.redo_labels_reversed().count(), 0);
     }
 }

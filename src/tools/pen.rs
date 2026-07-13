@@ -63,7 +63,7 @@ impl Tool for PenTool {
     }
 
     fn cancel(&mut self, ctx: &mut ToolCtx) {
-        if let Some(button) = self.engine.cancel(ctx) {
+        if let Some(button) = self.engine.cancel(ctx, "ブラシ") {
             let color = if button == PointerButton::Secondary {
                 ctx.secondary
             } else {

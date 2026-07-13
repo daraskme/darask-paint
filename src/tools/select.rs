@@ -86,6 +86,16 @@ pub struct Floating {
     /// するたびに `mask` はここから `resample_mask_nearest` で作り直す
     /// (累積劣化させない、`original`/`orig_w`/`orig_h` と対になる)。
     pub orig_mask: Vec<u8>,
+    /// v6 §33〜35(ARCHITECTURE.md §18.3 対応表): この浮動片が最終的に
+    /// 合成される(`app.rs::flush_floating_keep_selection`)ときに History
+    /// へ積む undo ラベル。生成経路によって変わる: 選択ドラッグ・移動
+    /// ツール・自由変形は既定の "選択の移動"、クリップボード貼り付けは
+    /// "貼り付け"、テキストの通常確定(`place_new_floating` 経由)は
+    /// "テキスト"(いずれも `with_label` で既定から上書きする)。ツール
+    /// 切替でテキスト編集が中断された場合だけは浮動片を経由せず直接合成
+    /// する別経路(`commit_pending_text_edit_and_composite`)を使うため、
+    /// そちらではこのフィールドは参照されない。
+    pub label: &'static str,
 }
 
 impl Floating {
@@ -115,7 +125,19 @@ impl Floating {
             orig_w: w,
             orig_h: h,
             orig_mask,
+            // ARCHITECTURE.md §18.3: 選択ドラッグ・移動ツール・自由変形の
+            // 浮動化はいずれもこの既定ラベルのまま(`with_label` で上書き
+            // されるのは貼り付け/テキストの生成経路だけ)。
+            label: "選択の移動",
         }
+    }
+
+    /// 生成後にラベルを差し替える(貼り付け/テキスト等、既定の
+    /// "選択の移動" と異なる commit ラベルを持つ浮動片向け、
+    /// ARCHITECTURE.md §18.3)。
+    pub fn with_label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
     }
 
     /// 全画素選択済み(矩形)の浮動片を作る便利コンストラクタ。v4 時点でも

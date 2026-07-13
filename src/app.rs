@@ -73,7 +73,8 @@ use crate::ui::layers_panel::{LayersPanelAction, RenameState};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
 use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
-use crate::ui::{dialogs, menu, options_bar, side_panel, status_bar, toolbar};
+use crate::ui::toolbar::{self, ToolbarAction};
+use crate::ui::{dialogs, menu, options_bar, side_panel, status_bar};
 
 /// SPEC §5: 最近使った色は最大 8 個。
 const MAX_RECENT_COLORS: usize = 8;
@@ -350,6 +351,14 @@ enum ModalState {
     },
     /// v4 §26: 「ヘルプ > バージョン情報」。表示するだけで状態を持たない。
     About,
+    /// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログ(Ctrl+K)。
+    /// `New`/`ImageResize` と同じ「ドラフト値を持ち、OK で確定・キャンセルで
+    /// 破棄する」パターン。確定前に実際の `self.max_undo_steps`/
+    /// 各タブの `History::max_steps` を書き換えないよう、編集中の値は
+    /// このドラフトにだけ保持する。
+    Preferences {
+        draft_max_undo_steps: u32,
+    },
 }
 
 /// rfd のネイティブダイアログはブロッキングでイベントループを止めるため、
@@ -482,10 +491,19 @@ impl Tab {
     /// 浮動片・アンドゥ履歴・ズーム/パンは初期状態)。`untitled_number` は
     /// `doc.path.is_none()` のときだけ渡す(呼び出し元は
     /// `DaraskApp::open_new_tab`/`DaraskApp::new` を参照)。
-    fn new(doc: Document, untitled_number: Option<u32>) -> Self {
+    ///
+    /// `max_undo_steps`(SPEC §34/ARCHITECTURE.md §18.2・§18.6-2): 新規タブの
+    /// `History` は `History::new()` の既定(50)のまま作られるため、設定
+    /// ダイアログで既に別の値へ変更済みなら、ここで `set_max_steps` を呼んで
+    /// 新規タブにも同じ上限を適用する(呼び出し元は常に
+    /// `DaraskApp::max_undo_steps` を渡す — 新規タブだけ既定値に取り残される
+    /// バグを防ぐ)。
+    fn new(doc: Document, untitled_number: Option<u32>, max_undo_steps: u32) -> Self {
+        let mut history = History::new();
+        history.set_max_steps(max_undo_steps as usize);
         Self {
             doc,
-            history: History::new(),
+            history,
             view: CanvasView::new(),
             selection: None,
             floating: None,
@@ -589,6 +607,13 @@ pub struct DaraskApp {
     /// `zoom >= 8.0`(800%)のときだけ実際に描かれる(`canvas_view::
     /// draw_pixel_grid`)。
     show_pixel_grid: bool,
+    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」(1–500、
+    /// 既定 50)。設定ダイアログの OK で更新される、アプリ全体で共有の値
+    /// (`current_settings`/`Tab::new` の呼び出し元がこれを渡す。SPEC §26 の
+    /// 永続化対象に追加)。開いている**全タブ**の `History::max_steps` へ即座に
+    /// 反映するのは `apply_preferences` の責務(ARCHITECTURE.md §18.6-2:
+    /// 「既存タブが取り残される、というバグを作らない」)。
+    max_undo_steps: u32,
 
     // -- v2 §14: カラーパネル(ARCHITECTURE.md §14.3/§14.4, V2-M3) --------
     /// 色相リング + SV 三角形の編集中状態(ドラッグ中は HSV を正とする、
@@ -794,7 +819,11 @@ impl DaraskApp {
             // v5 §30(ARCHITECTURE.md §17.1): 起動時はタブ 1 枚
             // (CLI 引数があればそれを開いた状態、無ければ白紙の新規。
             // SPEC §30: 「セッション復元は非目標」)。
-            tabs: vec![Tab::new(doc, initial_untitled_number)],
+            tabs: vec![Tab::new(
+                doc,
+                initial_untitled_number,
+                settings.max_undo_steps,
+            )],
             active_tab: 0,
             next_untitled_number,
             // SPEC §26: 「最後に使ったツール」。
@@ -828,6 +857,7 @@ impl DaraskApp {
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
             show_pixel_grid: settings.show_pixel_grid,
+            max_undo_steps: settings.max_undo_steps,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
             // だけ空欄がちらつく)。
@@ -1082,6 +1112,9 @@ impl DaraskApp {
                     let tab = self.active_tab_mut();
                     tab.view.fit_to_window(&tab.doc);
                 }
+
+                // v6 §34(ARCHITECTURE.md §18.2): Ctrl+K で設定ダイアログ。
+                Action::OpenPreferences => self.open_preferences_modal(),
             }
         }
     }
@@ -2157,10 +2190,14 @@ impl DaraskApp {
         self.select_drag = None;
         if let Some(floating) = self.active_tab_mut().floating.take() {
             let target = select::floating_target_rect(&floating);
+            // ARCHITECTURE.md §18.3: この浮動片がどう生成されたか(選択の
+            // 移動/貼り付け/テキスト)によってラベルが変わるため、
+            // `Floating::label`(生成時に決まる)をそのまま使う。
+            let label = floating.label;
             let tab = &mut self.tabs[self.active_tab];
             tab.history.ensure_tiles_saved(&tab.doc, target);
             select::composite_floating(&mut tab.doc, &floating);
-            tab.history.commit_stroke(&mut tab.doc);
+            tab.history.commit_stroke(&mut tab.doc, label);
         }
     }
 
@@ -2223,6 +2260,20 @@ impl DaraskApp {
         }
     }
 
+    /// v6-M3(SPEC §35、ARCHITECTURE.md §18.4): 履歴パネルの行クリック(複数
+    /// 手順のジャンプ)。安全規則は既存の Undo/Redo(`Action::Undo`/`Redo`、
+    /// 上の `handle_shortcuts`/`handle_menu_action` 参照)と**全く同じ**
+    /// 順序(`commit_open_gesture()` で進行中のストローク・浮動片を先に
+    /// 確定 → `History` を操作 → `clamp_selection_to_doc()`)にする
+    /// (ARCHITECTURE.md §18.6-1: 「ジャンプだけを特別扱いして安全確認を
+    /// 省略しない」「ジャンプ専用の別ルートを作らない」)。
+    fn jump_history_to(&mut self, target_len: usize) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        tab.history.jump_to(&mut tab.doc, target_len);
+        self.clamp_selection_to_doc();
+    }
+
     /// SPEC §18: Ctrl+T(自由変形)。選択範囲があれば浮動化してハンドル表示。
     /// なければ全選択→アクティブレイヤーを浮動化してハンドル表示。以降は
     /// §16(ハンドルドラッグ)・§18(Esc キャンセル)と同じ操作になる。
@@ -2283,12 +2334,21 @@ impl DaraskApp {
     /// 選択ツールでは何もしない(`commit_open_gesture` と違い
     /// `commit_selection` は呼ばないため、これから処理する浮動片/選択を
     /// 誤って確定・消費しない)。
+    ///
+    /// ARCHITECTURE.md §18.3 の対応表: 「Delete による消去」→「削除」。
+    /// Ctrl+X はラベルだけ異なる(「切り取り」)ため、実処理は
+    /// `delete_selection_labeled` に共通化し、こちらはその既定ラベル版の
+    /// 薄いラッパー(`cut_selection_to_clipboard` 参照)。
     fn delete_selection(&mut self) {
+        self.delete_selection_labeled("削除");
+    }
+
+    fn delete_selection_labeled(&mut self, label: &'static str) {
         self.end_active_gesture();
         self.select_drag = None;
         if self.active_tab_mut().floating.take().is_some() {
             let tab = &mut self.tabs[self.active_tab];
-            tab.history.commit_stroke(&mut tab.doc);
+            tab.history.commit_stroke(&mut tab.doc, label);
             self.active_tab_mut().selection = None;
             return;
         }
@@ -2301,7 +2361,7 @@ impl DaraskApp {
                 tab.history.begin_stroke(tab.doc.active);
                 tab.history.ensure_tiles_saved(&tab.doc, mask.bbox);
                 select::clear_region_transparent(&mut tab.doc, &mask);
-                tab.history.commit_stroke(&mut tab.doc);
+                tab.history.commit_stroke(&mut tab.doc, label);
             }
         }
     }
@@ -2357,7 +2417,9 @@ impl DaraskApp {
             return;
         }
         if self.copy_selection_to_clipboard() {
-            self.delete_selection();
+            // ARCHITECTURE.md §18.3 の対応表: 「切り取り」(Delete による
+            // 消去の「削除」とはラベルだけ異なる、`delete_selection` 参照)。
+            self.delete_selection_labeled("切り取り");
         }
     }
 
@@ -2445,7 +2507,8 @@ impl DaraskApp {
     fn begin_paste_floating(&mut self, w: u32, h: u32, pixels: Vec<u8>) {
         let center = self.active_tab().view.view_center_img();
         let pos = pos2(center.x - w as f32 / 2.0, center.y - h as f32 / 2.0);
-        self.place_new_floating(pos, w, h, pixels);
+        // ARCHITECTURE.md §18.3 の対応表: 「貼り付け」。
+        self.place_new_floating(pos, w, h, pixels, "貼り付け");
     }
 
     /// 新規コンテンツ(クリップボード貼り付け・v3 §19 のテキストラスタライズ)
@@ -2464,7 +2527,19 @@ impl DaraskApp {
     /// 上書きしてしまう)が起きる(`free_transform` が同じ理由で直接代入して
     /// いるのと同じ落とし穴)。呼び出し側は既に先行ジェスチャを確定済みで
     /// あることが前提。
-    fn place_new_floating(&mut self, pos: Pos2, w: u32, h: u32, pixels: Vec<u8>) {
+    ///
+    /// `label` は確定時に History へ積む undo ラベル(ARCHITECTURE.md
+    /// §18.3: 貼り付けは「貼り付け」、テキストは「テキスト」)。
+    /// `Floating::label` に載せておき、実際の commit は
+    /// `flush_floating_keep_selection` がそれを読んで行う。
+    fn place_new_floating(
+        &mut self,
+        pos: Pos2,
+        w: u32,
+        h: u32,
+        pixels: Vec<u8>,
+        label: &'static str,
+    ) {
         let id = self.alloc_floating_id();
         self.tool = ToolKind::Select;
         // 切り出し元が無いので `begin_stroke` するだけで `ensure_tiles_saved`
@@ -2472,7 +2547,8 @@ impl DaraskApp {
         // `commit_selection` 参照)。
         let tab = &mut self.tabs[self.active_tab];
         tab.history.begin_stroke(tab.doc.active);
-        self.active_tab_mut().floating = Some(Floating::new_rect(pixels, w, h, pos, None, id));
+        self.active_tab_mut().floating =
+            Some(Floating::new_rect(pixels, w, h, pos, None, id).with_label(label));
         self.active_tab_mut().selection = None;
         // M4 で発見・修正したバグ: 浮動片は画面に見えている未保存の変更
         // だが、以前は `commit_selection` で合成されるまで `doc.modified` が
@@ -2501,9 +2577,11 @@ impl DaraskApp {
             .replace_with_single_layer(w, h, pixels);
         self.active_tab_mut().doc.modified = true;
         let after = self.active_tab().doc.snapshot();
+        // ARCHITECTURE.md §18.3 の対応表: これも実質「貼り付け」確定
+        // (SPEC §6 の白紙置き換え貼り付け)。
         self.active_tab_mut()
             .history
-            .push(HistoryOp::ReplaceAll { before, after });
+            .push(HistoryOp::ReplaceAll { before, after }, "貼り付け");
         self.active_tab_mut().next_layer_number = 1;
         self.reset_tool_state_for_new_document();
     }
@@ -2659,7 +2737,8 @@ impl DaraskApp {
         let Some((w, h, pixels)) = self.rasterize_pending_text(&state.buffer) else {
             return;
         };
-        self.place_new_floating(state.pos, w, h, pixels);
+        // ARCHITECTURE.md §18.3 の対応表: 「テキスト」。
+        self.place_new_floating(state.pos, w, h, pixels, "テキスト");
         self.push_recent_color(self.primary);
     }
 
@@ -2694,7 +2773,8 @@ impl DaraskApp {
         tab.history.begin_stroke(tab.doc.active);
         tab.history.ensure_tiles_saved(&tab.doc, target);
         select::composite_floating(&mut tab.doc, &floating);
-        tab.history.commit_stroke(&mut tab.doc);
+        // ARCHITECTURE.md §18.3 の対応表: 「テキスト」。
+        tab.history.commit_stroke(&mut tab.doc, "テキスト");
         tab.doc.modified = true;
         self.push_recent_color(self.primary);
     }
@@ -3107,7 +3187,8 @@ impl DaraskApp {
         // 変更しないため、もはや不要(新規 `Tab` は `Tab::new` が
         // `layer_rename: None`/`next_layer_number: 1` で初期化する。
         // `Tab` の docstring 参照)。
-        self.tabs.push(Tab::new(doc, untitled_number));
+        self.tabs
+            .push(Tab::new(doc, untitled_number, self.max_undo_steps));
         let index = self.tabs.len() - 1;
         self.active_tab = index;
         self.reset_tool_state_for_new_document();
@@ -3355,6 +3436,7 @@ impl DaraskApp {
             user_palette: self.user_palette.clone(),
             last_tool: self.tool,
             show_pixel_grid: self.show_pixel_grid,
+            max_undo_steps: self.max_undo_steps,
         }
     }
 
@@ -3427,6 +3509,35 @@ impl DaraskApp {
         self.modal = Some(ModalState::About);
     }
 
+    /// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログを開く
+    /// (Ctrl+K・ツールバーの歯車ボタン)。ドラフト値は現在の
+    /// `self.max_undo_steps` から始める(`New`/`ImageResize` と同じ
+    /// 「開いた時点の実際の値をドラフトの初期値にする」パターン)。
+    fn open_preferences_modal(&mut self) {
+        self.modal = Some(ModalState::Preferences {
+            draft_max_undo_steps: self.max_undo_steps,
+        });
+    }
+
+    /// SPEC §34/ARCHITECTURE.md §18.2・§18.3: 設定ダイアログの OK 確定
+    /// (`show_modal` の `ModalState::Preferences` 分岐から呼ぶ)。
+    ///
+    /// - `self.max_undo_steps` を更新し、即座に設定ファイルへ保存する
+    ///   (ARCHITECTURE.md §18.2: 「OK で即座に適用+設定ファイルへ保存」)。
+    /// - **開いている全タブ**の `History::set_max_steps` を呼ぶ
+    ///   (ARCHITECTURE.md §18.6-2: 「既存タブが取り残される、というバグを
+    ///   作らない」)。値を下げて現在の段数がそれを超えていれば、
+    ///   `History::set_max_steps` 内部の `trim_to_limits` がその場で
+    ///   古いものから切り詰める(ARCHITECTURE.md §18.3、新しい仕組みを
+    ///   増やさない)。
+    fn apply_preferences(&mut self, new_max_undo_steps: u32) {
+        self.max_undo_steps = new_max_undo_steps;
+        for tab in &mut self.tabs {
+            tab.history.set_max_steps(new_max_undo_steps as usize);
+        }
+        self.save_settings();
+    }
+
     // -----------------------------------------------------------------
     // M4: 画像メニュー(SPEC §7)
     // -----------------------------------------------------------------
@@ -3435,11 +3546,11 @@ impl DaraskApp {
     /// 差分から `HistoryOp::ReplaceAll` を積む(SPEC §13: 画像メニューの
     /// 操作は全レイヤーに適用されるため、v1 の単一バッファ `Replace` ではなく
     /// 全レイヤー+寸法のスナップショットを使う、ARCHITECTURE.md §14.2)。
-    fn push_replace_all(&mut self, before: crate::document::DocSnapshot) {
+    fn push_replace_all(&mut self, before: crate::document::DocSnapshot, label: impl Into<String>) {
         let after = self.active_tab().doc.snapshot();
         self.active_tab_mut()
             .history
-            .push(HistoryOp::ReplaceAll { before, after });
+            .push(HistoryOp::ReplaceAll { before, after }, label);
         self.active_tab_mut().doc.mark_all_dirty();
         self.active_tab_mut().doc.modified = true;
     }
@@ -3448,28 +3559,28 @@ impl DaraskApp {
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.flip_horizontal();
-        self.push_replace_all(before);
+        self.push_replace_all(before, "左右反転");
     }
 
     fn apply_flip_vertical(&mut self) {
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.flip_vertical();
-        self.push_replace_all(before);
+        self.push_replace_all(before, "上下反転");
     }
 
     fn apply_rotate_cw(&mut self) {
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.rotate_cw();
-        self.push_replace_all(before);
+        self.push_replace_all(before, "右に90°回転");
     }
 
     fn apply_rotate_ccw(&mut self) {
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.rotate_ccw();
-        self.push_replace_all(before);
+        self.push_replace_all(before, "左に90°回転");
     }
 
     /// SPEC §7: 「選択範囲でトリミング」。選択(または浮動片)が無ければ
@@ -3492,7 +3603,7 @@ impl DaraskApp {
         }
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.crop_to(rect);
-        self.push_replace_all(before);
+        self.push_replace_all(before, "選択範囲でトリミング");
         self.active_tab_mut().selection = None;
     }
 
@@ -3621,7 +3732,10 @@ impl DaraskApp {
         // 実行していたが、新規タブは挿入されるだけで元タブ(そのタブ自身の
         // `layer_rename`)を一切変更しないため不要(`open_new_tab` と同じ
         // 理由、`Tab` の docstring 参照)。
-        self.tabs.insert(insert_at, Tab::new(doc, untitled_number));
+        self.tabs.insert(
+            insert_at,
+            Tab::new(doc, untitled_number, self.max_undo_steps),
+        );
         self.active_tab = insert_at;
         self.reset_tool_state_for_new_document();
         insert_at
@@ -3633,7 +3747,7 @@ impl DaraskApp {
         self.active_tab_mut()
             .doc
             .resize(width.max(1), height.max(1), interpolation);
-        self.push_replace_all(before);
+        self.push_replace_all(before, "画像サイズ変更");
     }
 
     fn confirm_canvas_resize(&mut self, width: u32, height: u32) {
@@ -3642,7 +3756,7 @@ impl DaraskApp {
         self.active_tab_mut()
             .doc
             .resize_canvas(width.max(1), height.max(1));
-        self.push_replace_all(before);
+        self.push_replace_all(before, "キャンバスサイズ変更");
     }
 
     // -----------------------------------------------------------------
@@ -3686,7 +3800,11 @@ impl DaraskApp {
     /// 規則で、進行中のジェスチャ(ブラシ等のドラッグ、または選択の浮動片)
     /// を種類を問わず先に確定する `commit_open_gesture` を呼ぶ(選択自体は
     /// 残す、SPEC §21)。
-    fn apply_tone_adjustment_immediate(&mut self, f: impl Fn([u8; 4]) -> [u8; 4]) {
+    fn apply_tone_adjustment_immediate(
+        &mut self,
+        label: &'static str,
+        f: impl Fn([u8; 4]) -> [u8; 4],
+    ) {
         self.commit_open_gesture();
         let bounds = self
             .tone_adjust_target_rect()
@@ -3712,17 +3830,17 @@ impl DaraskApp {
             }
         }
         tab.doc.mark_dirty(bounds);
-        tab.history.commit_stroke(&mut tab.doc);
+        tab.history.commit_stroke(&mut tab.doc, label);
     }
 
     /// SPEC §24: 「階調の反転 (Ctrl+I) — 即時(RGB反転、アルファ不変)」。
     fn apply_invert(&mut self) {
-        self.apply_tone_adjustment_immediate(raster::invert_pixel);
+        self.apply_tone_adjustment_immediate("階調の反転", raster::invert_pixel);
     }
 
     /// SPEC §24: 「グレースケール化 (Ctrl+Shift+U) — 即時(Rec.709 輝度)」。
     fn apply_grayscale(&mut self) {
-        self.apply_tone_adjustment_immediate(raster::grayscale_pixel);
+        self.apply_tone_adjustment_immediate("グレースケール化", raster::grayscale_pixel);
     }
 
     /// ライブプレビュー付きモーダルを開く共通処理。開いた時点で
@@ -3834,8 +3952,8 @@ impl DaraskApp {
     /// 軽量なレイヤー構造操作を 1 undo 単位として push する
     /// (`push_replace_all` と同じ副作用(全面 dirty・`modified` 設定)を、
     /// 全レイヤースナップショットを取らずに行う)。
-    fn push_layer_history(&mut self, op: HistoryOp) {
-        self.active_tab_mut().history.push(op);
+    fn push_layer_history(&mut self, op: HistoryOp, label: impl Into<String>) {
+        self.active_tab_mut().history.push(op, label);
         self.active_tab_mut().doc.mark_all_dirty();
         self.active_tab_mut().doc.modified = true;
     }
@@ -3887,11 +4005,14 @@ impl DaraskApp {
         let before_active = self.active_tab().doc.active_index();
         if self.active_tab_mut().doc.add_layer(name.clone()) {
             let index = self.active_tab().doc.active_index();
-            self.push_layer_history(HistoryOp::AddLayer {
-                index,
-                name,
-                before_active,
-            });
+            self.push_layer_history(
+                HistoryOp::AddLayer {
+                    index,
+                    name,
+                    before_active,
+                },
+                "レイヤーを追加",
+            );
         }
     }
 
@@ -3901,11 +4022,14 @@ impl DaraskApp {
         if self.active_tab_mut().doc.duplicate_active_layer() {
             let index = self.active_tab().doc.active_index();
             let layer = self.active_tab().doc.layers[index].clone();
-            self.push_layer_history(HistoryOp::DuplicateLayer {
-                index,
-                layer,
-                before_active,
-            });
+            self.push_layer_history(
+                HistoryOp::DuplicateLayer {
+                    index,
+                    layer,
+                    before_active,
+                },
+                "レイヤーを複製",
+            );
         }
     }
 
@@ -3919,11 +4043,14 @@ impl DaraskApp {
         let before_active = self.active_tab().doc.active_index();
         let layer = self.active_tab().doc.layers[before_active].clone();
         if self.active_tab_mut().doc.remove_active_layer() {
-            self.push_layer_history(HistoryOp::RemoveLayer {
-                index: before_active,
-                layer,
-                before_active,
-            });
+            self.push_layer_history(
+                HistoryOp::RemoveLayer {
+                    index: before_active,
+                    layer,
+                    before_active,
+                },
+                "レイヤーを削除",
+            );
         }
     }
 
@@ -3932,7 +4059,7 @@ impl DaraskApp {
         let from = self.active_tab().doc.active_index();
         if self.active_tab_mut().doc.move_active_layer_up() {
             let to = self.active_tab().doc.active_index();
-            self.push_layer_history(HistoryOp::MoveLayer { from, to });
+            self.push_layer_history(HistoryOp::MoveLayer { from, to }, "レイヤーの並び替え");
         }
     }
 
@@ -3941,7 +4068,7 @@ impl DaraskApp {
         let from = self.active_tab().doc.active_index();
         if self.active_tab_mut().doc.move_active_layer_down() {
             let to = self.active_tab().doc.active_index();
-            self.push_layer_history(HistoryOp::MoveLayer { from, to });
+            self.push_layer_history(HistoryOp::MoveLayer { from, to }, "レイヤーの並び替え");
         }
     }
 
@@ -3957,11 +4084,14 @@ impl DaraskApp {
         let upper = self.active_tab().doc.layers[index].clone();
         let lower_before = self.active_tab().doc.layers[index - 1].clone();
         if self.active_tab_mut().doc.merge_active_down() {
-            self.push_layer_history(HistoryOp::MergeDown {
-                index,
-                upper,
-                lower_before,
-            });
+            self.push_layer_history(
+                HistoryOp::MergeDown {
+                    index,
+                    upper,
+                    lower_before,
+                },
+                "レイヤーの結合",
+            );
         }
     }
 
@@ -3976,7 +4106,7 @@ impl DaraskApp {
         }
         let before = self.active_tab().doc.snapshot();
         if self.active_tab_mut().doc.flatten_all() {
-            self.push_replace_all(before);
+            self.push_replace_all(before, "画像の統合");
         }
     }
 
@@ -4050,6 +4180,11 @@ impl DaraskApp {
             MenuAction::Delete => self.delete_selection(),
             MenuAction::SelectAll => self.select_all(),
             MenuAction::Deselect => self.commit_selection(),
+            // v6 §33(ARCHITECTURE.md §18.1): 編集メニューに追加した
+            // 「自由変形」。Ctrl+T(`Action::FreeTransform`)と全く同じ処理を
+            // 呼ぶだけ(`free_transform` 自身が commit-first ガードを持つ、
+            // ドキュメントコメント参照)。
+            MenuAction::FreeTransform => self.free_transform(),
             MenuAction::ImageResize => {
                 self.modal = Some(ModalState::ImageResize {
                     width: self.active_tab().doc.width,
@@ -4090,6 +4225,9 @@ impl DaraskApp {
             MenuAction::LayerMergeDown => self.layer_merge_down(),
             MenuAction::LayerFlatten => self.layer_flatten(),
             MenuAction::About => self.open_about_modal(),
+            // v6 §33/§34: メニューバー「その他」の設定ボタン。ツールバーの
+            // 歯車ボタン(`ToolbarAction::OpenPreferences`)と同じ処理。
+            MenuAction::OpenPreferences => self.open_preferences_modal(),
         }
     }
 
@@ -4198,7 +4336,9 @@ impl DaraskApp {
                 match outcome {
                     DialogOutcome::Confirmed => {
                         let tab = self.active_tab_mut();
-                        tab.history.commit_stroke(&mut tab.doc);
+                        // ARCHITECTURE.md §18.3 の対応表: 「明るさ・コントラスト」。
+                        tab.history
+                            .commit_stroke(&mut tab.doc, "明るさ・コントラスト");
                         keep_open = false;
                     }
                     DialogOutcome::Cancelled => {
@@ -4228,7 +4368,8 @@ impl DaraskApp {
                 match outcome {
                     DialogOutcome::Confirmed => {
                         let tab = self.active_tab_mut();
-                        tab.history.commit_stroke(&mut tab.doc);
+                        // ARCHITECTURE.md §18.3 の対応表: 「色相・彩度・明度」。
+                        tab.history.commit_stroke(&mut tab.doc, "色相・彩度・明度");
                         keep_open = false;
                     }
                     DialogOutcome::Cancelled => {
@@ -4248,6 +4389,18 @@ impl DaraskApp {
                     DialogOutcome::Pending => {}
                 }
             }
+            ModalState::Preferences {
+                draft_max_undo_steps,
+            } => match dialogs::show_preferences(ctx, draft_max_undo_steps) {
+                DialogOutcome::Confirmed => {
+                    self.apply_preferences(*draft_max_undo_steps);
+                    keep_open = false;
+                }
+                DialogOutcome::Cancelled => {
+                    keep_open = false;
+                }
+                DialogOutcome::Pending => {}
+            },
             ModalState::ConfirmUnsaved => {
                 let label = self.window_doc_label();
                 match dialogs::show_confirm_unsaved(ctx, &label) {
@@ -4444,8 +4597,12 @@ impl eframe::App for DaraskApp {
             toast_text.as_deref(),
         );
 
-        if let Some(new_tool) = toolbar::show(ui, self.tool, self.lasso_mode) {
-            self.set_tool(new_tool);
+        if let Some(action) = toolbar::show(ui, self.tool, self.lasso_mode) {
+            match action {
+                ToolbarAction::SelectTool(new_tool) => self.set_tool(new_tool),
+                // v6 §34: ツールバーの歯車ボタン(Ctrl+K と同じ)。
+                ToolbarAction::OpenPreferences => self.open_preferences_modal(),
+            }
         }
 
         // v2 レビューで発見・修正したバグ: egui のパネルは宣言順に残り領域の
@@ -4474,8 +4631,19 @@ impl eframe::App for DaraskApp {
         // 借用してしまうメソッド呼び出し)ではなく `Tab` への可変参照を
         // 1 回だけ取って両フィールドへ分割借用する。
         let tab = &mut self.tabs[self.active_tab];
-        if let Some(action) = side_panel::show(ui, &mut tab.doc, &mut tab.layer_rename, color_ctx) {
+        let (layer_action, history_jump) = side_panel::show(
+            ui,
+            &mut tab.doc,
+            &mut tab.layer_rename,
+            &tab.history,
+            color_ctx,
+        );
+        if let Some(action) = layer_action {
             self.handle_layers_panel_action(action);
+        }
+        // v6-M3(SPEC §35、ARCHITECTURE.md §18.4): 履歴パネルの行クリック。
+        if let Some(target_len) = history_jump {
+            self.jump_history_to(target_len);
         }
 
         {
@@ -4770,7 +4938,7 @@ mod tests {
     /// テスト専用にフィールドを直接組み立てるコンストラクタを用意する。
     fn new_for_test(doc: Document) -> DaraskApp {
         DaraskApp {
-            tabs: vec![Tab::new(doc, Some(1))],
+            tabs: vec![Tab::new(doc, Some(1), settings::DEFAULT_MAX_UNDO_STEPS)],
             active_tab: 0,
             next_untitled_number: 2,
             tool: ToolKind::Pen,
@@ -4799,6 +4967,7 @@ mod tests {
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
             show_pixel_grid: true,
+            max_undo_steps: settings::DEFAULT_MAX_UNDO_STEPS,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
             // だけ空欄がちらつく)。プライマリの初期値(黒)に合わせる。
@@ -5692,6 +5861,13 @@ mod tests {
     #[test]
     fn layer_add_refuses_past_the_64_layer_cap() {
         let mut app = new_for_test(Document::new(1, 1, Background::White));
+        // v6 §34/ARCHITECTURE.md §18.3: `History` の既定の保持数上限
+        // (`DEFAULT_MAX_STEPS` = 50)は `MAX_LAYERS - 1`(63)より小さいため、
+        // このテスト固有の目的(レイヤー上限到達時に undo エントリが
+        // 積まれないこと)を保持数キャップの影響で汚染しないよう、ここだけ
+        // 明示的に引き上げておく(このテストは History の保持数キャップ自体を
+        // 検証する場ではない、それは history.rs 側のテストが担う)。
+        app.active_tab_mut().history.set_max_steps(MAX_LAYERS);
         for _ in 0..(MAX_LAYERS - 1) {
             app.layer_add();
         }
@@ -5719,6 +5895,91 @@ mod tests {
                 tab.history.undo(&mut tab.doc)
             },
             "the refused add must not have pushed an undo entry"
+        );
+    }
+
+    // -- v6 §34(V6-M2、ARCHITECTURE.md §18.2): 設定(環境設定)ダイアログ ----
+
+    /// `History` は `undo_stack` の長さを公開しないため、既存の公開 API
+    /// (`undo`/`redo`)だけを使って積まれているエントリ数を数える(このテスト
+    /// セクション専用のヘルパー)。呼び出し後は全部やり直して呼び出し側の
+    /// 状態を壊さないようにする。
+    fn count_undo_entries(history: &mut History, doc: &mut Document) -> usize {
+        let mut n = 0;
+        while history.undo(doc) {
+            n += 1;
+        }
+        while history.redo(doc) {}
+        n
+    }
+
+    #[test]
+    fn open_preferences_modal_seeds_draft_from_current_value() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.max_undo_steps = 77;
+        app.open_preferences_modal();
+        let Some(ModalState::Preferences {
+            draft_max_undo_steps,
+        }) = app.modal
+        else {
+            panic!("expected ModalState::Preferences to be open");
+        };
+        assert_eq!(draft_max_undo_steps, 77);
+    }
+
+    #[test]
+    fn apply_preferences_updates_max_undo_steps_field() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        assert_eq!(app.max_undo_steps, settings::DEFAULT_MAX_UNDO_STEPS);
+        app.apply_preferences(200);
+        assert_eq!(app.max_undo_steps, 200);
+    }
+
+    /// SPEC §34/ARCHITECTURE.md §18.6-2: 「`max_steps` を小さく設定変更した
+    /// 瞬間に現在開いている全タブへ反映すること」。2 つのタブそれぞれに
+    /// デフォルト上限(50)より多くない範囲でエントリを積んでおき、保持数を
+    /// 3 へ下げたら**両方の**タブがその場で 3 件まで切り詰められることを
+    /// 確認する(新規タブだけに適用され既存タブが取り残される、という
+    /// バグの回帰テスト)。
+    #[test]
+    fn apply_preferences_truncates_every_open_tabs_history_immediately() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        for _ in 0..5 {
+            app.apply_invert();
+        }
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        for _ in 0..5 {
+            app.apply_invert();
+        }
+        assert_eq!(app.tabs.len(), 2);
+
+        app.apply_preferences(3);
+
+        for tab in &mut app.tabs {
+            let n = count_undo_entries(&mut tab.history, &mut tab.doc);
+            assert_eq!(
+                n, 3,
+                "every open tab's history must be capped to the new limit, not just the active one"
+            );
+        }
+    }
+
+    /// SPEC §34: 新規タブも、既に変更済みの保持数を最初から使うこと(既定の
+    /// 50 に一瞬でも取り残されない)。
+    #[test]
+    fn new_tab_inherits_the_currently_configured_max_undo_steps() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.apply_preferences(3);
+        app.open_new_tab(Document::new(4, 4, Background::White));
+
+        for _ in 0..5 {
+            app.apply_invert();
+        }
+        let tab = &mut app.tabs[app.active_tab];
+        let n = count_undo_entries(&mut tab.history, &mut tab.doc);
+        assert_eq!(
+            n, 3,
+            "a newly created tab must already use the app-wide max_undo_steps, not the History default"
         );
     }
 
@@ -6136,6 +6397,7 @@ mod tests {
         app.recent_files.push_back(PathBuf::from("x.png"));
         app.window_size = egui::vec2(1600.0, 900.0);
         app.window_maximized = true;
+        app.max_undo_steps = 250;
 
         let s = app.current_settings();
         assert_eq!(s.primary, app.primary);
@@ -6152,6 +6414,7 @@ mod tests {
         assert_eq!(s.window_width, 1600);
         assert_eq!(s.window_height, 900);
         assert!(s.window_maximized);
+        assert_eq!(s.max_undo_steps, 250);
     }
 
     // -- v4 レビューで発見・修正したバグ: 最大化中のウィンドウ内寸を

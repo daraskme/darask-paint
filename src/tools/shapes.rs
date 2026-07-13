@@ -116,7 +116,8 @@ impl ShapeTool {
                     )
                 };
                 ctx.doc.mark_dirty(touched);
-                ctx.history.commit_stroke(ctx.doc);
+                // ARCHITECTURE.md §18.3 の対応表: 「直線」。
+                ctx.history.commit_stroke(ctx.doc, "直線");
                 ctx.used_colors.push(button_color(ctx, drag.button));
             }
             ShapeKind::Rect | ShapeKind::Ellipse => {
@@ -170,7 +171,13 @@ impl ShapeTool {
                 if let Some(t) = touched {
                     ctx.doc.mark_dirty(t);
                 }
-                ctx.history.commit_stroke(ctx.doc);
+                // ARCHITECTURE.md §18.3 の対応表: 「矩形」/「楕円」。
+                let label = match self.kind {
+                    ShapeKind::Rect => "矩形",
+                    ShapeKind::Ellipse => "楕円",
+                    ShapeKind::Line => unreachable!(),
+                };
+                ctx.history.commit_stroke(ctx.doc, label);
 
                 match self.mode {
                     ShapeMode::Both => {

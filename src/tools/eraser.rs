@@ -54,7 +54,7 @@ impl Tool for EraserTool {
     fn cancel(&mut self, ctx: &mut ToolCtx) {
         // 消しゴムには「色」の概念がないため、確定してもリターン値は無視して
         // よい(最近使った色には積まない、`event` と同じ扱い)。
-        let _ = self.engine.cancel(ctx);
+        let _ = self.engine.cancel(ctx, "消しゴム");
     }
 
     fn draw_preview(
