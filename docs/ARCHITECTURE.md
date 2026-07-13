@@ -539,3 +539,180 @@ pub struct Floating {
 8. GitHub Actions の windows ランナーはヘッドレスで GL ウィンドウ生成に失敗し得る — bench ジョブは必ず `continue-on-error`。CI 必須ジョブに GUI 起動を含めない。
 9. 楕円/多角形マスクの境界線分抽出は選択確定時のみ(毎フレーム再計算しない)。巨大選択(4000×4000 全選択)でも境界抽出 < 50ms。
 10. Shift+M/Shift+L/Shift+G の巡回はツールバーのアイコン・ツールチップ・オプションバーの整合(現在バリアントの表示)を忘れない。
+
+---
+
+# v5 設計(タブ・複数ドキュメント)
+
+SPEC.md「v5 拡張仕様」(§30〜§32)に対応。**これは v1〜v4 で「単一ドキュメント」を前提に組んできた `DaraskApp` の構造変更**であり、機械的だが広範囲な書き換えになる。実装順は「データモデルをタブ化 → 既存の全呼び出し箇所を追随させてビルドを通す(挙動は変えない)→ タブ UI・切替 → 新規タブ複製機能」とする。
+
+## 17.1 データモデル
+
+```rust
+struct Tab {
+    doc: Document,
+    history: History,
+    view: CanvasView,           // zoom/pan/viewport はタブごとに独立して記憶される
+    selection: Option<Selection>,
+    floating: Option<Floating>,
+    // ストローク進行中の一時状態(StrokeRecorder は history 内、なげなわ多角形の
+    // 頂点列・Shift+クリック終点等は既存どおり DaraskApp 側のツール状態に残してよいが、
+    // 17.6-1 の「切替前に必ず確定」規則でタブ切替時に安全側へ倒す)。
+}
+
+struct DaraskApp {
+    tabs: Vec<Tab>,
+    active_tab: usize,          // 常に tabs.len() > 0、常に有効な index
+    next_untitled_number: u32,  // 「無題」「無題2」…の採番(既存 next_layer_number と同型)
+    // 以下は変更なし(アプリ全体で共有): tool, tools状態, primary/secondary,
+    // recent_colors, user_palette, brush_size/hardness/opacity/..., settings,
+    // modal, pending_action, toast, keymap 関連, recent_files 等
+}
+```
+
+- `self.doc` / `self.history` / `self.view` / `self.selection` / `self.floating` への既存の全アクセスは `self.tabs[self.active_tab].doc` 等に変わる。ヘルパー `active_tab(&self) -> &Tab` / `active_tab_mut(&mut self) -> &mut Tab` を用意し、既存コードの書き換え量を減らす。
+- 起動時(`DaraskApp::new`)は `tabs: vec![Tab::new(...)]`(CLI 引数があればそれを開いた Tab、無ければ白紙)、`active_tab: 0`。ベンチモード(`DARASK_BENCH=1`)はタブ 1 枚のまま従来どおり動作する(変更不要)。
+
+## 17.2 タブ切替とテクスチャ
+
+- `CanvasView` は現状どおり「自分が持つ `TextureHandle`」の仕組みをそのまま使う。タブ切替時(`switch_tab(new_index)`)は、切替先タブの `view.texture = None` に**強制的に戻す**(実際には切替先タブ自身の `view` はそもそも別インスタンスなので、単に「切替先の `CanvasView` を今の viewport 情報だけ更新して使う」だけでよい。同一タブに戻ってきた場合に古いテクスチャがそのまま使えるなら再アップロード不要 ―― ただし他のタブがアクティブな間にそのタブの `doc` は変更されない(操作はアクティブタブにしか効かない)ため、非アクティブタブのテクスチャは古びない。**タブ切替のたびに毎回全面再アップロードする必要はない**。切替先タブの `view.texture` が既に存在し `texture_size == doc.width/height` ならそのまま使う。存在しない(初回切替)場合のみ、既存の「新規/サイズ変更時のみ全面再アップロード」の分岐(§14.1)がそのまま効いて 1 回だけ全面 recompose+upload される。
+- `floating_texture` も同様にタブごと(`Tab::view` の一部)なので自然に分離される。
+- 結果として: 初めて開くタブへの切替時だけ全面 recompose 相当のコスト(既存の「開く」と同等)が掛かり、2 回目以降の再訪問は追加コスト無し。新しい仕組みを作らない。
+
+## 17.3 タブ切替時の安全規則(最重要の落とし穴の再発防止)
+
+このプロジェクトでは「進行中の操作(ストローク・浮動片・なげなわ多角形)を確定せずに別の操作(ツール切替・レイヤー操作・undo・貼り付け)を割り込ませると履歴が壊れる」というバグが v3〜v4 のレビューで繰り返し見つかっている(§15.6, §16.10 参照)。**タブ切替は構造的に同じ危険を持つ**ため、既存の `commit_open_gesture()`(ツール切替・レイヤー操作の前に呼んでいるもの)を **タブ切替の前に必ず呼ぶ**。Ctrl+Tab・Ctrl+Shift+Tab・タブバークリック・タブを閉じる・新規タブを開く、のすべての経路がこの一箇所(`switch_tab`/`close_tab`/`open_new_tab` 共通のエントリ)を通ること。
+
+## 17.4 未保存ガードの一般化
+
+- `pending_action` に `CloseTab(usize)` を追加。タブを閉じる際、そのタブの `doc.modified` が true なら該当タブをアクティブ化した上で既存の `ConfirmUnsaved` モーダルを出す(保存/破棄/キャンセル)。
+- ウィンドウを閉じる要求(`close_requested`)は、`modified` なタブの index 列を集めて `pending_action = CloseAllTabs(VecDeque<usize>)` とし、先頭から 1 つずつ `CloseTab` と同じ確認フローを回す。全部処理し終えたら `std::process::exit`。途中でキャンセルされたら全体を中止(`ViewportCommand::CancelClose` は最初の要求時点で既に送っているので、キャンセル時は何もしない=閉じない)。
+- 最後の 1 タブに対する Ctrl+W / タブの× は「閉じる」ではなく「新規」と同じ処理(§30)に差し替える(タブ数チェックを `close_tab` の先頭で行う)。
+
+## 17.5 選択範囲を新規タブに複製(§31)の実装
+
+- 新規タブの内容構築は既存の抽出コードを再利用する(新しいピクセル演算を書かない):
+  - 浮動片がある場合: `Floating.pixels/mask/w/h` をそのまま新規 `Document`(1 レイヤー)の初期値にする。
+  - 静的選択のみの場合: `tools::select::extract_region`(v4-M2 で実装済み)を選択 bbox・現在の `Selection.mask` で各レイヤーに対して呼び、結果を新規 `Document.layers` として順番どおり組み立てる。
+- 新規 `Tab` は `active_tab + 1` の位置に挿入し、`active_tab` をその index に更新(§17.3 の切替安全規則を通す)。`doc.modified = true`、`doc.path = None`、`history` は新規(空)。タブ名は `next_untitled_number` を消費して「無題」「無題2」…と採番(通常の新規作成と同じ命名関数を共有)。
+- 全レイヤー版の抽出コストは既存の「選択範囲でトリミング」と同程度(新規の性能懸念なし)。
+
+## 17.6 メニュー・keymap の変更
+
+- keymap.rs に `Action::CloseTab` / `Action::NextTab` / `Action::PrevTab`(前タブ)を追加、Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab を束縛。**Ctrl+Tab を egui 自身のフォーカス移動(Tab キー)が横取りしていないか実機で確認する**(§17.7-2)。
+- 画像メニューに「選択範囲を新規タブに複製」を追加、`MenuState` に `can_duplicate_selection_to_tab: bool`(`has_selection` と同じ値でよい)を追加。
+- ファイルメニューに「タブを閉じる (Ctrl+W)」を追加(名前を付けて保存の後、終了の前)。
+
+## 17.7 v5 マイルストーン(各段階でビルド緑・警告 0・clippy 0・テスト緑・ベンチ 300ms 以内)
+
+### V5-M1 — データモデルのタブ化(挙動不変)
+§17.1〜17.2。`DaraskApp` の `doc`/`history`/`view`/`selection`/`floating` を `tabs: Vec<Tab>` + `active_tab` に置き換え、全呼び出し箇所を `active_tab()`/`active_tab_mut()` 経由に書き換える。**UI にタブバーはまだ出さない**(常にタブ 1 枚のまま、v1〜v4 の全既存テスト・全既存挙動が同一であることを担保するマイルストーン)。受け入れ: 既存の全テストが(API 追随のみで)無傷で通ること。
+
+### V5-M2 — タブバー UI・切替・新規/開くの意味変更
+タブバーウィジェット、Ctrl+Tab/Ctrl+Shift+Tab/中クリック、Ctrl+N/Ctrl+Oを新規タブ方式に変更、パス正規化での重複オープン検出、D&D複数ファイル、タブ数上限24+トースト、常時1タブ維持、§17.3の安全規則配線。
+
+### V5-M3 — 未保存ガードの一般化・タブを閉じる
+§17.4 全部(Ctrl+W、タブの×、ウィンドウを閉じる際の複数タブ確認)。
+
+### V5-M4 — 選択範囲を新規タブに複製・最終検証
+§17.5〜17.6 全部 + README 更新 + 最終検証(fmt/clippy/build/test/bench + 実機目視確認)。
+
+## 17.8 v5 の落とし穴
+
+1. **タブ切替前に必ず `commit_open_gesture()` を呼ぶ**(§17.3)。これを忘れるクラスのバグは本プロジェクトで最も繰り返し発生してきたパターンなので、実装時は既存の tool-switch・layer-op の呼び出し箇所をそのまま模倣すること。
+2. Ctrl+Tab が egui のデフォルトのフォーカス移動と衝突しないか実機確認(衝突する場合はショートカット処理をフォーカス移動より先に consume する)。
+3. `active_tab` が指す index は「常に有効」を型ではなく実行時に保証している(境界チェックを怠らない。タブ削除後の index シフトに注意)。
+4. 非アクティブタブの `doc`/`history` はメモリに保持され続ける(N タブ = N 個の Document + History)。タブ数上限(24)がこの膨張の安全弁であることをコード上のコメントで明記する。
+5. 「選択範囲を新規タブに複製」は元タブを一切変更しない(読み取りのみ)。誤って元タブの `doc`/`selection` を書き換えないこと。
+6. ドラッグ&ドロップで複数ファイルを開く際、既存の未保存ガード(単一ファイルの Open 相当)をファイルごとに正しく通すこと(重複オープン検出も含む)。
+7. ベンチモード(`DARASK_BENCH=1`)・CLI 引数起動は「タブ 1 枚」のまま(タブ関連 UI の初期化コストを起動時間に載せない)。
+
+---
+
+# v6 設計(メニューの全展開アイコン化・アンドゥ履歴パネル)
+
+SPEC.md「v6 拡張仕様」(§33〜§35)に対応。**v5 マイルストーン実装中のエージェントはこの章を無視すること。** v6 は v5 完了後に着手し、v5 が作るタブ機構(タブバー・`Tab`/`active_tab` データモデル)を前提とする。
+
+## 18.1 menu.rs の再設計(ドロップダウン → 常時表示アイコン行)
+
+- 既存の `ui/menu.rs::show(ui, &MenuState) -> Option<MenuAction>` の**シグネチャは変えない**(`MenuAction` enum も変えない)。変わるのは内部実装のみ: `egui::menu::bar` + `ui.menu_button(...)` によるドロップダウンを、`ui.horizontal_wrapped(|ui| { ... })` の中に各アクションのアイコンボタンを並べる形に書き換える。
+- グループ順序と区切り: ファイル → (区切り) → 編集 → (区切り) → 画像 → (区切り) → レイヤー → (区切り) → 表示 → (区切り) → ヘルプ/設定。区切りは `ui.separator()` の縦版、またはグループ間の余白+薄い縦線。
+- 各アイコンボタンは `ui/icons.rs` に新規追加する描画関数群(SPEC §33 の全項目ぶん、既存の 9 ツールアイコンと同じ関数シグネチャ規約: `fn paint_xxx_icon(painter: &egui::Painter, rect: Rect, color: Color32)`)。20×24px 目安、ホバー/押下時のハイライトは既存のツールボタンと同じ描画パターンを踏襲する。
+- 「最近使ったファイル」だけは `egui::popup` 相当(既に色ピッカーやなげなわ確定などで使っている軽量ポップアップの流儀)でパス一覧を表示する小さな例外。他は全てワンクリックで即発火(既存の `MenuAction` を返す)。
+- 「ピクセルグリッド表示」は他のツールボタンと同じ `.selected(bool)` ハイライトでトグル状態を示す(即実行系ではなく状態表示系のボタン)。
+- `MenuState` に `pixel_grid_visible: bool` を追加(既に app 側に該当フラグがあるはずなので、それを渡すだけ)。
+
+## 18.2 設定(Preferences)ダイアログと保持数(SPEC §34)
+
+- `src/settings.rs`: `Settings` に `max_undo_steps: u32`(既定 `DEFAULT_MAX_UNDO_STEPS = 50`)を追加。キー `history.max_steps`、読込時 `[1, 500]` にクランプ(既存の `clamp_window_dims` と同じ流儀)。往復テストを追加。
+- 新規 `ModalState::Preferences { draft_max_undo_steps: u32 }`(ダイアログ内はドラフト値を持ち、OK で確定・キャンセルで破棄する既存の New/Resize ダイアログと同じパターン)。
+- OK 確定時: `self.settings.max_undo_steps` を更新して即保存(`save_settings()`)、かつ **開いている全タブ**に対して `tab.history.set_max_steps(new_value)` を呼ぶ(下方変更で現在の段数がそれを超えていれば§18.3のロジックでその場で切り詰める)。
+- Ctrl+K を keymap.rs に追加(`Action::OpenPreferences`)。ツールバーにも歯車アイコンのボタンを 1 つ(§33 末尾)。
+
+## 18.3 History のラベル付けと保持数キャップ・ジャンプ
+
+```rust
+pub struct HistoryEntry { pub op: HistoryOp, pub label: String }
+
+pub struct History {
+    undo_stack: Vec<HistoryEntry>,
+    redo_stack: Vec<HistoryEntry>,
+    max_bytes: usize,     // 既存 256MB(不変)
+    max_steps: usize,     // 新規。既定 50、Settings から注入
+    // ...
+}
+```
+
+- `push`/`commit_stroke`/`apply_layer_op` 等、`HistoryOp` を積む**全ての箇所**が呼び出し元由来の短い日本語ラベルを渡すようにシグネチャを変更する(`impl Into<String>` 引数を 1 つ追加するだけの機械的変更)。推奨ラベル対応表:
+
+  | 操作 | ラベル |
+  |---|---|
+  | ブラシ/消しゴム/鉛筆ストローク | "ブラシ" / "消しゴム" |
+  | 直線・矩形・楕円確定 | "直線" / "矩形" / "楕円" |
+  | 塗りつぶし | "塗りつぶし" |
+  | グラデーション確定 | "グラデーション" |
+  | テキスト確定 | "テキスト" |
+  | 選択/浮動片の移動確定(選択ドラッグ・移動ツール・自由変形) | "選択の移動" |
+  | 貼り付け確定 | "貼り付け" |
+  | 切り取り | "切り取り" |
+  | Delete による消去 | "削除" |
+  | 画像サイズ変更 / キャンバスサイズ変更 / トリミング | 同名そのまま |
+  | 左右反転 / 上下反転 / 右に90°回転 / 左に90°回転 | 同名そのまま |
+  | 明るさ・コントラスト / 色相・彩度 / 階調の反転 / グレースケール化 | 同名そのまま |
+  | レイヤー追加/複製/削除/移動/結合/統合 | "レイヤーを追加" / "レイヤーを複製" / "レイヤーを削除" / "レイヤーの並び替え" / "レイヤーの結合" / "画像の統合" |
+
+- **保持数キャップの適用**: 新規 push 時、`undo_stack.len() > max_steps` または合計バイトが `max_bytes` を超える限り先頭(最古)から破棄する。**下限は `min(10, max_steps)` 件を必ず保持**(v1 §9 の「直近10件」floor を `max_steps` 自体がそれより小さい設定の場合に矛盾させないための最小値クランプ)。
+- `set_max_steps(new: usize)`: `max_steps` を更新し、即座に上記の破棄ロジックを 1 回走らせて超過分を切り詰める(§18.2 のダイアログ OK 時に全タブへ呼ぶ)。
+- **ジャンプ**: `History::jump_to(&mut doc, target_len: usize)` は「新しい仕組みを増やさない」方針で、既存の単発 `undo()`/`redo()` を `target_len` に達するまでループ呼び出しするだけの薄い関数として実装する(最大 `max_steps` 回のループ、既定 50 なら軽量。新しいスナップショット合成ロジックは書かない)。
+- 破棄された古いエントリの有無(履歴パネルの「(これ以前の履歴は破棄されました)」注記用)は `History` に `truncated: bool`(一度でも先頭を破棄したら true のまま)を持たせて公開する。
+
+## 18.4 履歴パネル(SPEC §35)
+
+- 新規 `src/ui/history_panel.rs`: `show(ui, history: &History) -> Option<usize>`(クリックされた行の「その時点でのundo_stack長」を返すだけ。実際のジャンプ実行は呼び出し側=app.rs が既存の commit-first ガードを通してから `History::jump_to` を呼ぶ)。
+- 表示は `egui::ScrollArea::vertical()` 内に、`truncated` なら先頭に灰色の注記行、続いて仮想「(初期状態)」行、続いて `undo_stack` の各 `HistoryEntry.label` を先頭(最古)から順に、続いて `redo_stack` の各 `HistoryEntry.label` を逆順(直近の undo ほど上)に淡色で表示。現在位置(`undo_stack` の末尾に対応する行)をハイライト。
+- `side_panel.rs` に「色」「レイヤー」に続く 3 セクション目として配線。タブ切替時は自然にアクティブタブの `History` を渡すだけで追随する(v5 のタブ化により `history` は既にタブごとに独立しているため、パネル側に特別な対応は不要)。
+- クリック時の安全規則(app.rs 側): 履歴パネルからのジャンプ要求は、既存の `handle_undo_redo_shortcuts`/メニューの Undo/Redo が使っている「進行中のストローク・浮動片があれば先に確定してから実行する」ロジック(`commit_open_gesture()` 等)を**そのまま再利用**する。ジャンプ専用の別ルートを作らない。
+
+## 18.5 v6 マイルストーン(各段階でビルド緑・警告 0・clippy 0・テスト緑・ベンチ 300ms 以内)
+
+### V6-M1 — History のラベル付け・保持数キャップ・ジャンプ(UIなし)
+§18.3 全部。全 push 呼び出し箇所にラベルを追加、保持数キャップと `jump_to` を実装。既存の undo/redo 挙動(バイト上限・直近10件floor)は不変であることを既存テストで担保。
+
+### V6-M2 — 設定ダイアログ
+§18.2 全部。Ctrl+K、Preferences モーダル、settings.rs 拡張、全タブへの即時反映。
+
+### V6-M3 — 履歴パネル
+§18.4 全部。history_panel.rs、side_panel.rs への配線、クリックジャンプの安全配線。
+
+### V6-M4 — メニューの全展開アイコン化・最終検証
+§18.1 全部(SPEC §33 の全項目のアイコン化)+ README 更新 + 最終検証(fmt/clippy/build/test/bench + 実機目視確認、ウィンドウ最小幅 640px での折り返し確認も含む)。
+
+## 18.6 v6 の落とし穴
+
+1. 履歴パネルのジャンプは**必ず既存の commit-first ガードを再利用**する(§17.3/§17.8-1 と全く同じクラスの罠。ジャンプだけを特別扱いして安全確認を省略しない)。
+2. `max_steps` を小さく設定変更した瞬間に**現在開いている全タブ**へ反映すること(新規タブだけに適用され既存タブが取り残される、というバグを作らない)。
+3. ラベル付けの機械的変更(§18.3 の対応表)で、既存の `HistoryOp` 構築ロジック自体(何が起きるか)は一切変えない。ラベル文字列を追加するだけ。
+4. メニューの全展開アイコン化は**純粋に見た目とレイアウトの変更**であり、各 `MenuAction` の実際の意味・確認ダイアログ・キーボードショートカットは 1 つも変えない(既存の `handle_menu_action` 等は無改造で流用できるはず)。
+5. 「最近使ったファイル」のポップアップだけがドロップダウン的な UI として残る例外であることを実装コメントに明記する(SPEC §33 が認める唯一の例外)。
+6. ウィンドウ最小幅 640px でアイコン行が折り返しても操作不能にならないこと(実機で確認)。
+7. `HistoryEntry` へのラップで `HistoryOp` のシリアライズ/比較を前提にした既存テストがあれば、期待値をラベル込みの新シグネチャに追随させる(削除しない)。

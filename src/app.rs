@@ -41,7 +41,7 @@
 //! (ブラシは常時 AA になった)。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,7 @@ use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{pos2, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2};
 
 use crate::canvas_view::CanvasView;
-use crate::document::{Background, Document, Interpolation, MAX_LAYERS};
+use crate::document::{Background, Document, Interpolation, Layer, MAX_LAYERS};
 use crate::history::{History, HistoryOp};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
@@ -72,6 +72,7 @@ use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
 use crate::ui::layers_panel::{LayersPanelAction, RenameState};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
+use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
 use crate::ui::{dialogs, menu, options_bar, side_panel, status_bar, toolbar};
 
 /// SPEC §5: 最近使った色は最大 8 個。
@@ -113,6 +114,10 @@ const LASSO_DOUBLE_CLICK_DISTANCE: f32 = 4.0;
 /// SPEC §7: 「新規」ダイアログのデフォルト値。
 const DEFAULT_NEW_WIDTH: u32 = 1280;
 const DEFAULT_NEW_HEIGHT: u32 = 720;
+
+/// SPEC §30: 「タブ数の上限は 24」。超えて新規タブを作ろうとしたら作成せず
+/// トースト通知する(`tab_limit_toast_message`/`open_new_tab` 呼び出し元参照)。
+const MAX_TABS: usize = 24;
 
 /// SPEC §8: JPEG 品質のデフォルト値。
 const DEFAULT_JPEG_QUALITY: u8 = 90;
@@ -260,15 +265,44 @@ struct TextEditState {
 }
 
 /// 未保存ガード(SPEC §8)が「保存/破棄を選んだ後に何をするか」を覚えておく
-/// ためのアクション(ARCHITECTURE.md §10: `pending_action: Option<PendingAction>`
-/// (New/Open(path?)/Close))。
-#[derive(Debug, Clone)]
+/// ためのアクション(ARCHITECTURE.md §10: `pending_action: Option<PendingAction>`)。
+///
+/// v5 §30: Ctrl+N(新規)/Ctrl+O(開く)は「アクティブタブの内容を置き換える」
+/// から「新規タブを追加してそこに開く」に意味変更された(v1 §7・§8 を
+/// 上書き)。新規タブの追加は既存タブの内容を一切破壊しないため、もはや
+/// 未保存ガードの対象ではない(`begin_new_tab`/`begin_open_tab`/
+/// `open_path_in_new_tab` がこの列挙体を経由せず直接実行する)。この列挙体に
+/// 残っているのは、実際に既存の内容を破棄しうる操作だけ:
+/// SPEC §30 の「最後の 1 タブを閉じようとした場合…内容を白紙に戻す」
+/// (`CloseLastTab`、`close_tab` 参照。「新規」と同じダイアログを経由するが、
+/// こちらは唯一のタブの内容をその場で置き換えるため、v1〜v4 時代の `New` と
+/// 同様に未保存ガードが必要)、v5 §17.4 の「タブを閉じる際、そのタブが
+/// 未保存なら確認する」(`CloseTab`、`Ctrl+W`・タブの×・中クリック経由)、
+/// および v5 §17.4 の「ウィンドウを閉じる/終了する際、未保存タブがあれば
+/// タブごとに順番に確認する」(`CloseAllTabs`、`begin_quit` 参照)。
+// v5 §17.4 でこの列挙体の全バリアントが「閉じる」系(`CloseLastTab`/
+// `CloseTab`/`CloseAllTabs`)になったため clippy::enum_variant_names が
+// 反応するが、これは実際に「未保存ガード後に閉じる操作を実行する」という
+// この列挙体の役割そのものを表しており、プレフィックスを削ると
+// (`LastTab`/`Tab`/`AllTabs`)かえって何のタブ操作か読み取りにくくなる
+// (ARCHITECTURE.md §16.10-6: 「判断に迷う lint は allow+根拠コメント」)。
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAction {
-    New,
-    /// `Some(path)` なら D&D/CLI 等で既にパスが分かっている。`None` なら
-    /// ガード通過後に「開く」ダイアログを表示する。
-    Open(Option<PathBuf>),
-    Close,
+    /// SPEC §30: 最後の 1 タブを閉じようとした(`close_tab` 参照)。
+    CloseLastTab,
+    /// v5 §17.4: 2 枚以上あるタブのうちの 1 枚(`usize` は `tabs` への
+    /// index)を閉じようとした。`close_tab` が確認前に
+    /// `switch_tab(index)` 済みなので、確認モーダルが出ている間
+    /// アクティブタブは常にこの index を指す。
+    CloseTab(usize),
+    /// v5 §17.4: ウィンドウを閉じる/アプリを終了する一連の流れ。まだ確認
+    /// していない未保存タブの index 列(先頭が次に確認する対象)。
+    /// アプリごと終了する前提のため、確認の都度 `tabs` から取り除くことは
+    /// しない(`continue_closing_all_tabs` のドキュメントコメント参照 —
+    /// 削除しないので `tabs` の長さは変わらず、残りの index がずれる
+    /// 心配もない)。
+    CloseAllTabs(VecDeque<usize>),
 }
 
 /// SPEC §7 のダイアログ群(ARCHITECTURE.md §10: `modal: Option<ModalState>`)。
@@ -277,6 +311,11 @@ enum ModalState {
         width: u32,
         height: u32,
         background: Background,
+        /// `true` ならアクティブタブ(=唯一のタブ)の内容をその場で置き換える
+        /// (SPEC §30: 「最後の 1 タブを閉じる」→`PendingAction::CloseLastTab`
+        /// 経由)。`false` なら通常の Ctrl+N と同じく新規タブを追加する
+        /// (`confirm_new` 参照)。
+        replace_active: bool,
     },
     ImageResize {
         width: u32,
@@ -385,10 +424,115 @@ impl StartupToolState {
     }
 }
 
-pub struct DaraskApp {
+/// v5 §30(ARCHITECTURE.md §17.1): 1 つのドキュメントタブが持つ状態。
+///
+/// 読み替え規則(SPEC v5 冒頭): v1〜v4 で「ドキュメント」「doc」「画像」と
+/// 書かれていた箇所は、v5 以降は**アクティブタブのドキュメント**を指す。
+/// 選択・浮動片・アンドゥ履歴・ズーム/パン・ファイルパス・未保存フラグは
+/// タブごとに独立する(`doc`/`history`/`view`/`selection`/`floating` が
+/// それぞれ該当。`doc.path`/`doc.modified` は `Document` 自身が持つため
+/// ここには重複させない)。
+///
+/// ツール・色・ブラシ設定・パレット・最近使ったファイル・ウィンドウ状態は
+/// 引き続きアプリ全体で共有するため `DaraskApp` 側に残す(このタブ以外の
+/// フィールドは変更しない、ARCHITECTURE.md §17.1 冒頭の読み替え規則どおり)。
+///
+/// ストローク進行中の一時状態(`select_drag`/なげなわの頂点列/
+/// `text_edit` 等)は ARCHITECTURE.md §17.1 のコメントに従い `DaraskApp`
+/// 側に残す。V5-M2(タブ切替 UI の実装)では、これらの一時状態を安全側に
+/// 倒すため `commit_open_gesture()` をタブ切替の唯一の入口(`switch_tab`/
+/// `open_new_tab`/`close_tab`)の内部で必ず呼ぶ(ARCHITECTURE.md §17.3:
+/// 「タブ切替前に必ず commit_open_gesture() を呼ぶ」— 本プロジェクトで
+/// 最も繰り返し発生してきたバグパターンの再発防止策)。
+///
+/// バグ修正: `layer_rename`/`next_layer_number` は、以前は本 struct では
+/// なく `DaraskApp` 直下の共有フィールドだった。しかしこの 2 つは
+/// `doc`/`selection` 等と全く同じ「アクティブタブのドキュメントに紐付く
+/// 状態」であり、共有のままだと (1) タブ A でレイヤー名編集を開始した
+/// ままタブ B へ切り替えると、`side_panel::show` が「タブ B の doc」+
+/// 「タブ A で編集中だった rename」を組み合わせて描画してしまい、確定
+/// (Enter/フォーカス外し)するとタブ B の無関係なレイヤーの名前をタブ A
+/// での入力内容で上書きしてしまう(クロスタブ破損)、(2) 「レイヤー N」の
+/// 採番がタブをまたいで共有され、`untitled_number` と違いタブごとに
+/// 1 から連番にならず歯抜けになる、という 2 つの実在するバグを引き起こす。
+/// `untitled_number` と同様にタブごとに独立させることで両方解消する。
+struct Tab {
     doc: Document,
-    view: CanvasView,
     history: History,
+    view: CanvasView,
+    selection: Option<Selection>,
+    floating: Option<Floating>,
+    /// SPEC §30: 「無題」「無題2」「無題3」…の番号。`doc.path` が `None`
+    /// (=ファイルに紐付いていない)間だけ意味を持つ。生成時に
+    /// `DaraskApp::next_untitled_number` から一度だけ払い出され、以後は
+    /// 他のタブが閉じても採番し直さない(モノトニックに増え続けるだけ
+    /// なので、同時に開いている「無題」タブ同士のラベルは常に重複しない)。
+    untitled_number: Option<u32>,
+    /// ダブルクリックで開始した名前編集の状態(`ui/layers_panel.rs`)。
+    /// タブごとに独立(上記コメント参照)。
+    layer_rename: RenameState,
+    /// 新規レイヤーの名前(SPEC §13: 「レイヤー N」)に使う次の番号。
+    /// このタブのドキュメントを新規作成/読み込みし直すたびに 1 に
+    /// リセットする(タブごとに独立、上記コメント参照)。
+    next_layer_number: u32,
+}
+
+impl Tab {
+    /// 与えられた `Document` を唯一のドキュメントとする新規タブ(選択・
+    /// 浮動片・アンドゥ履歴・ズーム/パンは初期状態)。`untitled_number` は
+    /// `doc.path.is_none()` のときだけ渡す(呼び出し元は
+    /// `DaraskApp::open_new_tab`/`DaraskApp::new` を参照)。
+    fn new(doc: Document, untitled_number: Option<u32>) -> Self {
+        Self {
+            doc,
+            history: History::new(),
+            view: CanvasView::new(),
+            selection: None,
+            floating: None,
+            untitled_number,
+            layer_rename: None,
+            next_layer_number: 1,
+        }
+    }
+
+    /// SPEC §30: 「ファイル名(無題なら「無題」「無題2」「無題3」…と連番)」。
+    /// ウィンドウタイトル(`DaraskApp::window_doc_label`)・タブバー・
+    /// 「名前を付けて保存」の初期ファイル名(`DaraskApp::
+    /// default_save_file_name`)がすべてこれを情報源とする。
+    fn label(&self) -> String {
+        match &self.doc.path {
+            Some(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "無題".to_owned()),
+            // `untitled_number` は生成時に必ず `Some` が渡される前提だが
+            // (`doc.path.is_none()` の唯一の生成経路)、プログラミング上の
+            // 不変条件が破れても panic せず素の「無題」にフォールバックする。
+            None => match self.untitled_number {
+                Some(n) if n > 1 => format!("無題{n}"),
+                _ => "無題".to_owned(),
+            },
+        }
+    }
+}
+
+pub struct DaraskApp {
+    /// v5 §30(ARCHITECTURE.md §17.1): 開いているタブ群。**常に 1 枚以上を
+    /// 維持する**(SPEC §30: 「タブが 0 枚になる状態は作らない」、
+    /// `close_tab` 参照)。上限は `MAX_TABS`(SPEC §30: 24)。
+    tabs: Vec<Tab>,
+    /// `tabs` への有効な index。**常に有効**であることを実行時に保証する
+    /// (ARCHITECTURE.md §17.8-3: 型ではなく実行時に保証、境界チェックを
+    /// 怠らない)。タブ切替は必ず `switch_tab`/`open_new_tab`/`close_tab`
+    /// (ARCHITECTURE.md §17.3 の安全規則を内包する唯一の入口)を経由して
+    /// 更新すること。
+    active_tab: usize,
+    /// v5 §30(ARCHITECTURE.md §17.1): 「無題」「無題2」…の採番用カウンタ
+    /// (`next_layer_number` と同型)。`doc.path` が無い新規タブを作るたびに
+    /// 1 つ消費してインクリメントする(`take_untitled_number` 参照)。
+    /// タブが閉じても巻き戻さない(モノトニック、同時に開いている「無題」
+    /// タブ同士のラベルが重複しないことを保証する)。
+    next_untitled_number: u32,
     tool: ToolKind,
     /// SPEC §20: 「U: 図形(直前に使った図形)」。`ToolKind::Line`/`Rect`/
     /// `Ellipse` のいずれか(`set_tool` が唯一の更新箇所、`keymap::Action::
@@ -458,8 +602,9 @@ pub struct DaraskApp {
     user_palette: Vec<Color32>,
 
     // -- M4: 選択・フローティング(ARCHITECTURE.md §7) --------------------
-    selection: Option<Selection>,
-    floating: Option<Floating>,
+    // v5 §30(ARCHITECTURE.md §17.1): `selection`/`floating` は `Tab` へ移動
+    // した(タブごとに独立、読み替え規則)。`select_drag`(進行中ドラッグの
+    // 一時状態)はストローク進行中の一時状態として引き続きここに残す。
     select_drag: Option<SelectDrag>,
     /// `Floating` のテクスチャキャッシュキー用の採番(canvas_view.rs 参照)。
     next_floating_id: u64,
@@ -496,12 +641,9 @@ pub struct DaraskApp {
     recent_files: VecDeque<PathBuf>,
 
     // -- v2 §13: レイヤーパネル(ARCHITECTURE.md §14.8 V2-M2) --------------
-    /// ダブルクリックで開始した名前編集の状態(`ui/layers_panel.rs`)。
-    layer_rename: RenameState,
-    /// 新規レイヤーの名前(SPEC §13: 「レイヤー N」)に使う次の番号。
-    /// ドキュメントを新規作成/読み込みし直すたびに 1 にリセットする。
-    next_layer_number: u32,
-
+    // バグ修正: `layer_rename`/`next_layer_number` は `Tab`(タブごとの状態)
+    // へ移動した。詳細は `Tab` の docstring 参照(クロスタブ破損・採番の
+    // 歯抜けを防ぐため)。
     /// 起動時白画面(DWM 合成の競合)ワークアラウンドの状態。
     /// `StartupNudge` のドキュメントコメント参照。
     startup_nudge: StartupNudge,
@@ -526,6 +668,21 @@ pub struct DaraskApp {
 }
 
 impl DaraskApp {
+    /// v5 §30(ARCHITECTURE.md §17.1): アクティブタブへの参照。`active_tab`
+    /// (index フィールド)は `DaraskApp::new`/`new_for_test` が常に
+    /// `tabs` の有効な範囲で初期化し、タブを閉じる操作(v5 §17.4、
+    /// V5-M1 ではまだ存在しない)が必ず追随させるため、境界チェックは
+    /// `tabs[..]` の添字アクセスに委ねてよい(SPEC の不変条件が破れた場合は
+    /// パニックで即座に検出したい、ARCHITECTURE.md §17.8-3)。
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// 上と同じ(可変参照版)。
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
     /// `process_start` は `main()` 冒頭で取得した `Instant`。
     /// `bench_mode` は環境変数 `DARASK_BENCH=1` が設定されていたかどうか。
     /// `cli_path` は SPEC §3 の「プログラムから開く」用の起動引数(あれば)。
@@ -627,10 +784,19 @@ impl DaraskApp {
         gradient.colors = startup.gradient_colors;
         let window_size = egui::vec2(settings.window_width as f32, settings.window_height as f32);
 
+        // v5 §30: 起動時のタブは「無題」の採番対象になるかどうかを、`doc` を
+        // `Tab::new` へ移す前に確定しておく(CLI 引数で開けたファイルには
+        // 採番しない、`open_new_tab`/`Tab::label` と同じ規則)。
+        let initial_untitled_number = doc.path.is_none().then_some(1);
+        let next_untitled_number = if doc.path.is_none() { 2 } else { 1 };
+
         let mut app = Self {
-            doc,
-            view: CanvasView::new(),
-            history: History::new(),
+            // v5 §30(ARCHITECTURE.md §17.1): 起動時はタブ 1 枚
+            // (CLI 引数があればそれを開いた状態、無ければ白紙の新規。
+            // SPEC §30: 「セッション復元は非目標」)。
+            tabs: vec![Tab::new(doc, initial_untitled_number)],
+            active_tab: 0,
+            next_untitled_number,
             // SPEC §26: 「最後に使ったツール」。
             tool: settings.last_tool,
             last_shape_tool: startup.last_shape_tool,
@@ -667,8 +833,6 @@ impl DaraskApp {
             // だけ空欄がちらつく)。
             color_hex_buffer: color_panel::format_hex(settings.primary),
             user_palette: settings.user_palette,
-            selection: None,
-            floating: None,
             select_drag: None,
             next_floating_id: 0,
             text_font,
@@ -682,8 +846,6 @@ impl DaraskApp {
             last_title: String::new(),
             toast: None,
             recent_files: settings.recent_files,
-            layer_rename: None,
-            next_layer_number: 1,
             // ベンチモードは 2 フレームで自動終了する決定的なスモーク
             // テストなので、リサイズを送らない(SPEC §11)。
             startup_nudge: if bench_mode {
@@ -850,12 +1012,14 @@ impl DaraskApp {
                 // ストロークは「進行中」ではなくなる(M4 で確立した規則)。
                 Action::Undo => {
                     self.commit_open_gesture();
-                    self.history.undo(&mut self.doc);
+                    let tab = self.active_tab_mut();
+                    tab.history.undo(&mut tab.doc);
                     self.clamp_selection_to_doc();
                 }
                 Action::Redo => {
                     self.commit_open_gesture();
-                    self.history.redo(&mut self.doc);
+                    let tab = self.active_tab_mut();
+                    tab.history.redo(&mut tab.doc);
                     self.clamp_selection_to_doc();
                 }
 
@@ -897,15 +1061,27 @@ impl DaraskApp {
                 Action::LayerMergeDown => self.layer_merge_down(),
                 Action::LayerFlatten => self.layer_flatten(),
 
-                Action::New => self.request_action(PendingAction::New),
-                Action::Open => self.request_action(PendingAction::Open(None)),
+                // v5 §30: 新規タブを追加するだけで既存タブを破壊しないため
+                // `request_action`(未保存ガード)を経由しない
+                // (`begin_new_tab`/`begin_open_tab` のドキュメントコメント参照)。
+                Action::New => self.begin_new_tab(),
+                Action::Open => self.begin_open_tab(),
                 Action::Save => self.begin_save(),
                 Action::SaveAs => self.begin_save_as(),
 
-                Action::ZoomIn => self.view.zoom_in(),
-                Action::ZoomOut => self.view.zoom_out(),
-                Action::Zoom100 => self.view.zoom_to_100(),
-                Action::FitWindow => self.view.fit_to_window(&self.doc),
+                // v5 §30/§32: タブ切替(ARCHITECTURE.md §17.6)。
+                Action::NextTab => self.next_tab(),
+                Action::PrevTab => self.prev_tab(),
+                // v5 §30/§32(V5-M3): タブを閉じる(ARCHITECTURE.md §17.4)。
+                Action::CloseTab => self.close_tab(self.active_tab),
+
+                Action::ZoomIn => self.active_tab_mut().view.zoom_in(),
+                Action::ZoomOut => self.active_tab_mut().view.zoom_out(),
+                Action::Zoom100 => self.active_tab_mut().view.zoom_to_100(),
+                Action::FitWindow => {
+                    let tab = self.active_tab_mut();
+                    tab.view.fit_to_window(&tab.doc);
+                }
             }
         }
     }
@@ -1009,6 +1185,15 @@ impl DaraskApp {
     /// 一箇所に集約する。`set_tool` に加えて、レイヤー構造の変更・アクティブ
     /// レイヤーの切り替えの前にも呼ぶ)。
     fn commit_open_gesture(&mut self) {
+        // バグ修正: レイヤー名編集中の入力(`Tab::layer_rename`)も、浮動片や
+        // ストロークと全く同じ「先に確定してから実行」規則の対象にする
+        // (`commit_pending_layer_rename` のドキュメントコメント参照)。以前は
+        // ここで一切触れられておらず、ドキュメントを丸ごと差し替える一部の
+        // 経路(`reset_active_tab_document` 等)が単に `= None` で入力内容を
+        // 破棄するだけだった。ここで先に確定しておけば、それらの経路に
+        // 到達するより前に `doc.modified` が正しく立ち、未保存ガード
+        // (`request_action`)がリネームだけの変更も正しく検知できる。
+        self.commit_pending_layer_rename();
         // v3 §18: 移動(V)も選択と同じ `Selection`/`Floating` 浮動化パスを
         // 使う(`move_down`/`handle_move_event` 参照)ため、ここでも浮動片の
         // 確定を経由させる必要がある。そうしないと、移動ツールでドラッグ中に
@@ -1020,7 +1205,7 @@ impl DaraskApp {
         // 形状だけ)ため、ここでも同列に扱う。
         //
         // v4 §23/§24 で発見・修正したバグ: 以前はここで `commit_selection`
-        // (浮動片の確定に加え、無条件で `self.selection` もクリアする)を
+        // (浮動片の確定に加え、無条件で `self.active_tab().selection` もクリアする)を
         // 呼んでいたため、「M/Lasso/W で選択してから、ツールを切り替えて
         // グラデーション/色調補正を選択範囲に適用する」という SPEC §21 が
         // 前提とする最も基本的な使い方で、ツール切替(=このメソッドの呼び出し)
@@ -1043,11 +1228,11 @@ impl DaraskApp {
     /// 現在のツールに進行中のジェスチャ(ドラッグ)があれば、`Up` が来た
     /// 場合と同様に確定して終了する(`set_tool` からのみ呼ぶ)。
     fn end_active_gesture(&mut self) {
-        // v3 §19: テキストは `ToolCtx`(`self.doc`/`self.history` の借用)を
+        // v3 §19: テキストは `ToolCtx`(`self.active_tab().doc`/`self.active_tab().history` の借用)を
         // 経由しない独自の確定処理を持つ。`ToolCtx` を組み立てる前に分岐する
         // 必要がある — 確定処理自体が `&mut self` を要求するメソッド
         // (`commit_pending_text_edit_and_composite`)を呼ぶため、`ctx` が
-        // `self.doc`/`self.history` を借用したままだと借用チェッカーに
+        // `self.active_tab().doc`/`self.active_tab().history` を借用したままだと借用チェッカーに
         // 弾かれる。
         if self.tool == ToolKind::Text {
             self.commit_pending_text_edit_and_composite();
@@ -1067,9 +1252,18 @@ impl DaraskApp {
             return;
         }
         let mut used_colors = Vec::new();
+        // v5 §17.1: `active_tab_mut()` はメソッド呼び出しの向こう側にある
+        // ため、これを経由すると借用チェッカーは `*self` 全体が借用中だと
+        // 見なし、以後の `self.primary` 等の読み出しと衝突してしまう
+        // (Rust はメソッド境界を越えたフィールド単位の非交差借用を認識
+        // できない)。ここでは直接 `self.tabs[self.active_tab]` を経由して
+        // `Tab` への参照を 1 回だけ取り、以後は `tab.doc`/`tab.history`/
+        // `tab.selection` という直接のフィールドパスで分割借用する(同じ
+        // 手法を要する箇所すべてに共通)。
+        let tab = &mut self.tabs[self.active_tab];
         let mut ctx = ToolCtx {
-            doc: &mut self.doc,
-            history: &mut self.history,
+            doc: &mut tab.doc,
+            history: &mut tab.history,
             primary: self.primary,
             secondary: self.secondary,
             brush_size: self.brush_size,
@@ -1078,7 +1272,7 @@ impl DaraskApp {
             pencil: self.pencil_mode,
             smoothing: self.brush_smoothing as f32 / 100.0,
             used_colors: &mut used_colors,
-            clip: self.selection.as_ref().map(|s| &s.mask),
+            clip: tab.selection.as_ref().map(|s| &s.mask),
         };
         match self.tool {
             ToolKind::Pen => self.pen.cancel(&mut ctx),
@@ -1154,7 +1348,8 @@ impl DaraskApp {
     /// ブラシ半径(画像座標)をスクリーン論理ポイントへ換算する
     /// (ARCHITECTURE.md §15.1: `半径 = brush_r × zoom / ppp`)。
     fn brush_radius_screen(&self) -> f32 {
-        crate::tools::brush_radius(self.brush_size) * self.view.zoom / self.view.ppp()
+        crate::tools::brush_radius(self.brush_size) * self.active_tab().view.zoom
+            / self.active_tab().view.ppp()
     }
 
     /// SPEC §17: 「ブラシカーソル: キャンバス上ではブラシ半径の円アウトライン
@@ -1177,7 +1372,7 @@ impl DaraskApp {
         if radius_screen < 3.0 {
             return;
         }
-        let center = self.view.img_to_screen_pos(hover_img);
+        let center = self.active_tab().view.img_to_screen_pos(hover_img);
         painter.circle_stroke(
             center,
             radius_screen,
@@ -1191,14 +1386,14 @@ impl DaraskApp {
     }
 
     /// SPEC §16: 「ハンドルホバー時はリサイズカーソルを表示」。
-    /// `self.view.hover_img()` は前フレームのホバー位置(ステータスバーと
+    /// `self.active_tab().view.hover_img()` は前フレームのホバー位置(ステータスバーと
     /// 同じ 1 フレーム遅延、`status_bar::show` 呼び出し箇所のコメント参照)
     /// だが、連続したポインタ移動で駆動されるため実用上は無視できる。
     fn select_cursor(&self) -> egui::CursorIcon {
         if let Some(SelectDrag::ResizeFloating { handle, .. }) = &self.select_drag {
             return select::handle_cursor(*handle);
         }
-        if let Some(hover) = self.view.hover_img() {
+        if let Some(hover) = self.active_tab().view.hover_img() {
             if let Some(handle) = self.hit_resize_handle(hover) {
                 return select::handle_cursor(handle);
             }
@@ -1295,7 +1490,7 @@ impl DaraskApp {
                 if let ToolEvent::Down { img, button, mods } = ev {
                     if button == PointerButton::Primary {
                         let notches = if mods.alt { -1 } else { 1 };
-                        self.view.zoom_at_point(notches, img);
+                        self.active_tab_mut().view.zoom_at_point(notches, img);
                     }
                 }
                 continue;
@@ -1319,9 +1514,12 @@ impl DaraskApp {
             }
 
             let mut used_colors = Vec::new();
+            // v5 §17.1: `end_active_gesture` の `ctx` 組み立てと同じ理由で
+            // `self.tabs[self.active_tab]` を直接経由する(コメント参照)。
+            let tab = &mut self.tabs[self.active_tab];
             let mut ctx = ToolCtx {
-                doc: &mut self.doc,
-                history: &mut self.history,
+                doc: &mut tab.doc,
+                history: &mut tab.history,
                 primary: self.primary,
                 secondary: self.secondary,
                 brush_size: self.brush_size,
@@ -1330,7 +1528,7 @@ impl DaraskApp {
                 pencil: self.pencil_mode,
                 smoothing: self.brush_smoothing as f32 / 100.0,
                 used_colors: &mut used_colors,
-                clip: self.selection.as_ref().map(|s| &s.mask),
+                clip: tab.selection.as_ref().map(|s| &s.mask),
             };
             match self.tool {
                 ToolKind::Pen => self.pen.event(ev, &mut ctx),
@@ -1378,8 +1576,8 @@ impl DaraskApp {
         let y = img.y.floor() as i32;
         // このフレームでまだ合成に反映されていない編集があれば先に反映する
         // (canvas_view のテクスチャ更新はフレーム冒頭で一度だけ走るため)。
-        self.doc.recompose_if_dirty();
-        let Some(px) = self.doc.composite_pixel(x, y) else {
+        self.active_tab_mut().doc.recompose_if_dirty();
+        let Some(px) = self.active_tab().doc.composite_pixel(x, y) else {
             return;
         };
         let color = Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]);
@@ -1430,8 +1628,8 @@ impl DaraskApp {
         crate::document::IRect {
             x0: 0,
             y0: 0,
-            x1: self.doc.width as i32,
-            y1: self.doc.height as i32,
+            x1: self.active_tab().doc.width as i32,
+            y1: self.active_tab().doc.height as i32,
         }
     }
 
@@ -1481,10 +1679,16 @@ impl DaraskApp {
     /// 判定になる、SPEC §16 のハンドルサイズと同じ考え方)。
     fn lasso_polygon_click(&mut self, img: Pos2) {
         let now = Instant::now();
-        let screen_pos = self.view.img_to_screen_pos(img);
+        let screen_pos = self.active_tab().view.img_to_screen_pos(img);
         if let Some(state) = &mut self.lasso_polygon {
             if state.points.len() >= 3 {
-                let start_screen = self.view.img_to_screen_pos(state.points[0]);
+                // `state` は `self.lasso_polygon` を可変借用したままなので、
+                // `self.active_tab()`(メソッド呼び出しは `*self` 全体を
+                // 借用してしまう)ではなく直接 `self.tabs[..]` を経由して
+                // 借用チェッカーに非交差を示す。
+                let start_screen = self.tabs[self.active_tab]
+                    .view
+                    .img_to_screen_pos(state.points[0]);
                 if (screen_pos - start_screen).length() <= LASSO_CLOSE_DISTANCE {
                     let points = std::mem::take(&mut state.points);
                     self.lasso_polygon = None;
@@ -1530,8 +1734,9 @@ impl DaraskApp {
     /// なら選択を作らない(矩形選択の「単クリックは選択を残さない」と同じ
     /// 考え方)。
     fn finish_lasso_points(&mut self, points: Vec<Pos2>) {
-        let mask = select::polygon_mask(&points).clamp_to(self.doc.width, self.doc.height);
-        self.selection = if mask.is_empty() {
+        let mask = select::polygon_mask(&points)
+            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        self.active_tab_mut().selection = if mask.is_empty() {
             None
         } else {
             Some(Selection::new(mask))
@@ -1549,9 +1754,12 @@ impl DaraskApp {
         self.commit_selection();
         let x = img.x.floor() as i32;
         let y = img.y.floor() as i32;
-        let surface = self.doc.active_surface_mut(None);
+        // `self.magic_wand_tolerance` を同じ文で読むため、`active_tab_mut()`
+        // (`*self` 全体を借用してしまうメソッド呼び出し)ではなく直接
+        // `self.tabs[..]` を経由する(`lasso_polygon_click` と同じ理由)。
+        let surface = self.tabs[self.active_tab].doc.active_surface_mut(None);
         let mask = raster::flood_mask(&surface, x, y, self.magic_wand_tolerance);
-        self.selection = if mask.is_empty() {
+        self.active_tab_mut().selection = if mask.is_empty() {
             None
         } else {
             Some(Selection::new(mask))
@@ -1563,7 +1771,7 @@ impl DaraskApp {
             self.begin_resize_handle(handle, img);
             return;
         }
-        if let Some(floating) = &self.floating {
+        if let Some(floating) = &self.active_tab().floating {
             // 既に浮動中(前フレームまでの移動が未確定): クリック位置に
             // 関係なくそのまま追従を続ける(SPEC §18: ドラッグでレイヤー/
             // 選択範囲全体を動かす、選択ツールのような「範囲外クリックは
@@ -1578,6 +1786,7 @@ impl DaraskApp {
         // と同じく浮動化せず、undo エントリも積まない
         // (`select_drag_move`/`select_up` の `PendingFloating` 分岐参照)。
         let mask = self
+            .active_tab()
             .selection
             .as_ref()
             .map(|s| s.mask.clone())
@@ -1589,12 +1798,12 @@ impl DaraskApp {
     }
 
     /// 選択矩形・浮動片の外周にある矩形(画像座標)。どちらも無ければ `None`
-    /// (`self.floating`/`self.selection` は互いに排他、ARCHITECTURE.md §7)。
+    /// (`self.active_tab().floating`/`self.active_tab().selection` は互いに排他、ARCHITECTURE.md §7)。
     fn current_selection_or_floating_rect(&self) -> Option<crate::document::IRect> {
-        if let Some(floating) = &self.floating {
+        if let Some(floating) = &self.active_tab().floating {
             return Some(select::floating_target_rect(floating));
         }
-        self.selection.as_ref().map(|s| s.mask.bbox)
+        self.active_tab().selection.as_ref().map(|s| s.mask.bbox)
     }
 
     /// `img`(画像座標)がどのスケールハンドルに当たっているか
@@ -1606,22 +1815,22 @@ impl DaraskApp {
         if rect.is_empty() {
             return None;
         }
-        let screen_rect = self.view.img_rect_to_screen(rect);
+        let screen_rect = self.active_tab().view.img_rect_to_screen(rect);
         let handles = select::handle_rects(screen_rect);
-        let screen_pos = self.view.img_to_screen_pos(img);
+        let screen_pos = self.active_tab().view.img_to_screen_pos(img);
         select::hit_handle(&handles, screen_pos)
     }
 
     /// ハンドルドラッグを開始する。未浮動の選択でハンドルを掴んだ場合は、
     /// 内部ドラッグと同様にまず浮動化してから拡縮する(SPEC §16)。
     fn begin_resize_handle(&mut self, handle: select::Handle, img: Pos2) {
-        if self.floating.is_none() {
-            let Some(mask) = self.selection.as_ref().map(|s| s.mask.clone()) else {
+        if self.active_tab().floating.is_none() {
+            let Some(mask) = self.active_tab().selection.as_ref().map(|s| s.mask.clone()) else {
                 return;
             };
             self.begin_floating_from_selection(mask, img);
         }
-        let Some(floating) = &self.floating else {
+        let Some(floating) = &self.active_tab().floating else {
             return;
         };
         let (fx, fy) = handle.fraction();
@@ -1654,7 +1863,7 @@ impl DaraskApp {
         img: Pos2,
         lock_aspect: bool,
     ) {
-        let Some(floating) = self.floating.as_ref() else {
+        let Some(floating) = self.active_tab().floating.as_ref() else {
             return;
         };
         let (new_pos, new_w, new_h) = select::resize_floating_rect(
@@ -1694,7 +1903,7 @@ impl DaraskApp {
         } else {
             None
         };
-        let Some(floating) = self.floating.as_mut() else {
+        let Some(floating) = self.active_tab_mut().floating.as_mut() else {
             return;
         };
         if let Some((pixels, mask, id)) = resampled {
@@ -1712,7 +1921,7 @@ impl DaraskApp {
             self.begin_resize_handle(handle, img);
             return;
         }
-        if let Some(floating) = &self.floating {
+        if let Some(floating) = &self.active_tab().floating {
             let bounds = select::floating_target_rect(floating);
             if select::rect_contains(bounds, img) {
                 let offset = img - floating.pos;
@@ -1723,7 +1932,7 @@ impl DaraskApp {
             // 扱う(SPEC §6: 「選択外クリック」で確定)。
             self.commit_selection();
         }
-        if let Some(selection) = &self.selection {
+        if let Some(selection) = &self.active_tab().selection {
             if select::point_in_mask(&selection.mask, img) {
                 // M4 で発見・修正したバグ: ここで即座に `begin_floating_from_
                 // selection` を呼んでいたため、ドラッグせずに離すだけの
@@ -1739,7 +1948,7 @@ impl DaraskApp {
                 return;
             }
         }
-        self.selection = None;
+        self.active_tab_mut().selection = None;
         self.select_drag = Some(SelectDrag::NewSelection {
             start: img,
             current: img,
@@ -1764,7 +1973,7 @@ impl DaraskApp {
                 self.select_drag = Some(SelectDrag::NewSelection { start, current });
             }
             Some(SelectDrag::MoveFloating { offset }) => {
-                if let Some(floating) = &mut self.floating {
+                if let Some(floating) = &mut self.active_tab_mut().floating {
                     floating.pos = img - offset;
                 }
                 self.select_drag = Some(SelectDrag::MoveFloating { offset });
@@ -1833,7 +2042,7 @@ impl DaraskApp {
                 // Shift の状態を運ばないため、`apply_resize_floating` と
                 // 同じ「離す瞬間の数ピクセルのズレは無視する」割り切り)。
                 let end = if current != start { current } else { img };
-                self.selection = if end == start {
+                self.active_tab_mut().selection = if end == start {
                     None
                 } else {
                     // v4 レビューで発見・修正したバグ: 以前はここで先に
@@ -1858,7 +2067,8 @@ impl DaraskApp {
                     } else {
                         select::rect_mask(rect)
                     };
-                    let mask = mask.clamp_to(self.doc.width, self.doc.height);
+                    let mask =
+                        mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
                     if mask.is_empty() {
                         None
                     } else {
@@ -1867,7 +2077,7 @@ impl DaraskApp {
                 };
             }
             Some(SelectDrag::MoveFloating { offset }) => {
-                if let Some(floating) = &mut self.floating {
+                if let Some(floating) = &mut self.active_tab_mut().floating {
                     floating.pos = img - offset;
                 }
             }
@@ -1891,22 +2101,26 @@ impl DaraskApp {
     /// にしておき、確定時(`commit_selection`)に「切り出し元の透明化+合成先」
     /// をまとめて 1 つの `Patch` にする(ARCHITECTURE.md §7)。
     fn begin_floating_from_selection(&mut self, mask: crate::document::SelMask, img: Pos2) {
-        let mask = mask.clamp_to(self.doc.width, self.doc.height);
+        let mask = mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         let rect = mask.bbox;
         if rect.is_empty() {
-            self.selection = None;
+            self.active_tab_mut().selection = None;
             return;
         }
-        self.history.begin_stroke(self.doc.active);
-        self.history.ensure_tiles_saved(&self.doc, rect);
-        let pixels = select::extract_region(&self.doc, &mask);
-        select::clear_region_transparent(&mut self.doc, &mask);
-        self.doc.modified = true;
+        // `history`/`doc` を同時に触るため、`self.tabs[..]` を直接経由する
+        // (`active_tab_mut()` を複数回呼ぶと `*self` の二重可変借用になる、
+        // `end_active_gesture` のコメント参照)。
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
+        tab.history.ensure_tiles_saved(&tab.doc, rect);
+        let pixels = select::extract_region(&tab.doc, &mask);
+        select::clear_region_transparent(&mut tab.doc, &mask);
+        tab.doc.modified = true;
 
         let pos = pos2(rect.x0 as f32, rect.y0 as f32);
         let id = self.alloc_floating_id();
         let mask_bits = mask.mask.clone();
-        self.floating = Some(Floating::new(
+        self.active_tab_mut().floating = Some(Floating::new(
             pixels,
             rect.width() as u32,
             rect.height() as u32,
@@ -1915,7 +2129,7 @@ impl DaraskApp {
             Some(mask),
             id,
         ));
-        self.selection = None;
+        self.active_tab_mut().selection = None;
         let offset = img - pos;
         self.select_drag = Some(SelectDrag::MoveFloating { offset });
     }
@@ -1931,21 +2145,22 @@ impl DaraskApp {
     /// (単なる矩形選択だけ、または何も無い)場合は選択を解除するだけ。
     fn commit_selection(&mut self) {
         self.flush_floating_keep_selection();
-        self.selection = None;
+        self.active_tab_mut().selection = None;
     }
 
     /// `commit_selection` から浮動片の確定処理だけを切り出したもの
-    /// (`self.selection` はクリアしない)。SPEC §21 の「選択がある間は他
+    /// (`self.active_tab().selection` はクリアしない)。SPEC §21 の「選択がある間は他
     /// ツールの描画をクリップし続ける」を満たすため、まだ浮動化していない
     /// プレーンな選択を保持したまま浮動片だけを確定したい呼び出し元
     /// (`commit_open_gesture`、`free_transform` と同じ理由)向け。
     fn flush_floating_keep_selection(&mut self) {
         self.select_drag = None;
-        if let Some(floating) = self.floating.take() {
+        if let Some(floating) = self.active_tab_mut().floating.take() {
             let target = select::floating_target_rect(&floating);
-            self.history.ensure_tiles_saved(&self.doc, target);
-            select::composite_floating(&mut self.doc, &floating);
-            self.history.commit_stroke(&mut self.doc);
+            let tab = &mut self.tabs[self.active_tab];
+            tab.history.ensure_tiles_saved(&tab.doc, target);
+            select::composite_floating(&mut tab.doc, &floating);
+            tab.history.commit_stroke(&mut tab.doc);
         }
     }
 
@@ -1962,7 +2177,7 @@ impl DaraskApp {
     /// ストロークを破棄するだけでよい。
     fn cancel_floating(&mut self) {
         self.select_drag = None;
-        if let Some(floating) = self.floating.take() {
+        if let Some(floating) = self.active_tab_mut().floating.take() {
             if let Some(cut_from) = floating.cut_from {
                 // v4 §16.3: `cut_from` は `SelMask` になったが、復元は
                 // `bbox` 全体をタイルから一括コピーするだけでよい —
@@ -1971,17 +2186,18 @@ impl DaraskApp {
                 // bbox 全体を復元してもマスク外は「既に元の値のまま」で
                 // 変化しない(ARCHITECTURE.md §16.1 のタイル一括コピーと
                 // 同じ考え方を維持できる)。
-                self.history
-                    .restore_stroke_region(&mut self.doc, cut_from.bbox);
+                let tab = &mut self.tabs[self.active_tab];
+                tab.history
+                    .restore_stroke_region(&mut tab.doc, cut_from.bbox);
             }
         }
-        self.history.cancel_stroke();
-        self.selection = None;
+        self.active_tab_mut().history.cancel_stroke();
+        self.active_tab_mut().selection = None;
     }
 
     /// v4 レビューで発見・修正したバグ: `Action`/`MenuAction` の
     /// Undo/Redo は `commit_open_gesture` 後に `history.undo`/`redo` を
-    /// 呼ぶだけで、`self.selection` のクランプ/解除を一切行っていなかった。
+    /// 呼ぶだけで、`self.active_tab().selection` のクランプ/解除を一切行っていなかった。
     /// `HistoryOp::ReplaceAll`(サイズ変更/キャンバスサイズ変更/トリミング/
     /// 回転)を undo/redo するとドキュメント寸法が変わるが、選択はそのまま
     /// 残るため、古い(縮んだ後の寸法から見て範囲外の)座標を指した選択が
@@ -1995,9 +2211,11 @@ impl DaraskApp {
     /// 一般的な undo/redo(ブラシの Patch 等)ではクランプは恒等写像になり
     /// コストもほぼゼロ。
     fn clamp_selection_to_doc(&mut self) {
-        if let Some(selection) = &self.selection {
-            let clamped = selection.mask.clamp_to(self.doc.width, self.doc.height);
-            self.selection = if clamped.is_empty() {
+        if let Some(selection) = &self.active_tab().selection {
+            let clamped = selection
+                .mask
+                .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+            self.active_tab_mut().selection = if clamped.is_empty() {
                 None
             } else {
                 Some(Selection::new(clamped))
@@ -2012,12 +2230,12 @@ impl DaraskApp {
         // 進行中のジェスチャを先に確定する。ただし選択/移動ツールで「まだ
         // 浮動化していないプレーンな選択」がある場合は、Ctrl+T がまさに
         // それを対象にするため、`commit_open_gesture`/`commit_selection`
-        // (常に `self.selection` をクリアしてしまう)を経由させずに残す
+        // (常に `self.active_tab().selection` をクリアしてしまう)を経由させずに残す
         // (ARCHITECTURE.md §15.2: 「選択範囲があれば浮動化して」を壊さない
         // ため)。
         match self.tool {
             ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move
-                if self.floating.is_some() =>
+                if self.active_tab().floating.is_some() =>
             {
                 self.commit_selection();
             }
@@ -2033,11 +2251,12 @@ impl DaraskApp {
         self.tool = ToolKind::Select;
 
         let mask = self
+            .active_tab()
             .selection
             .as_ref()
             .map(|s| s.mask.clone())
             .unwrap_or_else(|| select::rect_mask(self.doc_full_rect()));
-        let mask = mask.clamp_to(self.doc.width, self.doc.height);
+        let mask = mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         if mask.is_empty() {
             return;
         }
@@ -2067,29 +2286,35 @@ impl DaraskApp {
     fn delete_selection(&mut self) {
         self.end_active_gesture();
         self.select_drag = None;
-        if self.floating.take().is_some() {
-            self.history.commit_stroke(&mut self.doc);
-            self.selection = None;
+        if self.active_tab_mut().floating.take().is_some() {
+            let tab = &mut self.tabs[self.active_tab];
+            tab.history.commit_stroke(&mut tab.doc);
+            self.active_tab_mut().selection = None;
             return;
         }
-        if let Some(selection) = self.selection.take() {
-            let mask = selection.mask.clamp_to(self.doc.width, self.doc.height);
+        if let Some(selection) = self.active_tab_mut().selection.take() {
+            let mask = selection
+                .mask
+                .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
             if !mask.is_empty() {
-                self.history.begin_stroke(self.doc.active);
-                self.history.ensure_tiles_saved(&self.doc, mask.bbox);
-                select::clear_region_transparent(&mut self.doc, &mask);
-                self.history.commit_stroke(&mut self.doc);
+                let tab = &mut self.tabs[self.active_tab];
+                tab.history.begin_stroke(tab.doc.active);
+                tab.history.ensure_tiles_saved(&tab.doc, mask.bbox);
+                select::clear_region_transparent(&mut tab.doc, &mask);
+                tab.history.commit_stroke(&mut tab.doc);
             }
         }
     }
 
     /// 現在の選択(浮動片優先)の画素を取得する。無ければ `None`。
     fn selected_pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
-        if let Some(floating) = &self.floating {
+        if let Some(floating) = &self.active_tab().floating {
             return Some((floating.w, floating.h, floating.pixels.clone()));
         }
-        if let Some(selection) = &self.selection {
-            let mask = selection.mask.clamp_to(self.doc.width, self.doc.height);
+        if let Some(selection) = &self.active_tab().selection {
+            let mask = selection
+                .mask
+                .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
             if mask.is_empty() {
                 return None;
             }
@@ -2097,7 +2322,7 @@ impl DaraskApp {
             return Some((
                 rect.width() as u32,
                 rect.height() as u32,
-                select::extract_region(&self.doc, &mask),
+                select::extract_region(&self.active_tab().doc, &mask),
             ));
         }
         None
@@ -2139,16 +2364,17 @@ impl DaraskApp {
     /// Ctrl+A(SPEC §6: 全選択)。既存の浮動片は先に確定する。
     fn select_all(&mut self) {
         self.commit_selection();
-        if self.doc.width == 0 || self.doc.height == 0 {
-            self.selection = None;
+        if self.active_tab().doc.width == 0 || self.active_tab().doc.height == 0 {
+            self.active_tab_mut().selection = None;
             return;
         }
-        self.selection = Some(Selection::new(select::rect_mask(crate::document::IRect {
-            x0: 0,
-            y0: 0,
-            x1: self.doc.width as i32,
-            y1: self.doc.height as i32,
-        })));
+        self.active_tab_mut().selection =
+            Some(Selection::new(select::rect_mask(crate::document::IRect {
+                x0: 0,
+                y0: 0,
+                x1: self.active_tab().doc.width as i32,
+                y1: self.active_tab().doc.height as i32,
+            })));
     }
 
     /// SPEC §6: 「ドキュメントが完全に未編集・未保存(起動直後の白紙)」の
@@ -2156,7 +2382,7 @@ impl DaraskApp {
     /// (`History::commit_stroke` が実際に何かを push したことがない)ことを
     /// もって「白紙」とみなす。
     fn doc_is_pristine(&self) -> bool {
-        self.doc.path.is_none() && !self.doc.modified
+        self.active_tab().doc.path.is_none() && !self.active_tab().doc.modified
     }
 
     /// Ctrl+V(SPEC §6)。
@@ -2217,7 +2443,7 @@ impl DaraskApp {
     /// パッチが選択の浮動片ハンドリング(`handle_select_event`)へ向かい、
     /// 他ツールの `begin_stroke` に晒されなくなる。
     fn begin_paste_floating(&mut self, w: u32, h: u32, pixels: Vec<u8>) {
-        let center = self.view.view_center_img();
+        let center = self.active_tab().view.view_center_img();
         let pos = pos2(center.x - w as f32 / 2.0, center.y - h as f32 / 2.0);
         self.place_new_floating(pos, w, h, pixels);
     }
@@ -2244,75 +2470,100 @@ impl DaraskApp {
         // 切り出し元が無いので `begin_stroke` するだけで `ensure_tiles_saved`
         // は呼ばない(confirm 時に合成先だけ保存すれば十分、
         // `commit_selection` 参照)。
-        self.history.begin_stroke(self.doc.active);
-        self.floating = Some(Floating::new_rect(pixels, w, h, pos, None, id));
-        self.selection = None;
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
+        self.active_tab_mut().floating = Some(Floating::new_rect(pixels, w, h, pos, None, id));
+        self.active_tab_mut().selection = None;
         // M4 で発見・修正したバグ: 浮動片は画面に見えている未保存の変更
         // だが、以前は `commit_selection` で合成されるまで `doc.modified` が
         // 立たなかった。このため貼り付け直後にウィンドウを閉じる/新規/開く
         // (`handle_close_request`/`request_action` はいずれも
         // `doc.modified` だけを見る)と、確認なしに貼り付け内容が破棄
         // されていた(SPEC §8 の未保存ガードの趣旨に反する)。
-        self.doc.modified = true;
+        self.active_tab_mut().doc.modified = true;
     }
 
     /// SPEC §6: 白紙時の置き換え貼り付け。ドキュメント全体を貼り付け画像の
     /// サイズに置き換える(スクリーンショット→保存が最短になるように)。
     /// SPEC §13: 新規作成直後と同様「背景」レイヤー 1 枚になる。
     fn replace_document_with_pasted_image(&mut self, w: u32, h: u32, pixels: Vec<u8>) {
-        let before = self.doc.snapshot();
-        self.doc.replace_with_single_layer(w, h, pixels);
-        self.doc.modified = true;
-        let after = self.doc.snapshot();
-        self.history.push(HistoryOp::ReplaceAll { before, after });
-        self.layer_rename = None;
-        self.next_layer_number = 1;
+        // バグ修正: レイヤー名編集中の入力を確定する処理は、呼び出し元の
+        // `paste_pixels` が先頭で呼ぶ `commit_open_gesture()`(実体は
+        // `commit_pending_layer_rename`。ドキュメントコメント参照)が既に
+        // 行っている。そこで確定されて `doc.modified` が立てば
+        // `doc_is_pristine()` が偽になり、そもそもこの関数(白紙置き換え)
+        // ではなく `begin_paste_floating` の経路を通るようになる —
+        // 「編集中のレイヤー名」も §6 の「完全に未編集」の判定に含まれる
+        // べきものとして扱われる。
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut()
+            .doc
+            .replace_with_single_layer(w, h, pixels);
+        self.active_tab_mut().doc.modified = true;
+        let after = self.active_tab().doc.snapshot();
+        self.active_tab_mut()
+            .history
+            .push(HistoryOp::ReplaceAll { before, after });
+        self.active_tab_mut().next_layer_number = 1;
         self.reset_tool_state_for_new_document();
     }
 
     fn draw_selection_overlay(&mut self, painter: &egui::Painter) {
         if let Some(SelectDrag::NewSelection { start, current }) = &self.select_drag {
             let rect = select::irect_from_points(*start, *current);
-            self.view.draw_selection_outline(painter, rect);
+            self.active_tab().view.draw_selection_outline(painter, rect);
             return;
         }
         // v4 §22: なげなわの進行中の軌跡/頂点列(確定前のプレビュー)。
         if self.tool == ToolKind::Lasso {
             if !self.lasso_freehand_points.is_empty() {
-                self.view
+                self.active_tab()
+                    .view
                     .draw_lasso_preview(painter, &self.lasso_freehand_points);
                 return;
             }
             if let Some(state) = &self.lasso_polygon {
-                self.view.draw_lasso_preview(painter, &state.points);
+                self.active_tab()
+                    .view
+                    .draw_lasso_preview(painter, &state.points);
                 return;
             }
         }
-        if let Some(floating) = self.floating.as_ref() {
-            self.view.draw_floating(painter, floating);
+        // `draw_floating` は `&mut CanvasView` を要求する一方、`floating` は
+        // 同じ `Tab` の別フィールドを不変借用したまま参照し続けるため、
+        // `self.tabs[..]` を直接経由して単一の `&mut Tab` からフィールドを
+        // 分割借用する(`active_tab()`/`active_tab_mut()` を混在させると
+        // `*self` の借用が競合する)。
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(floating) = tab.floating.as_ref() {
+            tab.view.draw_floating(painter, floating);
             let bounds = select::floating_target_rect(floating);
-            self.view.draw_selection_outline(painter, bounds);
-            self.view.draw_resize_handles(painter, bounds);
+            tab.view.draw_selection_outline(painter, bounds);
+            tab.view.draw_resize_handles(painter, bounds);
             return;
         }
-        if let Some(selection) = &self.selection {
+        if let Some(selection) = &self.active_tab().selection {
             // v4 §16.3: 矩形限定の `draw_selection_outline` ではなく、選択
             // 確定時に 1 回だけ計算済みのマスク境界線分(`Selection::
             // boundary`)を描く(既存の矩形選択は 4 本の線分になるので見た目
             // は変わらない、ARCHITECTURE.md §16.10-1)。
-            self.view
+            self.active_tab()
+                .view
                 .draw_selection_mask_outline(painter, &selection.boundary);
-            self.view.draw_resize_handles(painter, selection.mask.bbox);
+            self.active_tab()
+                .view
+                .draw_resize_handles(painter, selection.mask.bbox);
         }
     }
 
     /// ステータスバーの「選択サイズ」欄(SPEC §3)。浮動片があればその
     /// サイズ、無ければ選択矩形のサイズ。
     fn current_selection_size(&self) -> Option<(u32, u32)> {
-        if let Some(floating) = &self.floating {
+        if let Some(floating) = &self.active_tab().floating {
             return Some((floating.w, floating.h));
         }
-        self.selection
+        self.active_tab()
+            .selection
             .as_ref()
             .map(|s| (s.mask.bbox.width() as u32, s.mask.bbox.height() as u32))
     }
@@ -2439,11 +2690,12 @@ impl DaraskApp {
         // (`canvas_view` のテクスチャキャッシュには載らない)。
         let floating = Floating::new_rect(pixels, w, h, state.pos, None, 0);
         let target = select::floating_target_rect(&floating);
-        self.history.begin_stroke(self.doc.active);
-        self.history.ensure_tiles_saved(&self.doc, target);
-        select::composite_floating(&mut self.doc, &floating);
-        self.history.commit_stroke(&mut self.doc);
-        self.doc.modified = true;
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
+        tab.history.ensure_tiles_saved(&tab.doc, target);
+        select::composite_floating(&mut tab.doc, &floating);
+        tab.history.commit_stroke(&mut tab.doc);
+        tab.doc.modified = true;
         self.push_recent_color(self.primary);
     }
 
@@ -2460,11 +2712,12 @@ impl DaraskApp {
             mut buffer,
             needs_focus,
         } = state;
-        let screen_pos = self.view.img_to_screen_pos(pos);
+        let screen_pos = self.active_tab().view.img_to_screen_pos(pos);
         // ARCHITECTURE.md §15.3: 「表示フォントサイズ ≈ size × zoom / ppp
         // (プレビューは近似で可、上限あり)」。
-        let display_size = (self.text_font_size * self.view.zoom / self.view.ppp())
-            .clamp(TEXT_PREVIEW_MIN_PX, TEXT_PREVIEW_MAX_PX);
+        let display_size = (self.text_font_size * self.active_tab().view.zoom
+            / self.active_tab().view.ppp())
+        .clamp(TEXT_PREVIEW_MIN_PX, TEXT_PREVIEW_MAX_PX);
         let color = self.primary;
 
         let mut lost_focus = false;
@@ -2474,7 +2727,7 @@ impl DaraskApp {
             // その領域だけクリックを占有させる(SPEC §19: 「ボックス外
             // クリック」で確定 ⇔ ボックス内クリックは編集続行)。
             .order(egui::Order::Foreground);
-        let viewport = self.view.viewport_rect();
+        let viewport = self.active_tab().view.viewport_rect();
         if viewport.width() > 0.0 && viewport.height() > 0.0 {
             // v3 レビューで発見・修正したバグ: `constrain` を指定しないと
             // egui 0.35 の既定 `constrain_to(ctx.content_rect())`
@@ -2539,24 +2792,28 @@ impl DaraskApp {
         }
     }
 
-    /// D&D でファイルが落とされたら、未保存ガードを通して開く(SPEC §8)。
+    /// D&D でファイルが落とされたら新規タブとして開く(SPEC §30: 「ドラッグ
+    /// &ドロップ…からのオープンも同じ規則に従う。複数ファイルを同時ドロップ
+    /// した場合は複数タブを開く」)。新規タブの追加は既存タブを破壊しない
+    /// ため、v1〜v4 と異なり未保存ガードは不要(`open_path_in_new_tab` 参照)。
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         if self.modal.is_some() {
-            // 他のモーダル(新規/サイズ変更ダイアログ等)が表示中に
-            // ドキュメントを差し替えるとモーダルの状態と食い違うため、
-            // 何もしない(モーダルを閉じてから再度ドロップしてもらう)。
+            // 他のモーダル(新規/サイズ変更ダイアログ等)が表示中に新規タブを
+            // 追加するとモーダルの状態と食い違うため、何もしない(モーダルを
+            // 閉じてから再度ドロップしてもらう)。
             return;
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(path) = dropped.into_iter().find_map(|f| f.path) {
-            self.request_action(PendingAction::Open(Some(path)));
+        for path in dropped.into_iter().filter_map(|f| f.path) {
+            self.open_path_in_new_tab(path);
         }
     }
 
-    /// ウィンドウの閉じる要求(SPEC §8: 未保存変更ガード)。
-    /// `close_requested` は検知したフレーム内で即座に
-    /// `ViewportCommand::CancelClose` を送る必要がある(ARCHITECTURE.md
-    /// §12-2)。変更が無ければキャンセルせずそのまま閉じさせる。
+    /// ウィンドウの閉じる要求(SPEC §8: 未保存変更ガード、v5 §17.4: 「タブ
+    /// ごとに順番に確認ダイアログを出す」)。`close_requested` は検知した
+    /// フレーム内で即座に `ViewportCommand::CancelClose` を送る必要がある
+    /// (ARCHITECTURE.md §12-2)。**どのタブにも**変更が無ければキャンセル
+    /// せずそのまま閉じさせる。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if !close_requested {
@@ -2565,28 +2822,43 @@ impl DaraskApp {
         // v3 レビューで発見・修正したバグ: テキスト編集中(まだ確定して
         // いない入力ボックス)は `begin_text_edit`/入力中のバッファ更新の
         // どちらも `doc.modified` を立てないため、以前はここで即座に
-        // `!self.doc.modified` を見て未保存ガードを素通りし、確認なしに
+        // `!self.active_tab().doc.modified` を見て未保存ガードを素通りし、確認なしに
         // 入力中のテキストが失われていた(SPEC §8 の未保存ガードの趣旨に
         // 反する)。他の「先に確定してから実行」規則(SPEC §13 最終項、
         // `commit_open_gesture` のドキュメントコメント参照)と同じく、
         // `doc.modified` を見る前にここで確定させる。
         self.commit_open_gesture();
-        if !self.doc.modified {
+        // v5 §17.4: 「ウィンドウを閉じる操作は、未保存のタブがあれば
+        // タブごとに順番に確認ダイアログを出す」— アクティブタブだけでなく
+        // **全タブ**を見る(v1〜v4 は単一ドキュメントだったので
+        // `active_tab().doc.modified` だけで足りていたが、v5 ではそれだけ
+        // だと非アクティブな未保存タブが確認なしに失われてしまう)。
+        if !self.tabs.iter().any(|tab| tab.doc.modified) {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if self.modal.is_none() {
-            self.pending_action = Some(PendingAction::Close);
-            self.modal = Some(ModalState::ConfirmUnsaved);
-        } else {
+            self.begin_quit();
+        } else if self.pending_action.is_none() {
             // M4 で発見・修正したバグ: 以前は別のモーダル(画像サイズ変更等)
             // が表示中に閉じる要求が来ると、ここで何もせずに握りつぶして
             // いた(`CancelClose` は送るのでプロセスは終了しないが、
             // ユーザーには「閉じられない理由」が一切示されず、そのモーダルを
-            // 閉じた後も再度確認は出なかった)。`pending_action` だけを
-            // 予約しておき、`show_modal` がそのモーダルを閉じたタイミングで
-            // 未保存確認へ引き継ぐ(SPEC §8「閉じる前に保存確認」の趣旨)。
-            self.pending_action = Some(PendingAction::Close);
+            // 閉じた後も再度確認は出なかった)。`pending_action` に空の
+            // キューを予約しておき、`show_modal` がそのモーダルを閉じた
+            // タイミングで `resume_queued_close_after_modal` 経由で
+            // `begin_quit()`(全タブを再計算)へ引き継ぐ(SPEC §8「閉じる前に
+            // 保存確認」の趣旨)。
+            //
+            // `self.pending_action.is_none()` を条件にしているのは、既に
+            // 別の未保存確認(`CloseTab(idx)`/`CloseLastTab` — 例えば
+            // Ctrl+W で個別タブの確認モーダルが出ている最中に、さらに
+            // ウィンドウの × も押された、という稀な二重要求)が進行中の
+            // ときにそれを上書きして壊さないため。この場合は今回の閉じる
+            // 要求を静かに諦める(そのタブの確認が終わった後、もう一度
+            // ウィンドウを閉じてもらえば `self.modal.is_none()` の分岐に
+            // 入れる)。
+            self.pending_action = Some(PendingAction::CloseAllTabs(VecDeque::new()));
         }
     }
 
@@ -2599,7 +2871,7 @@ impl DaraskApp {
         match request {
             DialogRequest::OpenFile => {
                 if let Some(path) = io::open_dialog() {
-                    self.open_path(path);
+                    self.open_path_in_new_tab(path);
                 }
             }
             DialogRequest::SaveAs => {
@@ -2615,31 +2887,37 @@ impl DaraskApp {
         }
     }
 
+    /// SPEC §30: 「無題」タブの既定保存名も番号付けに追随させる(タブの
+    /// ラベルと同じ情報源、`Tab::label` 参照)。
     fn default_save_file_name(&self) -> String {
-        match &self.doc.path {
+        match &self.active_tab().doc.path {
             Some(p) => p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "無題.png".to_owned()),
-            None => "無題.png".to_owned(),
+            None => format!("{}.png", self.active_tab().label()),
         }
     }
 
-    /// 未保存ガードを通してからアクションを実行する(SPEC §8)。
+    /// 未保存ガードを通してからアクションを実行する(SPEC §8)。v5 時点では
+    /// `PendingAction::CloseLastTab`(SPEC §30: 「最後の 1 タブを閉じようと
+    /// した場合」)のみがこれを経由する — Ctrl+N/Ctrl+O は新規タブを追加
+    /// するだけで既存タブを破壊しないためこの関数を経由しない
+    /// (`begin_new_tab`/`begin_open_tab` 参照)。`CloseTab(usize)` は
+    /// 「該当タブをアクティブ化してから確認する」という追加のひと手間が
+    /// 要るため `close_tab` が独自に処理し、`CloseAllTabs` は `begin_quit`/
+    /// `continue_closing_all_tabs` が独自に処理する(いずれもこの汎用関数は
+    /// 経由しない)。
     fn request_action(&mut self, action: PendingAction) {
         // v3 レビューで発見・修正したバグ: テキスト編集中は `doc.modified`
-        // が立たないため、以前はここで `!self.doc.modified` を素通りして
-        // しまい、特に D&D(`handle_dropped_files` はキーボードフォーカスを
-        // 問わないため、`ctx.egui_wants_keyboard_input()` でテキスト編集中
-        // 無効になる Ctrl+N/Ctrl+O のショートカットと違って素通しする)で
-        // 編集中のドキュメントごと差し替わってしまい、旧ドキュメントの
-        // 編集ボックスが新ドキュメント上に取り残されていた。ツール切替と
-        // 同じ「先に確定」規則(SPEC §13 最終項)をここでも適用し、
-        // `doc.modified` の判定より前に確定させる(確定した内容が実際に
-        // ドキュメントを変えていれば `doc.modified` が立ち、未保存ガードも
-        // 正しく発動するようになる)。
+        // が立たないため、以前はここで `!self.active_tab().doc.modified` を
+        // 素通りしてしまい、編集中のドキュメントごと差し替わってしまう
+        // ことがあった。ツール切替と同じ「先に確定」規則(SPEC §13 最終項)
+        // をここでも適用し、`doc.modified` の判定より前に確定させる
+        // (確定した内容が実際にドキュメントを変えていれば `doc.modified`
+        // が立ち、未保存ガードも正しく発動するようになる)。
         self.commit_open_gesture();
-        if self.doc.modified {
+        if self.active_tab().doc.modified {
             self.pending_action = Some(action);
             self.modal = Some(ModalState::ConfirmUnsaved);
         } else {
@@ -2652,17 +2930,88 @@ impl DaraskApp {
     fn execute_pending_action(&mut self, action: PendingAction) {
         self.commit_selection();
         match action {
-            PendingAction::New => {
+            // SPEC §30: 「最後の 1 タブを閉じようとした場合…「新規」と同じ
+            // 扱い(未保存ガードを通してから内容を白紙に戻す)」。通常の
+            // Ctrl+N(`begin_new_tab`)と同じ「新規」ダイアログを経由するが、
+            // `replace_active: true` によりタブを追加せずその場で置き換える
+            // (`confirm_new` 参照)。
+            PendingAction::CloseLastTab => {
                 self.modal = Some(ModalState::New {
                     width: DEFAULT_NEW_WIDTH,
                     height: DEFAULT_NEW_HEIGHT,
                     background: Background::White,
+                    replace_active: true,
                 });
             }
-            PendingAction::Open(Some(path)) => self.open_path(path),
-            PendingAction::Open(None) => self.pending_dialog = Some(DialogRequest::OpenFile),
-            PendingAction::Close => self.exit_process(),
+            // v5 §17.4: `close_tab` が確認前に既にそのタブをアクティブ化
+            // 済み(`switch_tab(index)`)なので、`index` はここでもまだ
+            // 正しいタブを指す(確認モーダル表示中は他のタブ操作が割り込め
+            // ないため index がずれる余地はない)。
+            PendingAction::CloseTab(index) => {
+                self.remove_tab_and_adjust_active(index);
+            }
+            // v5 §17.4: 「先頭から 1 つずつ確認フローを回す」の続きを行う。
+            PendingAction::CloseAllTabs(queue) => {
+                self.continue_closing_all_tabs(queue);
+            }
         }
+    }
+
+    /// `close_tab`/`execute_pending_action(CloseTab)` の両方が使う、実際に
+    /// `tabs` から取り除いて `active_tab` を整合させる処理(ARCHITECTURE.md
+    /// §17.8-3: 「境界チェックを怠らない」)。
+    fn remove_tab_and_adjust_active(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(index);
+        if self.active_tab > index {
+            self.active_tab -= 1;
+        } else if self.active_tab == index {
+            // 閉じたタブがアクティブだった場合、同じ位置に来たタブ(元の
+            // 1 つ後ろ、無ければ最後)をアクティブにする(ブラウザのタブと
+            // 同じ挙動)。
+            self.active_tab = index.min(self.tabs.len() - 1);
+        }
+    }
+
+    /// v5 §17.4(ARCHITECTURE.md §17.4): ウィンドウを閉じる/アプリを終了
+    /// する唯一の入口。`MenuAction::Exit`・`handle_close_request`(モーダル
+    /// 非表示時)・`resume_queued_close_after_modal` の 3 箇所から呼ぶ。
+    /// 未保存タブが 1 つも無ければ確認なしで即座に終了する。
+    fn begin_quit(&mut self) {
+        self.commit_open_gesture();
+        let modified_tabs: VecDeque<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.doc.modified)
+            .map(|(index, _)| index)
+            .collect();
+        self.continue_closing_all_tabs(modified_tabs);
+    }
+
+    /// v5 §17.4: 「未保存のタブがあればタブごとに順番に確認ダイアログを
+    /// 出す」の本体。`queue` の先頭から順に未保存タブを確認する(1 枚ずつ
+    /// `ConfirmUnsaved` モーダルを出し、保存/破棄されたら次へ進む)。
+    /// アプリごと終了する前提のため、確認した後も `tabs` からは取り除かない
+    /// (`PendingAction::CloseAllTabs` のドキュメントコメント参照 — 削除
+    /// しないので `tabs` の長さが変わらず、キューに残った index が途中で
+    /// ずれる心配が無い)。全て確認し終えたら実際に終了する。
+    fn continue_closing_all_tabs(&mut self, mut queue: VecDeque<usize>) {
+        while let Some(index) = queue.pop_front() {
+            // 既に保存済み(直前のループで `doc.modified` が false に
+            // なった)、または範囲外(通常は起きない防御的チェック、
+            // ARCHITECTURE.md §17.8-3)ならスキップする。
+            if index >= self.tabs.len() || !self.tabs[index].doc.modified {
+                continue;
+            }
+            self.switch_tab(index);
+            self.pending_action = Some(PendingAction::CloseAllTabs(queue));
+            self.modal = Some(ModalState::ConfirmUnsaved);
+            return;
+        }
+        self.exit_process();
     }
 
     /// ドキュメントを丸ごと差し替える(新規作成/開く/白紙貼り付け置換)前後で
@@ -2683,18 +3032,23 @@ impl DaraskApp {
         self.lasso_polygon = None;
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    /// SPEC §30: 「開こうとしたファイルが既に開いているタブがあれば(パスを
+    /// 正規化して比較)、新規タブを作らずそのタブへ切り替える」。「開く」
+    /// ダイアログ・D&D・最近使ったファイルの全経路がここを通る。新規タブの
+    /// 追加は既存タブを一切破壊しないため未保存ガードは不要
+    /// (`begin_open_tab`/`request_action` のドキュメントコメント参照)。
+    fn open_path_in_new_tab(&mut self, path: PathBuf) {
+        if let Some(existing) = self.find_tab_by_path(&path) {
+            self.switch_tab(existing);
+            return;
+        }
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
         match io::load_image(&path) {
             Ok(doc) => {
-                self.doc = doc;
-                self.history = History::new();
-                self.selection = None;
-                self.floating = None;
-                self.select_drag = None;
-                self.view = CanvasView::new();
-                self.layer_rename = None;
-                self.next_layer_number = 1;
-                self.reset_tool_state_for_new_document();
+                self.open_new_tab(doc);
                 // SPEC §26: 「最近使ったファイル」。
                 self.remember_recent_file(path);
             }
@@ -2702,10 +3056,140 @@ impl DaraskApp {
         }
     }
 
+    /// SPEC §30: 「パスを正規化して比較」。既に同じファイルを開いている
+    /// タブがあればその index を返す。
+    fn find_tab_by_path(&self, path: &Path) -> Option<usize> {
+        let target = normalize_path_for_compare(path);
+        self.tabs.iter().position(|t| {
+            t.doc
+                .path
+                .as_deref()
+                .is_some_and(|p| normalize_path_for_compare(p) == target)
+        })
+    }
+
+    /// v5 §30/ARCHITECTURE.md §17.3: タブ切替の唯一の入口。Ctrl+Tab/
+    /// Ctrl+Shift+Tab・タブバークリックはすべてこれを経由する(「タブ切替前に
+    /// 必ず commit_open_gesture() を呼ぶ」— 本プロジェクトで最も繰り返し
+    /// 発生してきたバグパターンの再発防止策、ARCHITECTURE.md §17.8-1)。
+    fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+        self.commit_open_gesture();
+        self.active_tab = index;
+    }
+
+    /// SPEC §30: 「Ctrl+Tab: 次のタブへ切り替え(端では反対側へ循環)」。
+    fn next_tab(&mut self) {
+        let next = (self.active_tab + 1) % self.tabs.len();
+        self.switch_tab(next);
+    }
+
+    /// SPEC §30: 「Ctrl+Shift+Tab: 前のタブへ切り替え(端では反対側へ循環)」。
+    fn prev_tab(&mut self) {
+        let prev = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        self.switch_tab(prev);
+    }
+
+    /// v5 §30(ARCHITECTURE.md §17.1/§17.2/§17.3): 新しいタブを末尾に追加して
+    /// アクティブにする唯一の入口。タブ切替の安全規則(§17.3)に従い、
+    /// アクティブタブを差し替える前に必ず進行中のジェスチャを確定する。
+    /// タブ数上限(SPEC §30: 24)は呼び出し元(`begin_new_tab`/
+    /// `open_path_in_new_tab`)が事前に確認しておくこと(呼び出し文脈により
+    /// 上限チェックの要否・タイミングが異なるため、ここでは行わない)。
+    fn open_new_tab(&mut self, doc: Document) -> usize {
+        self.commit_open_gesture();
+        let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
+        // バグ修正: 以前はここで `self.layer_rename = None` を無条件に
+        // 実行していたが、これは共有フィールドだった頃の名残。新規タブは
+        // 追加されるだけで既存タブ(そのタブ自身の `layer_rename`)を一切
+        // 変更しないため、もはや不要(新規 `Tab` は `Tab::new` が
+        // `layer_rename: None`/`next_layer_number: 1` で初期化する。
+        // `Tab` の docstring 参照)。
+        self.tabs.push(Tab::new(doc, untitled_number));
+        let index = self.tabs.len() - 1;
+        self.active_tab = index;
+        self.reset_tool_state_for_new_document();
+        index
+    }
+
+    /// SPEC §30: 「無題」「無題2」…の採番(`Tab::untitled_number` 参照)。
+    fn take_untitled_number(&mut self) -> u32 {
+        let n = self.next_untitled_number;
+        self.next_untitled_number += 1;
+        n
+    }
+
+    /// SPEC §30: Ctrl+N / メニュー「新規」。新規タブを追加する方式に変わった
+    /// (v1 §7 を上書き)。既存タブの内容は一切変更しないため、`request_action`
+    /// (未保存ガード)を経由しない。進行中のジェスチャだけ先に確定する
+    /// (モーダル表示中はキャンバスへの入力を渡さないため、ダイアログを開く
+    /// 前に確定しておく必要がある、`request_action` と同じ理由)。
+    fn begin_new_tab(&mut self) {
+        self.commit_open_gesture();
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
+        self.modal = Some(ModalState::New {
+            width: DEFAULT_NEW_WIDTH,
+            height: DEFAULT_NEW_HEIGHT,
+            background: Background::White,
+            replace_active: false,
+        });
+    }
+
+    /// SPEC §30: Ctrl+O / メニュー「開く」。同上の理由で未保存ガードを
+    /// 適用しない。タブ数上限は「開こうとしたファイルが既に開いているタブ」
+    /// への切替を妨げないよう、パスが分かった後(`open_path_in_new_tab`)で
+    /// 確認する。
+    fn begin_open_tab(&mut self) {
+        self.commit_open_gesture();
+        self.pending_dialog = Some(DialogRequest::OpenFile);
+    }
+
+    /// SPEC §30: 「常に 1 タブ以上を維持する」。v5 §17.4(ARCHITECTURE.md
+    /// §17.4): 「タブを閉じる際、そのタブの `doc.modified` が true なら
+    /// 該当タブをアクティブ化した上で既存の `ConfirmUnsaved` モーダルを
+    /// 出す」。Ctrl+W(`Action::CloseTab`)・タブの×・中クリックの全経路が
+    /// これを通る(ARCHITECTURE.md §17.7 V5-M2/M3)。
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        // SPEC §30: 「最後の 1 タブを閉じようとした場合、そのタブを閉じる
+        // のではなく「新規」と同じ扱い(未保存ガードを通してから内容を白紙に
+        // 戻す)にする」。`request_action` が進行中のジェスチャの確定・
+        // 未保存ガードの両方を担う(`PendingAction::CloseLastTab` 参照)。
+        if self.tabs.len() == 1 {
+            self.request_action(PendingAction::CloseLastTab);
+            return;
+        }
+        // v5 §17.3: アクティブタブ自身を閉じる場合、進行中のジェスチャ
+        // (ブラシのドラッグ・浮動片・なげなわ等)を先に確定する。閉じる
+        // タブが非アクティブなら、そのタブにジェスチャが乗っていることは
+        // ない(ジェスチャは常にアクティブタブにのみ存在する)ので不要。
+        if index == self.active_tab {
+            self.commit_open_gesture();
+        }
+        if self.tabs[index].doc.modified {
+            // v5 §17.4: 「該当タブをアクティブ化した上で」確認する。
+            // `switch_tab` は既にアクティブなタブに対しては no-op なので
+            // (上で `commit_open_gesture` 済みの場合も)二重に確定は
+            // 起きない。
+            self.switch_tab(index);
+            self.pending_action = Some(PendingAction::CloseTab(index));
+            self.modal = Some(ModalState::ConfirmUnsaved);
+            return;
+        }
+        self.remove_tab_and_adjust_active(index);
+    }
+
     /// 「上書き保存」(SPEC §7: Ctrl+S)。パスが未知(無題)なら「名前を
     /// 付けて保存」ダイアログにフォールバックする。
     fn begin_save(&mut self) {
-        match self.doc.path.clone() {
+        match self.active_tab().doc.path.clone() {
             Some(path) => self.begin_save_to_path(path),
             None => self.pending_dialog = Some(DialogRequest::SaveAs),
         }
@@ -2753,11 +3237,11 @@ impl DaraskApp {
         // SPEC §13: 保存は常に可視レイヤーの合成(統合)結果を書き出す。
         // レイヤーが複数ある状態で保存したことをトーストで知らせる
         // (`io::save_image` 自体が統合するため、ここでは判定のみ)。
-        let had_multiple_layers = self.doc.layers.len() > 1;
-        match io::save_image(&mut self.doc, &path, format) {
+        let had_multiple_layers = self.active_tab().doc.layers.len() > 1;
+        match io::save_image(&mut self.active_tab_mut().doc, &path, format) {
             Ok(()) => {
-                self.doc.path = Some(path.clone());
-                self.doc.modified = false;
+                self.active_tab_mut().doc.path = Some(path.clone());
+                self.active_tab_mut().doc.modified = false;
                 if had_multiple_layers {
                     self.show_toast("レイヤーは統合して保存されました".to_owned());
                 }
@@ -2792,15 +3276,51 @@ impl DaraskApp {
         self.pending_action = None;
     }
 
-    fn confirm_new(&mut self, width: u32, height: u32, background: Background) {
-        self.doc = Document::new(width.clamp(1, 8192), height.clamp(1, 8192), background);
-        self.history = History::new();
-        self.selection = None;
-        self.floating = None;
+    /// 「新規」ダイアログの確定(`ModalState::New`)。`replace_active` が
+    /// `true` なら唯一のタブの内容をその場で置き換える(SPEC §30: 「最後の
+    /// 1 タブを閉じる」、`PendingAction::CloseLastTab` 経由)。`false` なら
+    /// 通常の Ctrl+N と同じく新規タブを追加する(SPEC §30 の読み替え規則、
+    /// v1 §7 を上書き)。
+    fn confirm_new(
+        &mut self,
+        width: u32,
+        height: u32,
+        background: Background,
+        replace_active: bool,
+    ) {
+        let doc = Document::new(width.clamp(1, 8192), height.clamp(1, 8192), background);
+        if replace_active {
+            self.reset_active_tab_document(doc);
+        } else {
+            self.open_new_tab(doc);
+        }
+    }
+
+    /// アクティブタブの `Document` をその場で丸ごと差し替える(v1〜v4 の
+    /// 「新規作成」と同じ in-place reset)。v5 ではタブを追加せず唯一の
+    /// タブを白紙に戻す経路(SPEC §30: 「最後の 1 タブを閉じる」)専用。
+    fn reset_active_tab_document(&mut self, doc: Document) {
+        // バグ修正: レイヤー名編集中の入力を確定する処理はここでは行わない。
+        // この関数へ至る唯一の経路(`confirm_new(replace_active: true)` ←
+        // `PendingAction::CloseLastTab`)は必ず `request_action` の
+        // `commit_open_gesture()` 呼び出しを経由済みで、そこで既に確定
+        // されている(`commit_open_gesture`/`commit_pending_layer_rename`
+        // のドキュメントコメント参照)。
+        // バグ修正: 以前はここで `untitled_number` を採番し直さなかった
+        // ため、「無題3」を最後の1タブとして閉じて新規化しても、タブ
+        // ラベルが「無題3」のまま(`next_untitled_number` が既に進んで
+        // いても「無題4」に更新されない)残っていた。通常の Ctrl+N
+        // (`open_new_tab`)と同じく、パスの無い新規ドキュメントには
+        // 必ず新しい番号を払い出す。
+        let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
+        self.active_tab_mut().doc = doc;
+        self.active_tab_mut().history = History::new();
+        self.active_tab_mut().selection = None;
+        self.active_tab_mut().floating = None;
         self.select_drag = None;
-        self.view = CanvasView::new();
-        self.layer_rename = None;
-        self.next_layer_number = 1;
+        self.active_tab_mut().view = CanvasView::new();
+        self.active_tab_mut().untitled_number = untitled_number;
+        self.active_tab_mut().next_layer_number = 1;
         self.reset_tool_state_for_new_document();
     }
 
@@ -2894,7 +3414,7 @@ impl DaraskApp {
             return;
         };
         if path.exists() {
-            self.request_action(PendingAction::Open(Some(path)));
+            self.open_path_in_new_tab(path);
         } else {
             self.recent_files.retain(|p| p != &path);
             self.save_settings();
@@ -2916,37 +3436,39 @@ impl DaraskApp {
     /// 操作は全レイヤーに適用されるため、v1 の単一バッファ `Replace` ではなく
     /// 全レイヤー+寸法のスナップショットを使う、ARCHITECTURE.md §14.2)。
     fn push_replace_all(&mut self, before: crate::document::DocSnapshot) {
-        let after = self.doc.snapshot();
-        self.history.push(HistoryOp::ReplaceAll { before, after });
-        self.doc.mark_all_dirty();
-        self.doc.modified = true;
+        let after = self.active_tab().doc.snapshot();
+        self.active_tab_mut()
+            .history
+            .push(HistoryOp::ReplaceAll { before, after });
+        self.active_tab_mut().doc.mark_all_dirty();
+        self.active_tab_mut().doc.modified = true;
     }
 
     fn apply_flip_horizontal(&mut self) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.flip_horizontal();
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut().doc.flip_horizontal();
         self.push_replace_all(before);
     }
 
     fn apply_flip_vertical(&mut self) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.flip_vertical();
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut().doc.flip_vertical();
         self.push_replace_all(before);
     }
 
     fn apply_rotate_cw(&mut self) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.rotate_cw();
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut().doc.rotate_cw();
         self.push_replace_all(before);
     }
 
     fn apply_rotate_ccw(&mut self) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.rotate_ccw();
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut().doc.rotate_ccw();
         self.push_replace_all(before);
     }
 
@@ -2955,7 +3477,7 @@ impl DaraskApp {
     fn apply_crop_to_selection(&mut self) {
         // SPEC §21: 「選択範囲でトリミング」は bbox でトリミング(マスク形状は
         // 見ない)。
-        let rect = match (&self.selection, &self.floating) {
+        let rect = match (&self.active_tab().selection, &self.active_tab().floating) {
             (Some(sel), _) => Some(sel.mask.bbox),
             (None, Some(floating)) => Some(select::floating_target_rect(floating)),
             (None, None) => None,
@@ -2964,27 +3486,162 @@ impl DaraskApp {
             return;
         };
         self.commit_selection();
-        let rect = rect.clamp_to(self.doc.width, self.doc.height);
+        let rect = rect.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         if rect.is_empty() {
             return;
         }
-        let before = self.doc.snapshot();
-        self.doc.crop_to(rect);
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut().doc.crop_to(rect);
         self.push_replace_all(before);
-        self.selection = None;
+        self.active_tab_mut().selection = None;
+    }
+
+    /// SPEC §31(ARCHITECTURE.md §17.5): 画像メニュー「選択範囲を新規タブに
+    /// 複製」。選択または浮動片がアクティブなときのみ意味を持つ(メニュー側で
+    /// 無効化もしているが、直接呼ばれた場合に備えて二重にガードする)。
+    fn duplicate_selection_to_new_tab(&mut self) {
+        if self.active_tab().selection.is_none() && self.active_tab().floating.is_none() {
+            return;
+        }
+        // SPEC §30: 「タブ数の上限は24。超えて新規タブを作ろうとしたら作成
+        // せずトースト通知」(既存の新規タブ経路と同じ流儀)。
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
+
+        // v5 §17.3/§17.8-1: 「タブ切替前に必ず commit_open_gesture() を呼ぶ」
+        // ―― ただしその一般形は選択/移動ツール中に浮動片を
+        // `flush_floating_keep_selection` でアクティブレイヤーへ合成して
+        // しまう。SPEC §31 は「浮動片がある場合はそのピクセルをそのまま
+        // 複製先へ渡し、元のタブは一切変更しない」ことを要求するため、ここで
+        // 合成してしまうと (a) 元タブを書き換えてしまい非破壊の要件に反し、
+        // (b) 複製先が「浮動片そのもの」ではなく「合成後にもう一度切り出した
+        // もの」になってしまう(浮動片が矩形より大きいレイヤーからはみ出た
+        // 位置にある場合、キャンバス外の画素が失われる違いが生じうる)。
+        // 浮動片が存在しうるのは `self.tool` が Select/EllipseSelect/Move の
+        // ときだけ(`place_new_floating` 参照。他のツールに切り替えた時点で
+        // 必ず `commit_open_gesture` を経由して確定済みになる)であり、その
+        // ときの唯一の「進行中ジェスチャ」は浮動片の移動/リサイズドラッグ
+        // (`select_drag`)だけなので、それだけを終了させる。それ以外の
+        // ツールでは浮動片は存在しえない(以下の抽出処理はプレーンな選択だけ
+        // を見る)ため、通常どおり `end_active_gesture` で他ツール(なげなわの
+        // 頂点列・テキスト編集・図形/グラデーションのドラッグ等)の進行中
+        // 状態を確定してよい ―― これらはタブをまたぐと座標が壊れる
+        // (ARCHITECTURE.md §17.8-1 と同じバグクラス)ため、タブ挿入前に
+        // 必ず終わらせておく必要がある。
+        if matches!(
+            self.tool,
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move
+        ) {
+            self.select_drag = None;
+        } else {
+            self.end_active_gesture();
+        }
+
+        let (width, height, layers, active) = if let Some(floating) = &self.active_tab().floating {
+            // SPEC §31: 「浮動片がある場合: その浮動片のピクセル(mask込み)を
+            // そのまま新規タブの唯一のレイヤーにする」。
+            let pixels = select::floating_layer_pixels(floating);
+            (
+                floating.w,
+                floating.h,
+                vec![Layer {
+                    name: "背景".to_owned(),
+                    visible: true,
+                    opacity: 255,
+                    pixels,
+                }],
+                0,
+            )
+        } else {
+            // SPEC §31: 「静的な選択のみの場合: 選択マスクの bbox で、全
+            // レイヤーをマスク外transparentで切り出し、レイヤー構成(名前・
+            // 表示・不透明度・重ね順・アクティブレイヤー)を保ったまま新規
+            // タブに複製する」(「選択範囲でトリミング」の全レイヤー方針を
+            // 踏襲、`apply_crop_to_selection` 参照)。
+            let mask = self
+                .active_tab()
+                .selection
+                .as_ref()
+                .expect("no-selection/no-floating is checked at the top of this function")
+                .mask
+                .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+            let rect = mask.bbox;
+            if rect.is_empty() {
+                return;
+            }
+            // ARCHITECTURE.md §17.5: `tools::select::extract_region` を
+            // 「各レイヤーに対して」呼ぶ ―― `extract_region` はアクティブ
+            // レイヤーしか読まないため、レイヤーごとに `doc.active` を一時的に
+            // 差し替えて呼び出し、抽出後は必ず元へ戻す(§17.8-5: 「元のタブは
+            // 一切変更しない」を満たすための読み取り専用操作であることを
+            // 保証する)。
+            let tab = &mut self.tabs[self.active_tab];
+            let saved_active = tab.doc.active;
+            let mut layers = Vec::with_capacity(tab.doc.layers.len());
+            for i in 0..tab.doc.layers.len() {
+                tab.doc.active = i;
+                let pixels = select::extract_region(&tab.doc, &mask);
+                let src = &tab.doc.layers[i];
+                layers.push(Layer {
+                    name: src.name.clone(),
+                    visible: src.visible,
+                    opacity: src.opacity,
+                    pixels,
+                });
+            }
+            tab.doc.active = saved_active;
+            (
+                rect.width() as u32,
+                rect.height() as u32,
+                layers,
+                saved_active,
+            )
+        };
+
+        let new_doc = Document::from_duplicated_layers(width, height, layers, active);
+        self.insert_duplicated_tab(new_doc);
+    }
+
+    /// `duplicate_selection_to_new_tab` 専用のタブ挿入。`open_new_tab`
+    /// (末尾に追加)と違い、SPEC §31: 「新規タブは元タブの直後に挿入され
+    /// アクティブになる」ため挿入位置が異なる。また `open_new_tab` は内部で
+    /// 無条件に `commit_open_gesture` を呼ぶが、`duplicate_selection_to_new_tab`
+    /// は既に浮動片を壊さない形でジェスチャを終わらせた後にここへ来るため、
+    /// ここでもう一度 `commit_open_gesture` を呼ぶと浮動片が元タブへ合成
+    /// されてしまい SPEC §31 の「元のタブは一切変更しない」に反する。
+    /// そのため `open_new_tab` を再利用せず専用の経路にする(タブ数上限は
+    /// 呼び出し元が確認済み)。
+    fn insert_duplicated_tab(&mut self, doc: Document) -> usize {
+        // SPEC §31: 「パスは無し(「無題」系の命名)」なので常に採番する。
+        let untitled_number = Some(self.take_untitled_number());
+        let insert_at = self.active_tab + 1;
+        // バグ修正: 以前はここで `self.layer_rename = None` を無条件に
+        // 実行していたが、新規タブは挿入されるだけで元タブ(そのタブ自身の
+        // `layer_rename`)を一切変更しないため不要(`open_new_tab` と同じ
+        // 理由、`Tab` の docstring 参照)。
+        self.tabs.insert(insert_at, Tab::new(doc, untitled_number));
+        self.active_tab = insert_at;
+        self.reset_tool_state_for_new_document();
+        insert_at
     }
 
     fn confirm_image_resize(&mut self, width: u32, height: u32, interpolation: Interpolation) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.resize(width.max(1), height.max(1), interpolation);
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut()
+            .doc
+            .resize(width.max(1), height.max(1), interpolation);
         self.push_replace_all(before);
     }
 
     fn confirm_canvas_resize(&mut self, width: u32, height: u32) {
         self.commit_selection();
-        let before = self.doc.snapshot();
-        self.doc.resize_canvas(width.max(1), height.max(1));
+        let before = self.active_tab().doc.snapshot();
+        self.active_tab_mut()
+            .doc
+            .resize_canvas(width.max(1), height.max(1));
         self.push_replace_all(before);
     }
 
@@ -3002,7 +3659,8 @@ impl DaraskApp {
 
     /// 色調補正の対象領域(SPEC §24: 「選択範囲があればその中だけ」)。
     fn tone_adjust_target_rect(&self) -> crate::document::IRect {
-        self.selection
+        self.active_tab()
+            .selection
             .as_ref()
             .map(|s| s.mask.bbox)
             .unwrap_or_else(|| self.doc_full_rect())
@@ -3032,15 +3690,19 @@ impl DaraskApp {
         self.commit_open_gesture();
         let bounds = self
             .tone_adjust_target_rect()
-            .clamp_to(self.doc.width, self.doc.height);
+            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         if bounds.is_empty() {
             return;
         }
-        self.history.begin_stroke(self.doc.active);
-        self.history.ensure_tiles_saved(&self.doc, bounds);
-        let clip = self.selection.as_ref().map(|s| &s.mask);
+        // `clip`(`tab.selection` 由来)と `tab.doc` を同時に借用するため
+        // 単一の `&mut Tab` を経由する(`apply_tone_adjustment_immediate`
+        // 系すべてに共通、`end_active_gesture` のコメント参照)。
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
+        tab.history.ensure_tiles_saved(&tab.doc, bounds);
+        let clip = tab.selection.as_ref().map(|s| &s.mask);
         {
-            let mut surface = self.doc.active_surface_mut(clip);
+            let mut surface = tab.doc.active_surface_mut(clip);
             for y in bounds.y0..bounds.y1 {
                 for x in bounds.x0..bounds.x1 {
                     if let Some(px) = surface.get_pixel(x, y) {
@@ -3049,8 +3711,8 @@ impl DaraskApp {
                 }
             }
         }
-        self.doc.mark_dirty(bounds);
-        self.history.commit_stroke(&mut self.doc);
+        tab.doc.mark_dirty(bounds);
+        tab.history.commit_stroke(&mut tab.doc);
     }
 
     /// SPEC §24: 「階調の反転 (Ctrl+I) — 即時(RGB反転、アルファ不変)」。
@@ -3083,10 +3745,11 @@ impl DaraskApp {
         self.commit_open_gesture();
         let bounds = self
             .tone_adjust_target_rect()
-            .clamp_to(self.doc.width, self.doc.height);
-        self.history.begin_stroke(self.doc.active);
+            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
         if !bounds.is_empty() {
-            self.history.ensure_tiles_saved(&self.doc, bounds);
+            tab.history.ensure_tiles_saved(&tab.doc, bounds);
         }
         bounds
     }
@@ -3121,16 +3784,20 @@ impl DaraskApp {
         rect: crate::document::IRect,
         f: impl Fn([u8; 4]) -> [u8; 4],
     ) {
-        let bounds = rect.clamp_to(self.doc.width, self.doc.height);
+        let bounds = rect.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         if bounds.is_empty() {
             return;
         }
-        let clip = self.selection.as_ref().map(|s| &s.mask);
+        // `clip`(`tab.selection` 由来)・`original_cursor`(`tab.history` 由来)・
+        // `surface`(`tab.doc` の可変借用)を同時に生かすため、単一の
+        // `&mut Tab` を経由してフィールドごとに分割借用する。
+        let tab = &mut self.tabs[self.active_tab];
+        let clip = tab.selection.as_ref().map(|s| &s.mask);
         // v4-M2 性能改善(ARCHITECTURE.md §16.1、`OriginalPixelCursor` の
         // ドキュメント参照): 対象領域全体の画素ループで 1 個のカーソルを
         // 使い回し、行ごとに `stroke.tiles` の `HashMap` を引き直さない。
-        let mut original_cursor = self.history.original_pixel_cursor();
-        let mut surface = self.doc.active_surface_mut(clip);
+        let mut original_cursor = tab.history.original_pixel_cursor();
+        let mut surface = tab.doc.active_surface_mut(clip);
         for y in bounds.y0..bounds.y1 {
             for x in bounds.x0..bounds.x1 {
                 if let Some(original) = original_cursor.get(x, y) {
@@ -3138,7 +3805,7 @@ impl DaraskApp {
                 }
             }
         }
-        self.doc.mark_dirty(bounds);
+        tab.doc.mark_dirty(bounds);
     }
 
     // -----------------------------------------------------------------
@@ -3168,24 +3835,58 @@ impl DaraskApp {
     /// (`push_replace_all` と同じ副作用(全面 dirty・`modified` 設定)を、
     /// 全レイヤースナップショットを取らずに行う)。
     fn push_layer_history(&mut self, op: HistoryOp) {
-        self.history.push(op);
-        self.doc.mark_all_dirty();
-        self.doc.modified = true;
+        self.active_tab_mut().history.push(op);
+        self.active_tab_mut().doc.mark_all_dirty();
+        self.active_tab_mut().doc.modified = true;
     }
 
-    /// SPEC §13: 「新規レイヤーは透明で名前は『レイヤー N』」。
+    /// SPEC §13: 「新規レイヤーは透明で名前は『レイヤー N』」。バグ修正:
+    /// 採番カウンタはタブごとに独立させた(`Tab::next_layer_number`。以前は
+    /// `DaraskApp` 直下の共有フィールドで、タブを切り替えて別タブでレイヤー
+    /// 追加すると番号が続きから採番され、タブ単体で見ると 1 から連番に
+    /// ならず歯抜けになっていた)。
     fn next_layer_name(&mut self) -> String {
-        let name = format!("レイヤー {}", self.next_layer_number);
-        self.next_layer_number += 1;
+        let tab = self.active_tab_mut();
+        let name = format!("レイヤー {}", tab.next_layer_number);
+        tab.next_layer_number += 1;
         name
+    }
+
+    /// バグ修正: 以前はレイヤー名編集中(`layer_rename` が `Some`)に
+    /// ドキュメントを丸ごと差し替える操作(`reset_active_tab_document`/
+    /// `replace_document_with_pasted_image`)が単に `layer_rename = None`
+    /// で破棄するだけで、`text_edit` に対して行っている
+    /// `commit_pending_text_edit_and_composite` のような「先に確定してから
+    /// 実行」を行っていなかった。`commit_open_gesture`(ツール切替・タブ
+    /// 切替・レイヤー操作・アンドゥ/リドゥ・未保存ガード判定の唯一の
+    /// 共通フック)の内部から呼ぶことで、これらすべての「割り込み」操作の
+    /// 前に入力中のテキストを確定させ、確定によって立った `doc.modified`
+    /// が未保存ガードにも正しく反映されるようにする。
+    fn commit_pending_layer_rename(&mut self) {
+        let Some((idx, text, _)) = self.active_tab_mut().layer_rename.take() else {
+            return;
+        };
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let tab = self.active_tab_mut();
+        if let Some(layer) = tab.doc.layers.get_mut(idx) {
+            layer.name = trimmed;
+            // `ui/layers_panel.rs::show_layer_row` の通常の確定経路と同様、
+            // 不透明度・表示切替の隣接ハンドラに揃えて `modified` を立てる
+            // (立てないと `doc_is_pristine()` がリネームだけされた文書を
+            // 「白紙」のまま誤判定し、Ctrl+V の白紙置換パスに載ってしまう)。
+            tab.doc.modified = true;
+        }
     }
 
     fn layer_add(&mut self) {
         self.commit_open_gesture();
         let name = self.next_layer_name();
-        let before_active = self.doc.active_index();
-        if self.doc.add_layer(name.clone()) {
-            let index = self.doc.active_index();
+        let before_active = self.active_tab().doc.active_index();
+        if self.active_tab_mut().doc.add_layer(name.clone()) {
+            let index = self.active_tab().doc.active_index();
             self.push_layer_history(HistoryOp::AddLayer {
                 index,
                 name,
@@ -3196,10 +3897,10 @@ impl DaraskApp {
 
     fn layer_duplicate(&mut self) {
         self.commit_open_gesture();
-        let before_active = self.doc.active_index();
-        if self.doc.duplicate_active_layer() {
-            let index = self.doc.active_index();
-            let layer = self.doc.layers[index].clone();
+        let before_active = self.active_tab().doc.active_index();
+        if self.active_tab_mut().doc.duplicate_active_layer() {
+            let index = self.active_tab().doc.active_index();
+            let layer = self.active_tab().doc.layers[index].clone();
             self.push_layer_history(HistoryOp::DuplicateLayer {
                 index,
                 layer,
@@ -3212,12 +3913,12 @@ impl DaraskApp {
         self.commit_open_gesture();
         // `Document::remove_active_layer` 自身の拒否条件(レイヤー1枚)を
         // 先に確認し、拒否される呼び出しでは複製コストを払わない。
-        if self.doc.layers.len() <= 1 {
+        if self.active_tab().doc.layers.len() <= 1 {
             return;
         }
-        let before_active = self.doc.active_index();
-        let layer = self.doc.layers[before_active].clone();
-        if self.doc.remove_active_layer() {
+        let before_active = self.active_tab().doc.active_index();
+        let layer = self.active_tab().doc.layers[before_active].clone();
+        if self.active_tab_mut().doc.remove_active_layer() {
             self.push_layer_history(HistoryOp::RemoveLayer {
                 index: before_active,
                 layer,
@@ -3228,18 +3929,18 @@ impl DaraskApp {
 
     fn layer_move_up(&mut self) {
         self.commit_open_gesture();
-        let from = self.doc.active_index();
-        if self.doc.move_active_layer_up() {
-            let to = self.doc.active_index();
+        let from = self.active_tab().doc.active_index();
+        if self.active_tab_mut().doc.move_active_layer_up() {
+            let to = self.active_tab().doc.active_index();
             self.push_layer_history(HistoryOp::MoveLayer { from, to });
         }
     }
 
     fn layer_move_down(&mut self) {
         self.commit_open_gesture();
-        let from = self.doc.active_index();
-        if self.doc.move_active_layer_down() {
-            let to = self.doc.active_index();
+        let from = self.active_tab().doc.active_index();
+        if self.active_tab_mut().doc.move_active_layer_down() {
+            let to = self.active_tab().doc.active_index();
             self.push_layer_history(HistoryOp::MoveLayer { from, to });
         }
     }
@@ -3249,13 +3950,13 @@ impl DaraskApp {
         // `Document::merge_active_down` 自身の拒否条件(レイヤー1枚・
         // アクティブが最下位)を先に確認し、拒否される呼び出しでは複製
         // コストを払わない。
-        let index = self.doc.active_index();
-        if index == 0 || self.doc.layers.len() <= 1 {
+        let index = self.active_tab().doc.active_index();
+        if index == 0 || self.active_tab().doc.layers.len() <= 1 {
             return;
         }
-        let upper = self.doc.layers[index].clone();
-        let lower_before = self.doc.layers[index - 1].clone();
-        if self.doc.merge_active_down() {
+        let upper = self.active_tab().doc.layers[index].clone();
+        let lower_before = self.active_tab().doc.layers[index - 1].clone();
+        if self.active_tab_mut().doc.merge_active_down() {
             self.push_layer_history(HistoryOp::MergeDown {
                 index,
                 upper,
@@ -3270,11 +3971,11 @@ impl DaraskApp {
     /// (ARCHITECTURE.md §14.2)。
     fn layer_flatten(&mut self) {
         self.commit_open_gesture();
-        if self.doc.layers.len() <= 1 {
+        if self.active_tab().doc.layers.len() <= 1 {
             return;
         }
-        let before = self.doc.snapshot();
-        if self.doc.flatten_all() {
+        let before = self.active_tab().doc.snapshot();
+        if self.active_tab_mut().doc.flatten_all() {
             self.push_replace_all(before);
         }
     }
@@ -3284,11 +3985,13 @@ impl DaraskApp {
     /// 「先に確定」してから切り替える(ARCHITECTURE.md §14.9-3: 「浮動片
     /// 保持中にアクティブレイヤーを変えると確定先が変わってしまう」の対策)。
     fn set_active_layer(&mut self, index: usize) {
-        if index >= self.doc.layers.len() || index == self.doc.active_index() {
+        if index >= self.active_tab().doc.layers.len()
+            || index == self.active_tab().doc.active_index()
+        {
             return;
         }
         self.commit_open_gesture();
-        self.doc.active = index;
+        self.active_tab_mut().doc.active = index;
     }
 
     /// レイヤーパネルからの操作を配線する。
@@ -3310,23 +4013,33 @@ impl DaraskApp {
 
     fn handle_menu_action(&mut self, action: MenuAction) {
         match action {
-            MenuAction::New => self.request_action(PendingAction::New),
-            MenuAction::Open => self.request_action(PendingAction::Open(None)),
+            // v5 §30: `begin_new_tab`/`begin_open_tab` のドキュメントコメント
+            // 参照(新規タブ追加は既存タブを破壊しないため未保存ガード不要)。
+            MenuAction::New => self.begin_new_tab(),
+            MenuAction::Open => self.begin_open_tab(),
             MenuAction::OpenRecent(index) => self.open_recent_file(index),
             MenuAction::Save => self.begin_save(),
             MenuAction::SaveAs => self.begin_save_as(),
-            MenuAction::Exit => self.request_action(PendingAction::Close),
+            // v5 §17.4: 「終了」もウィンドウを閉じる操作と同じく全タブを
+            // 確認する(`begin_quit` 参照。単体タブの `request_action` は
+            // アクティブタブしか見ないため、ここでは使わない)。
+            MenuAction::Exit => self.begin_quit(),
+            // v5 §17.6: ファイルメニュー「タブを閉じる」。アクティブタブを
+            // 閉じる(`Action::CloseTab`/Ctrl+W と同じ、`close_tab` 参照)。
+            MenuAction::CloseTab => self.close_tab(self.active_tab),
             MenuAction::Undo => {
                 // SPEC §13 最終項: 浮動片/ストローク進行中は先に確定してから
                 // 実行する(`handle_shortcuts` の `Action::Undo`/`Redo` と
                 // 同じ規則)。
                 self.commit_open_gesture();
-                self.history.undo(&mut self.doc);
+                let tab = self.active_tab_mut();
+                tab.history.undo(&mut tab.doc);
                 self.clamp_selection_to_doc();
             }
             MenuAction::Redo => {
                 self.commit_open_gesture();
-                self.history.redo(&mut self.doc);
+                let tab = self.active_tab_mut();
+                tab.history.redo(&mut tab.doc);
                 self.clamp_selection_to_doc();
             }
             MenuAction::Cut => self.cut_selection_to_clipboard(),
@@ -3339,19 +4052,20 @@ impl DaraskApp {
             MenuAction::Deselect => self.commit_selection(),
             MenuAction::ImageResize => {
                 self.modal = Some(ModalState::ImageResize {
-                    width: self.doc.width,
-                    height: self.doc.height,
+                    width: self.active_tab().doc.width,
+                    height: self.active_tab().doc.height,
                     keep_aspect: true,
                     interpolation: Interpolation::Bilinear,
                 });
             }
             MenuAction::CanvasResize => {
                 self.modal = Some(ModalState::CanvasResize {
-                    width: self.doc.width,
-                    height: self.doc.height,
+                    width: self.active_tab().doc.width,
+                    height: self.active_tab().doc.height,
                 });
             }
             MenuAction::Crop => self.apply_crop_to_selection(),
+            MenuAction::DuplicateSelectionToTab => self.duplicate_selection_to_new_tab(),
             MenuAction::FlipHorizontal => self.apply_flip_horizontal(),
             MenuAction::FlipVertical => self.apply_flip_vertical(),
             MenuAction::RotateCw => self.apply_rotate_cw(),
@@ -3360,10 +4074,13 @@ impl DaraskApp {
             MenuAction::HueSaturation => self.open_hue_saturation_modal(),
             MenuAction::Invert => self.apply_invert(),
             MenuAction::Grayscale => self.apply_grayscale(),
-            MenuAction::ZoomIn => self.view.zoom_in(),
-            MenuAction::ZoomOut => self.view.zoom_out(),
-            MenuAction::Zoom100 => self.view.zoom_to_100(),
-            MenuAction::FitWindow => self.view.fit_to_window(&self.doc),
+            MenuAction::ZoomIn => self.active_tab_mut().view.zoom_in(),
+            MenuAction::ZoomOut => self.active_tab_mut().view.zoom_out(),
+            MenuAction::Zoom100 => self.active_tab_mut().view.zoom_to_100(),
+            MenuAction::FitWindow => {
+                let tab = self.active_tab_mut();
+                tab.view.fit_to_window(&tab.doc);
+            }
             MenuAction::TogglePixelGrid => self.show_pixel_grid = !self.show_pixel_grid,
             MenuAction::LayerAdd => self.layer_add(),
             MenuAction::LayerDuplicate => self.layer_duplicate(),
@@ -3376,6 +4093,16 @@ impl DaraskApp {
         }
     }
 
+    /// SPEC §30(ARCHITECTURE.md §17.7 V5-M2): タブバーのクリック/中クリック
+    /// を実際の操作へディスパッチする(`ui/tab_bar.rs::show` は
+    /// `TabBarAction` を返すだけ、他の `ui/*` パネルと同じ流儀)。
+    fn handle_tab_bar_action(&mut self, action: TabBarAction) {
+        match action {
+            TabBarAction::Activate(index) => self.switch_tab(index),
+            TabBarAction::Close(index) => self.close_tab(index),
+        }
+    }
+
     /// 表示中のモーダル(あれば)を描き、確定/キャンセルを処理する。
     fn show_modal(&mut self, ctx: &egui::Context) {
         let Some(mut modal) = self.modal.take() else {
@@ -3383,20 +4110,24 @@ impl DaraskApp {
         };
         // M4 で発見・修正したバグ(`handle_close_request` 参照): このモーダル
         // が表示されている間に閉じる要求が来ていた(`pending_action` に
-        // `Close` が予約された)かどうかを、各分岐が `pending_action` を
-        // 書き換えるより前に覚えておく(例えば「新規」ダイアログの
+        // `CloseAllTabs` が予約された)かどうかを、各分岐が `pending_action`
+        // を書き換えるより前に覚えておく(例えば「新規」ダイアログの
         // キャンセルは無条件に `pending_action = None` するため、後から
-        // 読み直すと消えてしまう)。
-        let close_was_queued = matches!(self.pending_action, Some(PendingAction::Close));
+        // 読み直すと消えてしまう)。v5 §17.4: `handle_close_request` は
+        // 既に `CloseTab`/`CloseLastTab` の確認が進行中なら上書きしない
+        // (`pending_action.is_none()` ガード)ので、ここで `CloseAllTabs`
+        // を見つけたときだけが「閉じる要求が割り込んだ」ケースになる。
+        let close_was_queued = matches!(self.pending_action, Some(PendingAction::CloseAllTabs(_)));
         let mut keep_open = true;
         match &mut modal {
             ModalState::New {
                 width,
                 height,
                 background,
+                replace_active,
             } => match dialogs::show_new(ctx, width, height, background) {
                 DialogOutcome::Confirmed => {
-                    self.confirm_new(*width, *height, *background);
+                    self.confirm_new(*width, *height, *background, *replace_active);
                     keep_open = false;
                 }
                 DialogOutcome::Cancelled => {
@@ -3411,7 +4142,7 @@ impl DaraskApp {
                 keep_aspect,
                 interpolation,
             } => {
-                let (orig_w, orig_h) = (self.doc.width, self.doc.height);
+                let (orig_w, orig_h) = (self.active_tab().doc.width, self.active_tab().doc.height);
                 match dialogs::show_image_resize(
                     ctx,
                     width,
@@ -3466,12 +4197,14 @@ impl DaraskApp {
                 }
                 match outcome {
                     DialogOutcome::Confirmed => {
-                        self.history.commit_stroke(&mut self.doc);
+                        let tab = self.active_tab_mut();
+                        tab.history.commit_stroke(&mut tab.doc);
                         keep_open = false;
                     }
                     DialogOutcome::Cancelled => {
-                        self.history.restore_stroke_region(&mut self.doc, rect);
-                        self.history.cancel_stroke();
+                        let tab = self.active_tab_mut();
+                        tab.history.restore_stroke_region(&mut tab.doc, rect);
+                        tab.history.cancel_stroke();
                         keep_open = false;
                     }
                     DialogOutcome::Pending => {}
@@ -3494,12 +4227,14 @@ impl DaraskApp {
                 }
                 match outcome {
                     DialogOutcome::Confirmed => {
-                        self.history.commit_stroke(&mut self.doc);
+                        let tab = self.active_tab_mut();
+                        tab.history.commit_stroke(&mut tab.doc);
                         keep_open = false;
                     }
                     DialogOutcome::Cancelled => {
-                        self.history.restore_stroke_region(&mut self.doc, rect);
-                        self.history.cancel_stroke();
+                        let tab = self.active_tab_mut();
+                        tab.history.restore_stroke_region(&mut tab.doc, rect);
+                        tab.history.cancel_stroke();
                         keep_open = false;
                     }
                     DialogOutcome::Pending => {}
@@ -3542,41 +4277,40 @@ impl DaraskApp {
     }
 
     /// `show_modal` がモーダルを閉じた直後に呼ぶ。その間に閉じる要求が
-    /// 来ていた(`close_was_queued`)なら、未保存確認へ引き継ぐ(SPEC §8)。
-    /// 既に未保存変更が無くなっていれば、そのまま閉じる(`CancelClose` を
-    /// 既に送ってしまっているため OS の既定動作には戻れず、
-    /// `PendingAction::Close` の通常経路(`execute_pending_action`)と同じく
-    /// 明示的に終了する必要がある)。`show_modal` から切り出してあるのは、
-    /// egui の `Context` を必要とせずユニットテストできるようにするため。
+    /// 来ていた(`close_was_queued`)なら `begin_quit()` に引き継ぐ(SPEC
+    /// §8、v5 §17.4: 「未保存のタブがあればタブごとに順番に確認する」)。
+    /// `begin_quit` は全タブを見直すので、この一時モーダルが表示されて
+    /// いた間にどのタブが変更されたかを気にする必要はない。既に未保存
+    /// 変更が無くなっていれば `begin_quit` が即座に終了する
+    /// (`CancelClose` を既に送ってしまっているため OS の既定動作には
+    /// 戻れず、明示的に終了する必要がある)。`show_modal` から切り出して
+    /// あるのは、egui の `Context` を必要とせずユニットテストできるように
+    /// するため。
     fn resume_queued_close_after_modal(&mut self, close_was_queued: bool) {
         if !close_was_queued {
             return;
         }
-        if self.doc.modified {
-            self.modal = Some(ModalState::ConfirmUnsaved);
-        } else {
-            self.pending_action = None;
-            self.exit_process();
-        }
+        self.begin_quit();
     }
 
     // -----------------------------------------------------------------
     // タイトルバー(SPEC §3)
     // -----------------------------------------------------------------
 
+    /// SPEC §30: 「ウィンドウタイトルは引き続き `{アクティブタブのファイル名}
+    /// {*} - Darask Paint` を表示する」(`Tab::label` が「無題」の番号付けも
+    /// 含めて算出する)。
     fn window_doc_label(&self) -> String {
-        match &self.doc.path {
-            Some(p) => p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "無題".to_owned()),
-            None => "無題".to_owned(),
-        }
+        self.active_tab().label()
     }
 
     /// `{ファイル名}{*} - Darask Paint`(SPEC §3、`*` は未保存変更あり)。
     fn compute_window_title(&self) -> String {
-        let star = if self.doc.modified { "*" } else { "" };
+        let star = if self.active_tab().doc.modified {
+            "*"
+        } else {
+            ""
+        };
         format!("{}{star} - Darask Paint", self.window_doc_label())
     }
 }
@@ -3653,15 +4387,21 @@ impl eframe::App for DaraskApp {
 
         let toast_text = self.tick_toast(ui.ctx());
 
-        let layer_count = self.doc.layers.len();
-        let active_layer_index = self.doc.active_index();
+        let layer_count = self.active_tab().doc.layers.len();
+        let active_layer_index = self.active_tab().doc.active_index();
+        // v5 §31(ARCHITECTURE.md §17.6): 「選択範囲を新規タブに複製」も
+        // 「選択または浮動片がアクティブなときのみ有効」という同じ条件。
+        let has_selection =
+            self.active_tab().selection.is_some() || self.active_tab().floating.is_some();
         let menu_state = MenuState {
             // SPEC §13 最終項: 進行中のストロークがあっても、Undo は「先に
             // 確定してから実行」できるので有効表示にする(has_open_stroke の
             // ときは、確定によって少なくとも 1 件の undo 単位が生まれる)。
-            can_undo: self.history.can_undo() || self.history.has_open_stroke(),
-            can_redo: self.history.can_redo(),
-            has_selection: self.selection.is_some() || self.floating.is_some(),
+            can_undo: self.active_tab().history.can_undo()
+                || self.active_tab().history.has_open_stroke(),
+            can_redo: self.active_tab().history.can_redo(),
+            has_selection,
+            can_duplicate_selection_to_tab: has_selection,
             can_add_layer: layer_count < MAX_LAYERS,
             can_delete_layer: layer_count > 1,
             can_move_layer_up: active_layer_index + 1 < layer_count,
@@ -3675,14 +4415,31 @@ impl eframe::App for DaraskApp {
             self.handle_menu_action(action);
         }
 
+        // SPEC §30: メニューバーの直下に置くタブバー(横1列、水平スクロール)。
+        // `egui::Panel::top` はメニュー(直前)の宣言順で全幅の帯を確保する
+        // (ARCHITECTURE.md §14.9-7: パネルは宣言順にレイアウトが決まる —
+        // ツールバー(left)/右パネル(right)/オプションバー(top)より
+        // 前に置くことで、これらより先に全幅を確保できる)。
+        let tab_infos: Vec<TabInfo> = self
+            .tabs
+            .iter()
+            .map(|t| TabInfo {
+                label: t.label(),
+                modified: t.doc.modified,
+            })
+            .collect();
+        if let Some(action) = tab_bar::show(ui, &tab_infos, self.active_tab) {
+            self.handle_tab_bar_action(action);
+        }
+
         // ステータスバーはレイアウト順の都合上キャンバスより先に描くため、
         // 表示するカーソル座標/ズームは 1 フレーム前の値になる
         // (ポインタ移動のたびにフレームが駆動されるため実用上は無視できる)。
         status_bar::show(
             ui,
-            &self.doc,
-            self.view.hover_img(),
-            self.view.zoom,
+            &self.active_tab().doc,
+            self.active_tab().view.hover_img(),
+            self.active_tab().view.zoom,
             self.current_selection_size(),
             toast_text.as_deref(),
         );
@@ -3711,8 +4468,13 @@ impl eframe::App for DaraskApp {
             recent_colors: &self.recent_colors,
             user_palette: &mut self.user_palette,
         };
-        if let Some(action) = side_panel::show(ui, &mut self.doc, &mut self.layer_rename, color_ctx)
-        {
+        // `doc`/`layer_rename` は今や同じ `Tab` の disjoint なフィールドに
+        // なった(バグ修正: クロスタブ破損防止のためタブごとに独立させた、
+        // `Tab` の docstring 参照)ため、`active_tab_mut()`(`*self` 全体を
+        // 借用してしまうメソッド呼び出し)ではなく `Tab` への可変参照を
+        // 1 回だけ取って両フィールドへ分割借用する。
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(action) = side_panel::show(ui, &mut tab.doc, &mut tab.layer_rename, color_ctx) {
             self.handle_layers_panel_action(action);
         }
 
@@ -3750,52 +4512,54 @@ impl eframe::App for DaraskApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(64)))
             .show(ui, |ui| {
-                let output = self.view.show(ui, &mut self.doc, force_pan, cursor);
+                let tab = &mut self.tabs[self.active_tab];
+                let output = tab.view.show(ui, &mut tab.doc, force_pan, cursor);
                 // SPEC §25: ピクセルグリッド(トグル ON かつズーム 800% 以上
                 // のときだけ)。画像の直後・ツールプレビューより前に描く。
                 if self.show_pixel_grid {
-                    self.view.draw_pixel_grid(&output.painter, &self.doc);
+                    let tab = &self.tabs[self.active_tab];
+                    tab.view.draw_pixel_grid(&output.painter, &tab.doc);
                 }
                 // ARCHITECTURE.md §3: 市松模様→画像→ツールプレビュー→選択枠の順。
                 match self.tool {
                     ToolKind::Pen => self.pen.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
                     ),
                     ToolKind::Eraser => self.eraser.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
                     ),
                     ToolKind::Line => self.line.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
                     ),
                     ToolKind::Rect => self.rect_tool.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
                     ),
                     ToolKind::Ellipse => self.ellipse.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
                     ),
                     ToolKind::Gradient => self.gradient.draw_preview(
                         &output.painter,
-                        &self.view,
+                        &self.active_tab().view,
                         self.primary,
                         self.secondary,
                         self.brush_size,
@@ -3826,9 +4590,10 @@ impl eframe::App for DaraskApp {
                 // `effective_cursor`)のと二重表示になっていた。パン中は
                 // 円を出さない(SPEC §17「円表示時は OS カーソル非表示」の
                 // 排他が崩れないようにする)。
-                if matches!(self.tool, ToolKind::Pen | ToolKind::Eraser) && !self.view.is_panning()
+                if matches!(self.tool, ToolKind::Pen | ToolKind::Eraser)
+                    && !self.active_tab().view.is_panning()
                 {
-                    if let Some(hover) = self.view.hover_img() {
+                    if let Some(hover) = self.active_tab().view.hover_img() {
                         self.draw_brush_cursor(&output.painter, hover);
                     }
                 }
@@ -3933,6 +4698,22 @@ fn track_window_size(
     }
 }
 
+/// v5 §30: 「開こうとしたファイルが既に開いているタブがあれば(パスを
+/// 正規化して比較)」。シンボリックリンク解決・大文字小文字/`..`/相対パスの
+/// 違いを吸収した絶対パスにする。存在しない・アクセスできないパス(理論上
+/// ここには来ないはずだが、I/O は常に失敗しうる、CLAUDE.md 鉄則: I/O 経路で
+/// `unwrap()` しない)の場合は元のパスをそのまま返す(比較の精度は落ちるが
+/// panic はしない)。
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// SPEC §30: 「タブ数の上限は 24。超えて新規タブを作ろうとしたら作成せず
+/// トースト通知」。
+fn tab_limit_toast_message() -> String {
+    format!("これ以上タブを開けません(上限{MAX_TABS}件)")
+}
+
 /// ARCHITECTURE.md §9: egui のデフォルトフォントに日本語グリフは無いため、
 /// Windows システムフォントを追加する。`App::new` 相当(ここでは
 /// `DaraskApp::new`)で一度だけ呼ぶ。
@@ -3989,9 +4770,9 @@ mod tests {
     /// テスト専用にフィールドを直接組み立てるコンストラクタを用意する。
     fn new_for_test(doc: Document) -> DaraskApp {
         DaraskApp {
-            doc,
-            view: CanvasView::new(),
-            history: History::new(),
+            tabs: vec![Tab::new(doc, Some(1))],
+            active_tab: 0,
+            next_untitled_number: 2,
             tool: ToolKind::Pen,
             last_shape_tool: ToolKind::Line,
             last_marquee_tool: ToolKind::Select,
@@ -4023,8 +4804,6 @@ mod tests {
             // だけ空欄がちらつく)。プライマリの初期値(黒)に合わせる。
             color_hex_buffer: color_panel::format_hex(Color32::BLACK),
             user_palette: Vec::new(),
-            selection: None,
-            floating: None,
             select_drag: None,
             next_floating_id: 0,
             text_font: None,
@@ -4038,8 +4817,6 @@ mod tests {
             last_title: String::new(),
             toast: None,
             recent_files: VecDeque::new(),
-            layer_rename: None,
-            next_layer_number: 1,
             // テストにはウィンドウが無いため、ワークアラウンドは常に完了
             // 状態にしておく。
             startup_nudge: StartupNudge::Done,
@@ -4147,13 +4924,13 @@ mod tests {
     fn ctrl_j_duplicates_the_active_layer() {
         // SPEC §20: 「Ctrl+J 複製」(旧 v2 はレイヤーパネル/メニューのみ)。
         let mut app = new_for_test(Document::new(4, 4, Background::White));
-        let before = app.doc.layers.len();
+        let before = app.active_tab().doc.layers.len();
 
         let ctx = ctx_with_key_event(Key::J, Modifiers::CTRL);
         app.handle_shortcuts(&ctx);
 
-        assert_eq!(app.doc.layers.len(), before + 1);
-        assert!(app.history.can_undo());
+        assert_eq!(app.active_tab().doc.layers.len(), before + 1);
+        assert!(app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -4234,7 +5011,7 @@ mod tests {
     #[test]
     fn begin_paste_floating_switches_tool_to_select() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
-        app.doc.modified = true; // 白紙ではない状態を再現する。
+        app.active_tab_mut().doc.modified = true; // 白紙ではない状態を再現する。
         app.tool = ToolKind::Pen;
 
         app.begin_paste_floating(4, 4, [255, 0, 0, 255].repeat(16));
@@ -4244,10 +5021,10 @@ mod tests {
             ToolKind::Select,
             "paste must switch to Select so a later Pen Down cannot discard the open stroke"
         );
-        assert!(app.floating.is_some());
-        assert!(app.history.has_open_stroke());
+        assert!(app.active_tab().floating.is_some());
+        assert!(app.active_tab().history.has_open_stroke());
         assert!(
-            app.doc.modified,
+            app.active_tab().doc.modified,
             "an uncommitted floating paste must already count as an unsaved change"
         );
     }
@@ -4255,7 +5032,7 @@ mod tests {
     #[test]
     fn begin_paste_floating_commit_pushes_a_single_undo_unit() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
-        app.doc.modified = true;
+        app.active_tab_mut().doc.modified = true;
         app.tool = ToolKind::Pen;
 
         app.begin_paste_floating(4, 4, [255, 0, 0, 255].repeat(16));
@@ -4266,14 +5043,17 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke(), "recorder must survive");
+        assert!(
+            app.active_tab().history.has_open_stroke(),
+            "recorder must survive"
+        );
 
         app.commit_selection();
         assert!(
-            app.history.can_undo(),
+            app.active_tab().history.can_undo(),
             "committing the pasted floating must push exactly one undo unit"
         );
-        assert!(!app.history.has_open_stroke());
+        assert!(!app.active_tab().history.has_open_stroke());
     }
 
     // -- v2 レビューで発見・修正したバグ: 白紙置き換え貼り付けが進行中
@@ -4298,10 +5078,10 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
+        assert!(app.active_tab().history.has_open_stroke());
         // StrokeTool は commit_stroke までは modified を立てないため、
         // 修正前はここでまだ pristine 判定のままだった。
-        let painted_stroke = app.doc.get_pixel(5, 5);
+        let painted_stroke = app.active_tab().doc.get_pixel(5, 5);
         assert_ne!(painted_stroke, Some([255, 255, 255, 255]));
 
         app.paste_pixels(16, 16, [0, 255, 0, 255].repeat(256));
@@ -4309,35 +5089,83 @@ mod tests {
         // 元のペンストロークは、貼り付け用の(まだ未確定の)浮動片とは
         // 独立した undo 単位として、先に確定されているはず。
         assert!(
-            app.history.can_undo(),
+            app.active_tab().history.can_undo(),
             "the pen stroke must have been committed as its own undo unit before pasting"
         );
         assert_eq!(
-            (app.doc.width, app.doc.height),
+            (app.active_tab().doc.width, app.active_tab().doc.height),
             (20, 20),
             "the document must not be replaced while a stroke was open (it is no longer pristine after the commit)"
         );
         assert!(
-            app.floating.is_some(),
+            app.active_tab().floating.is_some(),
             "the paste must float onto the existing document instead of replacing it"
         );
         assert!(
-            app.history.has_open_stroke(),
+            app.active_tab().history.has_open_stroke(),
             "the paste itself legitimately opens its own separate, not-yet-committed stroke for the pending floating piece"
         );
 
         // undo を 2 回: ①貼り付け確定 ②ペンストローク。どちらも壊れずに
         // バイト正確に復元できる。
         app.commit_selection(); // Enter 相当で貼り付けを確定する。
-        assert!(!app.history.has_open_stroke());
-        assert!(app.history.undo(&mut app.doc));
+        assert!(!app.active_tab().history.has_open_stroke());
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
         assert_eq!(
-            app.doc.get_pixel(5, 5),
+            app.active_tab().doc.get_pixel(5, 5),
             painted_stroke,
             "undoing the paste must restore the just-drawn pen pixel, not a stale white one"
         );
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.get_pixel(5, 5), Some([255, 255, 255, 255]));
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(
+            app.active_tab().doc.get_pixel(5, 5),
+            Some([255, 255, 255, 255])
+        );
+    }
+
+    #[test]
+    fn pasting_onto_a_pristine_document_commits_a_pending_layer_rename_first() {
+        // 回帰テスト(バグ修正): `replace_document_with_pasted_image`(SPEC
+        // §6 の白紙置き換え貼り付け)は以前、レイヤー名編集中でも単に
+        // `layer_rename = None` で入力内容を破棄するだけだった。しかも
+        // `doc.modified` も立てていなかったため `doc_is_pristine()` が
+        // 誤って「白紙」のままと判定し、レイヤー名を編集しただけの
+        // ドキュメントごと貼り付け画像に置き換えてしまっていた。
+        // `commit_open_gesture`(`paste_pixels` が先頭で呼ぶ)が編集中の
+        // レイヤー名を先に確定するようになったことで、`doc.modified` が
+        // 正しく立ち、「完全に未編集」ではなくなるため、この場合は白紙
+        // 置き換えではなく通常の浮動片貼り付け(ドキュメントは無傷)になる。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        assert!(app.doc_is_pristine());
+        app.active_tab_mut().layer_rename = Some((0, "新しい名前".to_owned(), false));
+
+        app.paste_pixels(4, 4, [0, 255, 0, 255].repeat(16));
+
+        assert!(
+            app.active_tab().layer_rename.is_none(),
+            "the rename box must be closed, not left dangling"
+        );
+        assert_eq!(
+            app.active_tab().doc.layers[0].name,
+            "新しい名前",
+            "the typed name must be committed, not silently discarded"
+        );
+        assert_eq!(
+            (app.active_tab().doc.width, app.active_tab().doc.height),
+            (20, 20),
+            "an in-progress rename counts as a real edit, so the document must not be \
+             replaced wholesale by the pristine-paste shortcut"
+        );
+        assert!(
+            app.active_tab().floating.is_some(),
+            "the paste must float onto the existing (renamed) document instead"
+        );
     }
 
     // -- ドラッグ中のツール切替で進行中ストロークが破棄されるバグ(修正済み) --
@@ -4351,21 +5179,30 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        let painted = app.doc.get_pixel(5, 5);
+        assert!(app.active_tab().history.has_open_stroke());
+        let painted = app.active_tab().doc.get_pixel(5, 5);
         assert_ne!(painted, Some([255, 255, 255, 255]));
 
         app.set_tool(ToolKind::Eraser);
 
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "switching tools must commit the in-progress stroke, not discard it"
         );
-        assert!(app.history.can_undo());
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.get_pixel(5, 5), Some([255, 255, 255, 255]));
-        assert!(app.history.redo(&mut app.doc));
-        assert_eq!(app.doc.get_pixel(5, 5), painted);
+        assert!(app.active_tab().history.can_undo());
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(
+            app.active_tab().doc.get_pixel(5, 5),
+            Some([255, 255, 255, 255])
+        );
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.get_pixel(5, 5), painted);
     }
 
     // -- SPEC §13 最終項(v2 で修正): 進行中のストローク中の undo/redo は
@@ -4393,9 +5230,9 @@ mod tests {
                 button: PointerButton::Primary,
             },
         ]);
-        assert!(app.history.can_undo());
-        assert!(!app.history.has_open_stroke());
-        let painted_stroke1 = app.doc.get_pixel(2, 2);
+        assert!(app.active_tab().history.can_undo());
+        assert!(!app.active_tab().history.has_open_stroke());
+        let painted_stroke1 = app.active_tab().doc.get_pixel(2, 2);
         assert_ne!(painted_stroke1, Some([255, 255, 255, 255]));
 
         // ストローク2: Down だけ送ってストロークを開いたままにする。
@@ -4404,26 +5241,29 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        let painted_stroke2 = app.doc.get_pixel(10, 10);
+        assert!(app.active_tab().history.has_open_stroke());
+        let painted_stroke2 = app.active_tab().doc.get_pixel(10, 10);
         assert_ne!(painted_stroke2, Some([255, 255, 255, 255]));
 
         app.handle_menu_action(MenuAction::Undo);
 
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "undo must commit the open stroke first (same as switching tools)"
         );
         // ストローク2 は確定直後に取り消されるので消えている。
-        assert_eq!(app.doc.get_pixel(10, 10), Some([255, 255, 255, 255]));
+        assert_eq!(
+            app.active_tab().doc.get_pixel(10, 10),
+            Some([255, 255, 255, 255])
+        );
         // ストローク1 は無傷のまま残る。
-        assert_eq!(app.doc.get_pixel(2, 2), painted_stroke1);
+        assert_eq!(app.active_tab().doc.get_pixel(2, 2), painted_stroke1);
         assert!(
-            app.history.can_undo(),
+            app.active_tab().history.can_undo(),
             "stroke1 must remain on the undo stack"
         );
         assert!(
-            app.history.can_redo(),
+            app.active_tab().history.can_redo(),
             "the just-undone stroke2 must be on the redo stack"
         );
     }
@@ -4444,29 +5284,29 @@ mod tests {
             },
         ]);
         app.handle_menu_action(MenuAction::Undo); // stroke1 -> redo スタックへ。
-        assert!(app.history.can_redo());
+        assert!(app.active_tab().history.can_redo());
 
         app.dispatch_canvas_events(vec![ToolEvent::Down {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        let painted_stroke2 = app.doc.get_pixel(10, 10);
+        assert!(app.active_tab().history.has_open_stroke());
+        let painted_stroke2 = app.active_tab().doc.get_pixel(10, 10);
 
         app.handle_menu_action(MenuAction::Redo);
 
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "redo must commit the open stroke first (same as switching tools)"
         );
         // ストローク2 の確定が新規 push なので redo スタック(stroke1)は
         // クリアされ、この redo 呼び出し自体は何もしない(no-op)。
         assert!(
-            !app.history.can_redo(),
+            !app.active_tab().history.can_redo(),
             "committing stroke2 must have cleared the redo stack"
         );
-        assert_eq!(app.doc.get_pixel(10, 10), painted_stroke2);
+        assert_eq!(app.active_tab().doc.get_pixel(10, 10), painted_stroke2);
     }
 
     // -- v2 レビューで発見・修正したバグ: 選択ツールの単クリック(ドラッグ
@@ -4493,7 +5333,7 @@ mod tests {
         });
 
         assert!(
-            app.selection.is_none(),
+            app.active_tab().selection.is_none(),
             "a plain click (no drag) must not leave behind a 1x1 selection"
         );
     }
@@ -4515,7 +5355,11 @@ mod tests {
             button: PointerButton::Primary,
         });
 
-        let selection = app.selection.expect("a real drag must create a selection");
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("a real drag must create a selection");
         assert_eq!(
             (
                 selection.mask.bbox.x0,
@@ -4537,7 +5381,7 @@ mod tests {
         // 「内部クリック」を検証するにはハンドルの当たり判定(中心から
         // ±3.5pt)から十分離れた点でクリックする必要がある(16x16 の選択で
         // 中心 (10,10) を使えば、どの辺・角ハンドルからも 8pt 以上離れる)。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
@@ -4550,7 +5394,7 @@ mod tests {
             mods: Modifiers::NONE,
         });
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "a plain click must not float the selection yet"
         );
 
@@ -4558,13 +5402,13 @@ mod tests {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
         });
-        assert!(app.floating.is_none());
+        assert!(app.active_tab().floating.is_none());
         assert!(
-            app.selection.is_some(),
+            app.active_tab().selection.is_some(),
             "selection should remain after a no-op click"
         );
         assert!(
-            !app.history.can_undo(),
+            !app.active_tab().history.can_undo(),
             "a click without drag must not push an undo entry"
         );
     }
@@ -4576,7 +5420,7 @@ mod tests {
         // v2 §16: 上のテストと同じ理由で、ハンドルの当たり判定を避けた中心
         // 付近でドラッグする(rect 原点 (2,2) からの down オフセットは (8,8)
         // で、旧テストの (3,3) と役割は同じ)。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
@@ -4595,6 +5439,7 @@ mod tests {
         });
 
         let floating = app
+            .active_tab()
             .floating
             .as_ref()
             .expect("an actual drag must float the selection");
@@ -4615,7 +5460,7 @@ mod tests {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Pen;
         app.select_all();
-        assert!(app.selection.is_some());
+        assert!(app.active_tab().selection.is_some());
         assert_eq!(app.tool, ToolKind::Pen, "select_all must not switch tools");
 
         app.dispatch_canvas_events(vec![ToolEvent::Down {
@@ -4623,22 +5468,22 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        let painted_stroke = app.doc.get_pixel(5, 5);
+        assert!(app.active_tab().history.has_open_stroke());
+        let painted_stroke = app.active_tab().doc.get_pixel(5, 5);
         assert_ne!(painted_stroke, Some([255, 255, 255, 255]));
 
         app.delete_selection();
 
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "the pen stroke must have been committed as its own undo unit"
         );
         assert!(
-            app.selection.is_none(),
+            app.active_tab().selection.is_none(),
             "the full-canvas selection must have been deleted (made transparent)"
         );
         // 削除パッチは全面透明化のはず(選択の消去、SPEC §6)。
-        assert_eq!(app.doc.get_pixel(0, 0), Some([0, 0, 0, 0]));
+        assert_eq!(app.active_tab().doc.get_pixel(0, 0), Some([0, 0, 0, 0]));
 
         // 新しいストローク(Down+Up)を描いても、正常な(壊れていない)
         // undo 単位として記録される(`Tool::cancel` はストローク確定時に
@@ -4655,7 +5500,7 @@ mod tests {
                 button: PointerButton::Primary,
             },
         ]);
-        let painted_after_delete = app.doc.get_pixel(10, 10);
+        let painted_after_delete = app.active_tab().doc.get_pixel(10, 10);
         assert_ne!(
             painted_after_delete,
             Some([0, 0, 0, 0]),
@@ -4665,15 +5510,27 @@ mod tests {
         // undo 3 回: ③新ストローク ②選択削除 ①ペンの最初のストローク、で
         // それぞれバイト正確に復元できる(ストロークが破損したパッチに
         // 焼き込まれたり、未確定のまま残ったりしていない)。
-        assert!(app.history.undo(&mut app.doc));
-        assert!(app.history.undo(&mut app.doc));
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
         assert_eq!(
-            app.doc.get_pixel(5, 5),
+            app.active_tab().doc.get_pixel(5, 5),
             painted_stroke,
             "undoing the delete must restore the pen dot painted just before Delete was pressed"
         );
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.get_pixel(5, 5), Some([255, 255, 255, 255]));
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(
+            app.active_tab().doc.get_pixel(5, 5),
+            Some([255, 255, 255, 255])
+        );
     }
 
     // -- Ctrl+X がコピー失敗時にも削除してしまうバグ(修正済み) -------------
@@ -4684,12 +5541,13 @@ mod tests {
         // 幅/高さ 0 は io::copy_image_to_clipboard が OS クリップボードに
         // 触れる前に決定的に失敗させる(ARCHITECTURE.md §12-8)ので、実際の
         // OS クリップボード状態に依存せずにこの経路をテストできる。
-        app.floating = Some(Floating::new_rect(vec![], 0, 0, pos2(0.0, 0.0), None, 1));
+        app.active_tab_mut().floating =
+            Some(Floating::new_rect(vec![], 0, 0, pos2(0.0, 0.0), None, 1));
 
         app.cut_selection_to_clipboard();
 
         assert!(
-            app.floating.is_some(),
+            app.active_tab().floating.is_some(),
             "cut must not delete the selection when the clipboard copy failed"
         );
     }
@@ -4714,7 +5572,7 @@ mod tests {
 
         let png_path = dir.join("photo.png");
         assert_eq!(
-            app.doc.path,
+            app.active_tab().doc.path,
             Some(png_path.clone()),
             "saving to an unsupported extension must redirect to .png instead of writing PNG bytes under .gif"
         );
@@ -4729,7 +5587,7 @@ mod tests {
     #[test]
     fn resume_queued_close_after_modal_reopens_as_confirm_unsaved_when_still_modified() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
-        app.doc.modified = true;
+        app.active_tab_mut().doc.modified = true;
         app.modal = None; // CanvasResize 等、直前のモーダルが閉じた直後を再現。
 
         app.resume_queued_close_after_modal(true);
@@ -4743,7 +5601,7 @@ mod tests {
     #[test]
     fn resume_queued_close_after_modal_does_nothing_when_no_close_was_queued() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
-        app.doc.modified = true;
+        app.active_tab_mut().doc.modified = true;
 
         app.resume_queued_close_after_modal(false);
 
@@ -4756,25 +5614,60 @@ mod tests {
     fn layer_add_inserts_a_new_layer_as_a_single_undo_unit() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         app.layer_add();
-        assert_eq!(app.doc.layers.len(), 2);
-        assert_eq!(app.doc.layers[1].name, "レイヤー 1");
-        assert!(app.history.can_undo());
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers[1].name, "レイヤー 1");
+        assert!(app.active_tab().history.can_undo());
 
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 1);
-        assert!(app.history.can_redo());
-        assert!(app.history.redo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 2);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert!(app.active_tab().history.can_redo());
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
     }
 
     #[test]
     fn layer_add_names_increment_regardless_of_deletions() {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
         app.layer_add();
-        assert_eq!(app.doc.layers[1].name, "レイヤー 1");
+        assert_eq!(app.active_tab().doc.layers[1].name, "レイヤー 1");
         app.layer_delete();
         app.layer_add();
-        assert_eq!(app.doc.layers[1].name, "レイヤー 2");
+        assert_eq!(app.active_tab().doc.layers[1].name, "レイヤー 2");
+    }
+
+    #[test]
+    fn layer_add_numbering_is_independent_per_tab() {
+        // 回帰テスト(バグ修正): 「レイヤー N」の採番カウンタは以前
+        // `DaraskApp` 直下の共有フィールドだったため、タブを切り替えて
+        // 別タブでレイヤーを追加すると番号が続きから採番され、タブ単体で
+        // 見ると 1 から連番にならず歯抜けになっていた
+        // (`Tab::next_layer_number` のドキュメントコメント参照)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add();
+        assert_eq!(app.active_tab().doc.layers[1].name, "レイヤー 1");
+
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        app.layer_add();
+        assert_eq!(
+            app.active_tab().doc.layers[1].name,
+            "レイヤー 1",
+            "a brand-new tab's first added layer must be numbered 1, not continue \
+             from another tab's counter"
+        );
+
+        app.switch_tab(0);
+        app.layer_add();
+        assert_eq!(
+            app.active_tab().doc.layers[2].name,
+            "レイヤー 2",
+            "switching back must not have disturbed this tab's own counter"
+        );
     }
 
     #[test]
@@ -4782,15 +5675,18 @@ mod tests {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
         app.layer_delete();
         assert_eq!(
-            app.doc.layers.len(),
+            app.active_tab().doc.layers.len(),
             1,
             "must refuse to delete the last layer"
         );
-        assert!(!app.history.can_undo(), "a refused op must not push undo");
+        assert!(
+            !app.active_tab().history.can_undo(),
+            "a refused op must not push undo"
+        );
 
         app.layer_merge_down();
-        assert_eq!(app.doc.layers.len(), 1);
-        assert!(!app.history.can_undo());
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert!(!app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -4799,11 +5695,11 @@ mod tests {
         for _ in 0..(MAX_LAYERS - 1) {
             app.layer_add();
         }
-        assert_eq!(app.doc.layers.len(), MAX_LAYERS);
+        assert_eq!(app.active_tab().doc.layers.len(), MAX_LAYERS);
 
         app.layer_add(); // 上限到達、拒否されるはず。
         assert_eq!(
-            app.doc.layers.len(),
+            app.active_tab().doc.layers.len(),
             MAX_LAYERS,
             "must refuse to exceed MAX_LAYERS"
         );
@@ -4811,11 +5707,17 @@ mod tests {
         // 上限到達で拒否された呼び出しは undo エントリを積まない: ちょうど
         // MAX_LAYERS - 1 回の undo で元の 1 枚まで戻り、それ以上は戻せない。
         for _ in 0..(MAX_LAYERS - 1) {
-            assert!(app.history.undo(&mut app.doc));
+            assert!({
+                let tab = app.active_tab_mut();
+                tab.history.undo(&mut tab.doc)
+            });
         }
-        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
         assert!(
-            !app.history.undo(&mut app.doc),
+            !{
+                let tab = app.active_tab_mut();
+                tab.history.undo(&mut tab.doc)
+            },
             "the refused add must not have pushed an undo entry"
         );
     }
@@ -4840,70 +5742,93 @@ mod tests {
         for _ in 0..40 {
             app.layer_add();
         }
-        assert_eq!(app.doc.layers.len(), 41);
+        assert_eq!(app.active_tab().doc.layers.len(), 41);
         for i in 0..40 {
             assert!(
-                app.history.undo(&mut app.doc),
+                {
+                    let tab = app.active_tab_mut();
+                    tab.history.undo(&mut tab.doc)
+                },
                 "AddLayer entry #{i} must not have been evicted by the 256MB history limit"
             );
         }
-        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
     }
 
     #[test]
     fn layer_duplicate_history_round_trips_via_app() {
         let mut app = new_for_test(Document::new(4, 4, Background::Transparent));
-        app.doc.set_pixel(0, 0, [5, 6, 7, 255]);
+        app.active_tab_mut().doc.set_pixel(0, 0, [5, 6, 7, 255]);
         app.layer_duplicate();
-        assert_eq!(app.doc.layers.len(), 2);
-        assert_eq!(app.doc.layers[1].pixels[0..4], [5, 6, 7, 255]);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers[1].pixels[0..4], [5, 6, 7, 255]);
 
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 1);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
 
-        assert!(app.history.redo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 2);
-        assert_eq!(app.doc.layers[1].pixels[0..4], [5, 6, 7, 255]);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers[1].pixels[0..4], [5, 6, 7, 255]);
     }
 
     #[test]
     fn layer_move_up_and_down_history_round_trip_via_app() {
         let mut app = new_for_test(Document::new(2, 2, Background::White));
-        app.doc.layers[0].name = "下".to_owned();
+        app.active_tab_mut().doc.layers[0].name = "下".to_owned();
         app.layer_add();
-        app.doc.layers[1].name = "上".to_owned();
+        app.active_tab_mut().doc.layers[1].name = "上".to_owned();
         app.layer_move_down();
-        assert_eq!(app.doc.layers[0].name, "上");
-        assert_eq!(app.doc.active, 0);
+        assert_eq!(app.active_tab().doc.layers[0].name, "上");
+        assert_eq!(app.active_tab().doc.active, 0);
 
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.layers[0].name, "下");
-        assert_eq!(app.doc.active, 1);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers[0].name, "下");
+        assert_eq!(app.active_tab().doc.active, 1);
 
-        assert!(app.history.redo(&mut app.doc));
-        assert_eq!(app.doc.layers[0].name, "上");
-        assert_eq!(app.doc.active, 0);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers[0].name, "上");
+        assert_eq!(app.active_tab().doc.active, 0);
     }
 
     #[test]
     fn layer_merge_down_history_round_trips_via_app() {
         let mut app = new_for_test(Document::new(1, 1, Background::Transparent));
-        app.doc.layers[0] = crate::document::Layer::filled("下", 1, 1, [255, 255, 255, 255]);
+        app.active_tab_mut().doc.layers[0] =
+            crate::document::Layer::filled("下", 1, 1, [255, 255, 255, 255]);
         app.layer_add();
-        app.doc.layers[1] = crate::document::Layer::filled("上", 1, 1, [0, 0, 0, 255]);
-        app.doc.layers[1].opacity = 128;
+        app.active_tab_mut().doc.layers[1] =
+            crate::document::Layer::filled("上", 1, 1, [0, 0, 0, 255]);
+        app.active_tab_mut().doc.layers[1].opacity = 128;
 
         app.layer_merge_down();
-        assert_eq!(app.doc.layers.len(), 1);
-        let merged = app.doc.layers[0].pixels.clone();
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        let merged = app.active_tab().doc.layers[0].pixels.clone();
 
-        assert!(app.history.undo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 2);
-        assert_eq!(app.doc.layers[1].opacity, 128);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers[1].opacity, 128);
 
-        assert!(app.history.redo(&mut app.doc));
-        assert_eq!(app.doc.layers.len(), 1);
-        assert_eq!(app.doc.layers[0].pixels, merged);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert_eq!(app.active_tab().doc.layers[0].pixels, merged);
     }
 
     // -- ARCHITECTURE.md §14.9-3: レイヤー操作は浮動片/ストローク進行中に
@@ -4918,21 +5843,30 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        let painted = app.doc.get_pixel(5, 5);
+        assert!(app.active_tab().history.has_open_stroke());
+        let painted = app.active_tab().doc.get_pixel(5, 5);
         assert_ne!(painted, Some([255, 255, 255, 255]));
 
         app.layer_add();
 
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "the in-progress stroke must be committed before the layer is added"
         );
         // 2 つの undo 単位が積まれているはず: ①ペンストローク ②レイヤー追加。
-        assert!(app.history.undo(&mut app.doc)); // レイヤー追加を取り消す
-        assert_eq!(app.doc.layers.len(), 1);
-        assert!(app.history.undo(&mut app.doc)); // ストロークを取り消す
-        assert_eq!(app.doc.get_pixel(5, 5), Some([255, 255, 255, 255]));
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        }); // レイヤー追加を取り消す
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        }); // ストロークを取り消す
+        assert_eq!(
+            app.active_tab().doc.get_pixel(5, 5),
+            Some([255, 255, 255, 255])
+        );
     }
 
     #[test]
@@ -4942,7 +5876,7 @@ mod tests {
         // v2 §16: ハンドルの当たり判定を避けて内部ドラッグを起こす
         // (上の `dragging_inside_selection_floats_it_and_tracks_the_pointer`
         // と同じ理由)。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
@@ -4959,28 +5893,28 @@ mod tests {
             mods: Modifiers::NONE,
         });
         assert!(
-            app.floating.is_some(),
+            app.active_tab().floating.is_some(),
             "drag must have floated the selection"
         );
 
         app.layer_add();
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "the floating piece must be committed before the layer is added"
         );
-        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
     }
 
     #[test]
     fn set_active_layer_commits_open_floating_before_switching() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.layer_add();
-        assert_eq!(app.doc.active, 1);
+        assert_eq!(app.active_tab().doc.active, 1);
 
         app.tool = ToolKind::Select;
         // v2 §16: 同上、ハンドルの当たり判定を避ける。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
@@ -4996,15 +5930,15 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
 
         app.set_active_layer(0);
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "switching the active layer must commit the floating piece to the previously active layer"
         );
-        assert_eq!(app.doc.active, 0);
+        assert_eq!(app.active_tab().doc.active, 0);
     }
 
     #[test]
@@ -5013,15 +5947,16 @@ mod tests {
         // 履歴を経由せず直接レイヤーを増やし、切り替え自体が undo 単位に
         // ならないことだけを検証する(`layer_add` 自体の undo は別テスト
         // `layer_add_inserts_a_new_layer_as_a_single_undo_unit` で担保済み)。
-        app.doc
+        app.active_tab_mut()
+            .doc
             .layers
             .push(crate::document::Layer::filled("上", 10, 10, [0, 0, 0, 0]));
-        assert!(!app.history.can_undo());
+        assert!(!app.active_tab().history.can_undo());
 
         app.set_active_layer(1);
-        assert_eq!(app.doc.active, 1);
+        assert_eq!(app.active_tab().doc.active, 1);
         assert!(
-            !app.history.can_undo(),
+            !app.active_tab().history.can_undo(),
             "switching the active layer must not be a history op (SPEC §13)"
         );
     }
@@ -5030,17 +5965,17 @@ mod tests {
     fn layers_panel_action_dispatch_wires_through_to_document() {
         let mut app = new_for_test(Document::new(6, 6, Background::White));
         app.handle_layers_panel_action(LayersPanelAction::Add);
-        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
         app.handle_layers_panel_action(LayersPanelAction::Activate(0));
-        assert_eq!(app.doc.active, 0);
+        assert_eq!(app.active_tab().doc.active, 0);
         app.handle_layers_panel_action(LayersPanelAction::MoveUp);
-        assert_eq!(app.doc.active, 1);
+        assert_eq!(app.active_tab().doc.active, 1);
         app.handle_layers_panel_action(LayersPanelAction::Duplicate);
-        assert_eq!(app.doc.layers.len(), 3);
+        assert_eq!(app.active_tab().doc.layers.len(), 3);
         app.handle_layers_panel_action(LayersPanelAction::MergeDown);
-        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
         app.handle_layers_panel_action(LayersPanelAction::Delete);
-        assert_eq!(app.doc.layers.len(), 1);
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
     }
 
     #[test]
@@ -5175,7 +6110,7 @@ mod tests {
 
         app.open_recent_file(1);
 
-        assert_eq!(app.doc.path, Some(path.clone()));
+        assert_eq!(app.active_tab().doc.path, Some(path.clone()));
         assert_eq!(
             app.recent_files.front(),
             Some(&path),
@@ -5295,7 +6230,7 @@ mod tests {
         io::save_image(&mut doc, &path, SaveFormat::Png).expect("seed file should save");
 
         let mut app = new_for_test(Document::new(4, 4, Background::White));
-        app.open_path(path.clone());
+        app.open_path_in_new_tab(path.clone());
 
         assert_eq!(app.recent_files.front(), Some(&path));
 
@@ -5436,7 +6371,7 @@ mod tests {
     fn dragging_a_handle_on_an_already_floating_piece_resizes_it() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.floating = Some(Floating::new_rect(
+        app.active_tab_mut().floating = Some(Floating::new_rect(
             [255, 0, 0, 255].repeat(100), // 10x10 の不透明赤
             10,
             10,
@@ -5468,7 +6403,7 @@ mod tests {
             mods: Modifiers::NONE,
         });
 
-        let floating = app.floating.as_ref().expect("still floating");
+        let floating = app.active_tab().floating.as_ref().expect("still floating");
         // 左上(反対側の角)は固定されたまま、右下がポインタに追従して 20x20 に拡大する。
         assert_eq!(floating.pos, pos2(5.0, 5.0));
         assert_eq!((floating.w, floating.h), (20, 20));
@@ -5493,7 +6428,7 @@ mod tests {
         // 同様にまず浮動化してから拡縮する」。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5507,10 +6442,10 @@ mod tests {
         });
 
         assert!(
-            app.floating.is_some(),
+            app.active_tab().floating.is_some(),
             "grabbing a handle on a plain selection must float it first"
         );
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().selection.is_none());
         assert!(matches!(
             app.select_drag,
             Some(SelectDrag::ResizeFloating {
@@ -5524,7 +6459,7 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        let floating = app.floating.as_ref().expect("still floating");
+        let floating = app.active_tab().floating.as_ref().expect("still floating");
         assert_eq!(floating.pos, pos2(5.0, 5.0));
         assert_eq!((floating.w, floating.h), (20, 20));
     }
@@ -5533,7 +6468,7 @@ mod tests {
     fn shift_held_while_dragging_a_handle_locks_the_aspect_ratio() {
         let mut app = new_for_test(Document::new(100, 100, Background::White));
         app.tool = ToolKind::Select;
-        app.floating = Some(Floating::new_rect(
+        app.active_tab_mut().floating = Some(Floating::new_rect(
             [0, 0, 0, 255].repeat(200), // 10x20
             10,
             20,
@@ -5553,7 +6488,7 @@ mod tests {
             mods: Modifiers::SHIFT,
         });
 
-        let floating = app.floating.as_ref().expect("still floating");
+        let floating = app.active_tab().floating.as_ref().expect("still floating");
         // 元の比率は 10:20 = 1:2。Shift でこの比率が保たれるはず。
         let ratio = floating.w as f32 / floating.h as f32;
         assert!(
@@ -5567,13 +6502,13 @@ mod tests {
     #[test]
     fn hit_resize_handle_detects_the_handle_under_a_plain_selection() {
         // `select_cursor`(SPEC §16: 「ハンドルホバー時はリサイズカーソルを
-        // 表示」)は `self.view.hover_img()` 経由でこの判定を使う。
+        // 表示」)は `self.active_tab().view.hover_img()` 経由でこの判定を使う。
         // `hover_img` はキャンバス上のポインタ移動(`CanvasView::show`、
         // egui::Context 必須)でしか更新できないため、ここではその下位関数
         // `hit_resize_handle`/`handle_cursor` を直接検証する。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5597,7 +6532,7 @@ mod tests {
     fn move_tool_floats_and_moves_the_whole_active_layer_when_no_selection() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Move;
-        app.doc.set_pixel(2, 2, [9, 9, 9, 255]);
+        app.active_tab_mut().doc.set_pixel(2, 2, [9, 9, 9, 255]);
 
         app.handle_move_event(ToolEvent::Down {
             img: pos2(3.0, 3.0),
@@ -5611,6 +6546,7 @@ mod tests {
         });
 
         let floating = app
+            .active_tab()
             .floating
             .as_ref()
             .expect("dragging with no selection must float the whole active layer");
@@ -5625,14 +6561,14 @@ mod tests {
             "must track the pointer delta from the down position"
         );
         // 切り出し元(全面)は浮動化と同時に透明化されている(未確定)。
-        assert_eq!(app.doc.get_pixel(2, 2), Some([0, 0, 0, 0]));
+        assert_eq!(app.active_tab().doc.get_pixel(2, 2), Some([0, 0, 0, 0]));
     }
 
     #[test]
     fn move_tool_moves_only_the_existing_selection_rect() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Move;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5651,6 +6587,7 @@ mod tests {
         });
 
         let floating = app
+            .active_tab()
             .floating
             .as_ref()
             .expect("must float the existing selection");
@@ -5678,11 +6615,11 @@ mod tests {
         });
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "a plain click (no drag) must not float the layer"
         );
         assert!(
-            !app.history.can_undo(),
+            !app.active_tab().history.can_undo(),
             "a no-op click must not push an undo entry (SPEC §18: before==after suppression)"
         );
     }
@@ -5701,15 +6638,15 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
 
         app.set_tool(ToolKind::Pen);
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "switching tools must commit the open floating (same rule as the select tool)"
         );
-        assert!(app.history.can_undo());
+        assert!(app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -5728,15 +6665,15 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
 
         app.layer_add();
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "the floating piece must be committed before the layer is added"
         );
-        assert_eq!(app.doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
     }
 
     // -- v3 §18: Esc = キャンセル(ARCHITECTURE.md §15.2, §15.6 落とし穴1) ---
@@ -5745,9 +6682,9 @@ mod tests {
     fn cancel_floating_after_dragging_a_selection_restores_original_bytes_exactly() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Select;
-        app.doc.set_pixel(7, 7, [10, 20, 30, 255]);
-        let original = app.doc.active_pixels().to_vec();
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().doc.set_pixel(7, 7, [10, 20, 30, 255]);
+        let original = app.active_tab().doc.active_pixels().to_vec();
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 12,
@@ -5764,9 +6701,12 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        assert!(app.floating.is_some(), "drag must float the selection");
+        assert!(
+            app.active_tab().floating.is_some(),
+            "drag must float the selection"
+        );
         assert_ne!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             original.as_slice(),
             "the cut_from region must already be transparent while floating"
         );
@@ -5774,25 +6714,25 @@ mod tests {
         app.cancel_floating();
 
         assert_eq!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             original.as_slice(),
             "Esc must byte-exactly restore the pre-float document"
         );
-        assert!(app.floating.is_none());
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().floating.is_none());
+        assert!(app.active_tab().selection.is_none());
         assert!(
-            !app.history.can_undo(),
+            !app.active_tab().history.can_undo(),
             "cancel must not push any undo entry"
         );
-        assert!(!app.history.has_open_stroke());
+        assert!(!app.active_tab().history.has_open_stroke());
     }
 
     #[test]
     fn cancel_floating_after_move_tool_restores_the_whole_layer() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         app.tool = ToolKind::Move;
-        app.doc.set_pixel(3, 3, [1, 2, 3, 255]);
-        let original = app.doc.active_pixels().to_vec();
+        app.active_tab_mut().doc.set_pixel(3, 3, [1, 2, 3, 255]);
+        let original = app.active_tab().doc.active_pixels().to_vec();
 
         app.handle_move_event(ToolEvent::Down {
             img: pos2(1.0, 1.0),
@@ -5804,35 +6744,35 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
 
         app.cancel_floating();
 
-        assert_eq!(app.doc.active_pixels(), original.as_slice());
-        assert!(app.floating.is_none());
-        assert!(!app.history.can_undo());
+        assert_eq!(app.active_tab().doc.active_pixels(), original.as_slice());
+        assert!(app.active_tab().floating.is_none());
+        assert!(!app.active_tab().history.can_undo());
     }
 
     #[test]
     fn cancel_floating_after_paste_just_discards_without_touching_the_document() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
-        app.doc.modified = true; // 白紙ではない状態を再現する。
-        let original = app.doc.active_pixels().to_vec();
+        app.active_tab_mut().doc.modified = true; // 白紙ではない状態を再現する。
+        let original = app.active_tab().doc.active_pixels().to_vec();
 
         app.begin_paste_floating(3, 3, [1, 2, 3, 255].repeat(9));
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
         assert_eq!(app.tool, ToolKind::Select);
 
         app.cancel_floating();
 
         assert_eq!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             original.as_slice(),
             "a pasted floating never touched the document before commit, so cancel leaves it untouched"
         );
-        assert!(app.floating.is_none());
-        assert!(!app.history.can_undo());
-        assert!(!app.history.has_open_stroke());
+        assert!(app.active_tab().floating.is_none());
+        assert!(!app.active_tab().history.can_undo());
+        assert!(!app.active_tab().history.has_open_stroke());
     }
 
     // -- v3 §18: 自由変形(Ctrl+T、ARCHITECTURE.md §15.2) ---------------------
@@ -5841,7 +6781,7 @@ mod tests {
     fn free_transform_floats_the_existing_selection_and_preserves_its_rect() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Pen; // 直前のツールが何であっても働くことを示す。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5852,6 +6792,7 @@ mod tests {
 
         assert_eq!(app.tool, ToolKind::Select);
         let floating = app
+            .active_tab()
             .floating
             .as_ref()
             .expect("Ctrl+T must float the existing selection");
@@ -5862,13 +6803,13 @@ mod tests {
     #[test]
     fn free_transform_from_select_tool_with_a_plain_selection_does_not_lose_it() {
         // 回帰テスト: 進行中ジェスチャの確定に無条件で `commit_selection`
-        // (常に `self.selection` をクリアする)を使うと、選択ツールで
+        // (常に `self.active_tab().selection` をクリアする)を使うと、選択ツールで
         // 「まだ浮動化していない」選択を持っている状態で Ctrl+T を押したとき
         // にその選択自体が消えてしまい、変形対象がキャンバス全体に化けて
         // しまうバグになる(`free_transform` 実装時に発見・回避)。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5877,7 +6818,7 @@ mod tests {
 
         app.free_transform();
 
-        let floating = app.floating.as_ref().expect("must float");
+        let floating = app.active_tab().floating.as_ref().expect("must float");
         assert_eq!(
             (floating.w, floating.h),
             (10, 10),
@@ -5890,14 +6831,14 @@ mod tests {
     #[test]
     fn switching_tools_away_from_select_preserves_a_plain_selection() {
         // 回帰テスト: `commit_open_gesture`(`set_tool` が呼ぶ)が無条件で
-        // `commit_selection`(常に `self.selection` をクリアする)を使うと、
+        // `commit_selection`(常に `self.active_tab().selection` をクリアする)を使うと、
         // 「M で選択してから G/Shift+G でグラデーションに切り替える」という
         // SPEC §21/§23 が前提とする使い方で、ツール切替の瞬間に選択が消えて
         // しまいクリップ対象が無くなるバグになる(`free_transform` が Ctrl+T
         // について既に回避していたのと同一クラス、上のテスト参照)。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -5907,10 +6848,10 @@ mod tests {
         app.set_tool(ToolKind::Gradient);
 
         assert!(
-            app.selection.is_some(),
+            app.active_tab().selection.is_some(),
             "a plain (non-floating) selection must survive a plain tool switch"
         );
-        assert!(app.floating.is_none());
+        assert!(app.active_tab().floating.is_none());
     }
 
     #[test]
@@ -5930,19 +6871,19 @@ mod tests {
             }),
             pos2(2.0, 2.0),
         );
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
         // 実際に動かしていないと、切り出し元へそのまま同じ画素を貼り戻すだけ
         // になり before==after 抑制(ARCHITECTURE.md §15.2)で undo 単位が
         // 積まれない。「移動した」ことにするため位置をずらす。
-        app.floating.as_mut().unwrap().pos = pos2(5.0, 5.0);
+        app.active_tab_mut().floating.as_mut().unwrap().pos = pos2(5.0, 5.0);
 
         app.set_tool(ToolKind::Pen);
 
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "the floating piece must be committed"
         );
-        assert!(app.history.can_undo());
+        assert!(app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -5953,6 +6894,7 @@ mod tests {
         app.free_transform();
 
         let floating = app
+            .active_tab()
             .floating
             .as_ref()
             .expect("Ctrl+T must float the whole layer when there is no selection");
@@ -5962,17 +6904,17 @@ mod tests {
     #[test]
     fn free_transform_can_be_cancelled_with_esc_restoring_the_original_document() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
-        app.doc.set_pixel(4, 4, [5, 6, 7, 255]);
-        let original = app.doc.active_pixels().to_vec();
+        app.active_tab_mut().doc.set_pixel(4, 4, [5, 6, 7, 255]);
+        let original = app.active_tab().doc.active_pixels().to_vec();
 
         app.free_transform();
-        assert!(app.floating.is_some());
+        assert!(app.active_tab().floating.is_some());
 
         app.cancel_floating();
 
-        assert_eq!(app.doc.active_pixels(), original.as_slice());
-        assert!(app.floating.is_none());
-        assert!(!app.history.can_undo());
+        assert_eq!(app.active_tab().doc.active_pixels(), original.as_slice());
+        assert!(app.active_tab().floating.is_none());
+        assert!(!app.active_tab().history.can_undo());
     }
 
     // -- v3 §18: ズームツール(ARCHITECTURE.md §15.2) -------------------------
@@ -5981,7 +6923,7 @@ mod tests {
     fn zoom_tool_click_zooms_in_around_the_click_point() {
         let mut app = new_for_test(Document::new(100, 100, Background::White));
         app.tool = ToolKind::Zoom;
-        let before_zoom = app.view.zoom;
+        let before_zoom = app.active_tab().view.zoom;
 
         app.dispatch_canvas_events(vec![ToolEvent::Down {
             img: pos2(30.0, 40.0),
@@ -5989,15 +6931,18 @@ mod tests {
             mods: Modifiers::NONE,
         }]);
 
-        assert!(app.view.zoom > before_zoom, "a plain click must zoom in");
+        assert!(
+            app.active_tab().view.zoom > before_zoom,
+            "a plain click must zoom in"
+        );
     }
 
     #[test]
     fn zoom_tool_alt_click_zooms_out_instead_of_sampling_a_color() {
         let mut app = new_for_test(Document::new(100, 100, Background::White));
         app.tool = ToolKind::Zoom;
-        app.view.zoom = 2.0; // まず拡大しておき、縮小できることを確認する。
-        let before_zoom = app.view.zoom;
+        app.active_tab_mut().view.zoom = 2.0; // まず拡大しておき、縮小できることを確認する。
+        let before_zoom = app.active_tab().view.zoom;
         let before_primary = app.primary;
 
         app.dispatch_canvas_events(vec![ToolEvent::Down {
@@ -6006,7 +6951,10 @@ mod tests {
             mods: Modifiers::ALT,
         }]);
 
-        assert!(app.view.zoom < before_zoom, "Alt+click must zoom out");
+        assert!(
+            app.active_tab().view.zoom < before_zoom,
+            "Alt+click must zoom out"
+        );
         assert_eq!(
             app.primary, before_primary,
             "Alt+click on the zoom tool must not trigger the temporary eyedropper (SPEC §18 overrides SPEC §4 here)"
@@ -6070,10 +7018,10 @@ mod tests {
 
         assert!(app.text_edit.is_none());
         assert!(
-            !app.history.can_undo(),
+            !app.active_tab().history.can_undo(),
             "SPEC §19: Esc discards without pushing any history"
         );
-        assert!(app.floating.is_none());
+        assert!(app.active_tab().floating.is_none());
     }
 
     #[test]
@@ -6095,10 +7043,10 @@ mod tests {
             "the pending edit is consumed either way"
         );
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "SPEC §19: an empty-string commit must do nothing"
         );
-        assert!(!app.history.can_undo());
+        assert!(!app.active_tab().history.can_undo());
         assert_eq!(
             app.tool,
             ToolKind::Text,
@@ -6122,7 +7070,11 @@ mod tests {
         app.commit_pending_text_edit();
 
         assert!(app.text_edit.is_none());
-        let floating = app.floating.as_ref().expect("non-empty text must float");
+        let floating = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .expect("non-empty text must float");
         assert_eq!(
             floating.pos,
             pos2(5.0, 6.0),
@@ -6134,7 +7086,7 @@ mod tests {
             "committed text reuses the selection tool's floating machinery"
         );
         assert!(
-            app.history.has_open_stroke(),
+            app.active_tab().history.has_open_stroke(),
             "not yet finalized until the floating itself is confirmed (Enter/outside click/Esc)"
         );
         assert_eq!(
@@ -6160,7 +7112,7 @@ mod tests {
 
         assert!(app.text_edit.is_none());
         assert!(
-            app.floating.is_none(),
+            app.active_tab().floating.is_none(),
             "a tool-switch interruption composites directly, no adjustable floating left behind"
         );
         assert_eq!(
@@ -6169,10 +7121,10 @@ mod tests {
             "this helper must never touch self.tool (called from inside set_tool's own commit step)"
         );
         assert!(
-            app.history.can_undo(),
+            app.active_tab().history.can_undo(),
             "must be exactly one finished undo unit"
         );
-        assert!(!app.history.has_open_stroke());
+        assert!(!app.active_tab().history.has_open_stroke());
     }
 
     #[test]
@@ -6197,8 +7149,8 @@ mod tests {
              `place_new_floating`/`commit_pending_text_edit_and_composite`)"
         );
         assert!(app.text_edit.is_none());
-        assert!(app.floating.is_none());
-        assert!(app.history.can_undo());
+        assert!(app.active_tab().floating.is_none());
+        assert!(app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -6259,8 +7211,10 @@ mod tests {
             },
         ]);
 
-        // 新規作成(SPEC §7: Ctrl+N のダイアログ確定に相当)。
-        app.confirm_new(40, 10, Background::Transparent);
+        // 新規作成(SPEC §7: Ctrl+N のダイアログ確定に相当。v5 §30 では
+        // 新規タブを追加する方式になった — `active_tab()` は以後この
+        // 新しいタブを指す)。
+        app.confirm_new(40, 10, Background::Transparent, false);
 
         // 新ドキュメントで最初の Shift+クリックを (35,5) に打つ。
         app.dispatch_canvas_events(vec![
@@ -6276,68 +7230,92 @@ mod tests {
         ]);
 
         assert_eq!(
-            app.doc.get_pixel(20, 5).unwrap()[3],
+            app.active_tab().doc.get_pixel(20, 5).unwrap()[3],
             0,
             "confirm_new must reset last_end; shift+click in the new document must not draw \
              a line back to the stale endpoint from the document that was just replaced"
         );
         assert_ne!(
-            app.doc.get_pixel(35, 5).unwrap()[3],
+            app.active_tab().doc.get_pixel(35, 5).unwrap()[3],
             0,
             "the shift+click point itself must still be painted as a dot"
         );
     }
 
-    // -- v3 レビューで発見・修正したバグ: `request_action`/
-    // `handle_close_request` が進行中のテキスト編集を確定も破棄もせず
-    // `doc.modified` だけを見ていたため、D&D やウィンドウを閉じる操作が
-    // 未保存ガードをすり抜けて編集中の内容を失っていた
-    // (`request_action`/`handle_close_request` のドキュメントコメント参照)。
+    // -- v3 レビューで発見・修正したバグ: 進行中のテキスト編集を確定も
+    // 破棄もせず `doc.modified` だけを見ていたため、D&D やウィンドウを
+    // 閉じる操作が未保存ガードをすり抜けて編集中の内容を失っていた。
+    //
+    // v5 §30 でこのバグの根本原因(`request_action` の「先に確定してから
+    // 判定する」規則)は Ctrl+N/Ctrl+O には当てはまらなくなった —
+    // 新規タブの追加は既存タブの内容を一切破壊しないため、そもそも
+    // 未保存ガード自体が不要になった(`begin_new_tab`/`begin_open_tab`/
+    // `open_path_in_new_tab` のドキュメントコメント参照)。ただし「進行中の
+    // ジェスチャを先に確定する」という安全側の性質そのものは
+    // タブ切替の安全規則(ARCHITECTURE.md §17.3)として引き続き必須なので、
+    // 以下はその性質を新しい関数群に対して検証する。
     // ------------------------------------------------------------------
 
     #[test]
-    fn request_action_commits_pending_text_edit_before_checking_unsaved_guard() {
+    fn begin_open_tab_commits_pending_text_edit_before_opening_a_new_tab() {
         let Some(font) = test_font() else {
             eprintln!("skip: no system Japanese font found");
             return;
         };
+        let dir = temp_dir_for_app_test("open_commits_text_edit");
+        let path = dir.join("photo.png");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &path,
+            SaveFormat::Png,
+        )
+        .expect("seed file should save");
+
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Text;
         app.text_font = Some(font);
         app.begin_text_edit(pos2(5.0, 5.0));
         app.text_edit.as_mut().unwrap().buffer = "A".to_owned();
         assert!(
-            !app.doc.modified,
+            !app.active_tab().doc.modified,
             "typing alone must not mark the doc modified yet (sanity check on the bug's \
              precondition)"
         );
 
-        // D&D 経由の「開く」は `handle_dropped_files` → `request_action` を
-        // 通る(`process_pending_dialog` はブロッキングダイアログを要する
-        // ため、ここでは核心である `request_action` を直接駆動する)。
-        app.request_action(PendingAction::Open(Some(PathBuf::from("dummy.png"))));
+        // D&D・「開く」ダイアログ・最近使ったファイルはすべて
+        // `open_path_in_new_tab` を通る(ここで直接駆動する)。
+        app.open_path_in_new_tab(path.clone());
 
         assert!(
             app.text_edit.is_none(),
-            "the pending text edit must have been committed, not left dangling on a \
-             document that's about to be replaced"
-        );
-        assert!(
-            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
-            "a real committed edit must trigger the unsaved-changes guard instead of \
-             silently swapping the document out from under it"
+            "the pending text edit on the OLD tab must have been committed before switching \
+             away from it, not left dangling"
         );
         assert_eq!(
-            app.doc.width, 40,
-            "the document must not have been replaced yet (still waiting on the modal)"
+            app.tabs.len(),
+            2,
+            "v5 §30: opening a file must add a new tab, not replace the old one"
         );
+        assert!(
+            app.tabs[0].doc.modified,
+            "the original tab's committed text edit must remain intact on the OLD tab, not \
+             be discarded (opening a file no longer destroys existing tabs)"
+        );
+        assert_eq!(
+            app.active_tab, 1,
+            "the newly opened file must become the active tab"
+        );
+        assert_eq!(app.active_tab().doc.path, Some(path));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn request_action_executes_immediately_when_the_committed_edit_was_empty() {
-        // 対照テスト: 空文字列の確定は「何もしない」(SPEC §19)ので
-        // `doc.modified` は立たず、未保存ガードは(元から変更がなければ)
-        // 従来どおり素通りしてよい。
+    fn begin_new_tab_commits_pending_text_edit_and_shows_the_new_dialog_immediately() {
+        // v5 §30: Ctrl+N はもはや未保存ガードの対象ではない(新規タブの
+        // 追加は既存タブを破壊しない)ので、進行中の(空の)テキスト編集を
+        // 確定した直後、確認モーダルを挟まずに「新規」ダイアログが
+        // 即座に表示されるはずである。
         let Some(font) = test_font() else {
             eprintln!("skip: no system Japanese font found");
             return;
@@ -6348,13 +7326,868 @@ mod tests {
         app.begin_text_edit(pos2(5.0, 5.0));
         // buffer は空のまま。
 
-        app.request_action(PendingAction::New);
+        app.begin_new_tab();
 
         assert!(app.text_edit.is_none());
         assert!(
-            app.modal.is_none() || matches!(app.modal, Some(ModalState::New { .. })),
-            "an empty text edit must not itself trigger the unsaved-changes guard"
+            matches!(app.modal, Some(ModalState::New { .. })),
+            "Ctrl+N no longer needs an unsaved-changes guard; the New dialog must show \
+             immediately"
         );
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "the dialog hasn't been confirmed yet, so no tab has been added"
+        );
+    }
+
+    // -- v5 §30/§32(ARCHITECTURE.md §17.7 V5-M2): タブ切替・タブを閉じる・
+    // 重複オープン検出・タブ数上限・「無題」番号付け ----------------------
+
+    #[test]
+    fn next_tab_and_prev_tab_cycle_through_all_tabs_and_wrap_at_the_ends() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        app.open_new_tab(Document::new(6, 6, Background::White));
+        assert_eq!(app.active_tab, 2);
+
+        app.next_tab();
+        assert_eq!(app.active_tab, 0, "SPEC §30: 端では反対側へ循環する");
+        app.next_tab();
+        assert_eq!(app.active_tab, 1);
+
+        app.prev_tab();
+        assert_eq!(app.active_tab, 0);
+        app.prev_tab();
+        assert_eq!(app.active_tab, 2, "SPEC §30: 前のタブも端で循環する");
+    }
+
+    #[test]
+    fn switch_tab_commits_an_open_pen_stroke_on_the_tab_being_left() {
+        // ARCHITECTURE.md §17.3/§17.8-1: 「タブ切替前に必ず
+        // commit_open_gesture() を呼ぶ」の直接的な回帰テスト。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.open_new_tab(Document::new(20, 20, Background::White));
+        assert_eq!(app.active_tab, 1);
+
+        app.switch_tab(0);
+        assert_eq!(app.active_tab, 0);
+        app.tool = ToolKind::Pen;
+        // Down のみ(Up を送らない) = ストロークが進行中のまま。
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(5.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        assert!(
+            app.tabs[0].history.has_open_stroke(),
+            "sanity check: a stroke must be open before switching"
+        );
+
+        app.switch_tab(1);
+
+        assert_eq!(app.active_tab, 1);
+        assert!(
+            !app.tabs[0].history.has_open_stroke(),
+            "switching tabs must commit the open stroke on the tab being left, not abandon it"
+        );
+        assert!(
+            app.tabs[0].history.can_undo(),
+            "the committed stroke must be a real undo unit"
+        );
+        assert_ne!(
+            app.tabs[0].doc.get_pixel(5, 5).unwrap()[3],
+            0,
+            "the pixel painted before switching must have been kept"
+        );
+    }
+
+    #[test]
+    fn per_tab_layer_rename_state_cannot_corrupt_another_tabs_layer_name() {
+        // 回帰テスト(バグ修正): `layer_rename` は以前 `DaraskApp` 直下の
+        // 共有フィールドだった。タブ A でレイヤー名編集を開始したまま
+        // 別のタブ B がアクティブになると、B のレイヤーパネル描画がタブ A
+        // の未確定の編集状態を(B 自身のレイヤー構成と無関係に)引き継いで
+        // しまい、確定すると B の無関係なレイヤーの名前が A での入力内容で
+        // 上書きされていた(クロスタブ破損)。`Tab::layer_rename` として
+        // タブごとに独立させたことで、この漏洩は構造的に起こり得なくなった:
+        // `active_tab` がどう変わろうと、各タブは自分自身の rename 状態
+        // しか持たない。ここでは `switch_tab`(=先に確定してしまう安全な
+        // 経路)を経由せず直接 `active_tab` を切り替え、万一どこかで安全
+        // フックの呼び出しが漏れても構造的に破損が起きないことを確認する。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add(); // タブ A(index 0)を2枚レイヤーにする。
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        app.layer_add(); // タブ B(index 1)も2枚レイヤーにする(同じ index で衝突させる)。
+        let original_tab_b_layer1_name = app.tabs[1].doc.layers[1].name.clone();
+
+        // タブ A でレイヤー1(index 1)の名前編集を「開始」した状態
+        // (まだ確定していない)を直接作る。
+        app.tabs[0].layer_rename = Some((1, "タブAで入力中".to_owned(), false));
+        app.active_tab = 1;
+
+        // タブ B は自分自身の(未編集の)rename 状態を持つため、タブ A の
+        // 編集中テキストを一切引き継がない。
+        assert!(
+            app.tabs[1].layer_rename.is_none(),
+            "each tab must have its own independent rename state, not a shared one"
+        );
+        assert_eq!(
+            app.tabs[1].doc.layers[1].name, original_tab_b_layer1_name,
+            "tab B's layer name must be unaffected by tab A's in-progress edit"
+        );
+
+        // タブ A 自身の未確定の編集は無傷のまま残っている。
+        assert_eq!(
+            app.tabs[0].layer_rename,
+            Some((1, "タブAで入力中".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn switch_tab_out_of_range_or_to_the_current_tab_is_a_no_op() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert_eq!(app.active_tab, 1);
+
+        app.switch_tab(1); // 既にアクティブなタブ。
+        assert_eq!(app.active_tab, 1);
+
+        app.switch_tab(99); // 範囲外。
+        assert_eq!(app.active_tab, 1);
+    }
+
+    #[test]
+    fn close_tab_removes_a_background_tab_and_shifts_the_active_index_down() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        app.open_new_tab(Document::new(6, 6, Background::White));
+        assert_eq!(app.active_tab, 2);
+
+        app.close_tab(0); // アクティブより前のタブを閉じる。
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(
+            app.active_tab, 1,
+            "closing a tab before the active one must shift the active index down by one"
+        );
+        assert_eq!(app.active_tab().doc.width, 6, "still the same logical tab");
+    }
+
+    #[test]
+    fn close_tab_the_active_tab_activates_the_tab_that_slides_into_its_place() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        app.open_new_tab(Document::new(6, 6, Background::White));
+        app.switch_tab(1);
+        assert_eq!(app.active_tab, 1);
+
+        app.close_tab(1); // アクティブ自身を閉じる。
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(
+            app.active_tab, 1,
+            "the tab that slid into the closed slot must become active"
+        );
+        assert_eq!(app.active_tab().doc.width, 6);
+    }
+
+    #[test]
+    fn close_tab_the_last_tab_in_the_vec_activates_the_new_last_tab() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert_eq!(app.active_tab, 1);
+
+        app.close_tab(1); // 末尾かつアクティブなタブを閉じる。
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn close_tab_on_a_single_unmodified_tab_resets_it_to_blank_immediately() {
+        // SPEC §30: 「常に 1 タブ以上を維持する…最後の 1 タブを閉じようと
+        // した場合…「新規」と同じ扱い」。未変更なら未保存ガードは発動せず、
+        // 「新規」ダイアログが即座に出る(`request_action` の従来どおりの
+        // 挙動)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        assert!(!app.active_tab().doc.modified);
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1, "SPEC §30: タブが 0 枚になってはいけない");
+        assert!(
+            matches!(
+                app.modal,
+                Some(ModalState::New {
+                    replace_active: true,
+                    ..
+                })
+            ),
+            "closing the last tab must show the New dialog in in-place-replace mode"
+        );
+    }
+
+    #[test]
+    fn close_tab_on_a_single_modified_tab_asks_for_confirmation_first() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.active_tab_mut().doc.modified = true;
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
+            "SPEC §30: 「未保存ガードを通してから内容を白紙に戻す」"
+        );
+
+        // 破棄を選ぶと、続けて「新規」ダイアログ(置き換えモード)が出る。
+        app.confirm_unsaved_discard();
+        assert!(matches!(
+            app.modal,
+            Some(ModalState::New {
+                replace_active: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closing_the_last_tab_commits_a_pending_layer_rename_and_asks_to_save() {
+        // 回帰テスト(バグ修正): 以前は `reset_active_tab_document` が単に
+        // `layer_rename = None` で編集中の入力を破棄するだけで、
+        // `text_edit` に対して行っている「先に確定してから実行」が無かった。
+        // さらに確定処理自体が `doc.modified` を立てていなかったため、
+        // レイヤー名を編集しただけの(他は何も変更していない)ドキュメント
+        // でも `request_action` の未保存ガードが発動せず、確認なしにいきなり
+        // 「新規」ダイアログへ進んで入力内容がどこにも残らず消えていた。
+        // `commit_open_gesture` が編集中のレイヤー名を先に確定するように
+        // なったことで、この場合も「未保存の変更」として正しく検知される。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        assert!(!app.active_tab().doc.modified);
+        app.active_tab_mut().layer_rename = Some((0, "新しい名前".to_owned(), false));
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1, "SPEC §30: タブが 0 枚になってはいけない");
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
+            "an in-progress layer rename must count as an unsaved change, not be silently \
+             discarded without a chance to save"
+        );
+        assert_eq!(
+            app.active_tab().doc.layers[0].name,
+            "新しい名前",
+            "the typed name must have been committed, not discarded"
+        );
+        assert!(app.active_tab().layer_rename.is_none());
+    }
+
+    #[test]
+    fn closing_the_last_tab_and_recreating_it_advances_the_untitled_number() {
+        // 回帰テスト(バグ修正): `reset_active_tab_document` は以前
+        // `Tab::untitled_number` を採番し直さなかったため、「無題3」を
+        // 最後の1タブとして閉じて新規化しても、タブラベルが「無題3」の
+        // まま(`next_untitled_number` が既に 4 に進んでいても更新されない)
+        // 残っていた。通常の Ctrl+N(`open_new_tab`)が必ず新しい番号を
+        // 払い出すのと非対称だった。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        assert_eq!(app.tabs[2].label(), "無題3");
+
+        // タブ0・タブ1を閉じ、「無題3」だけが残る唯一のタブにする
+        // (いずれも未変更なので確認モーダルは出ない)。
+        app.close_tab(0);
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab().label(), "無題3");
+
+        // 唯一のタブを閉じようとする(SPEC §30: 「新規」と同じ扱い)。
+        app.close_tab(0);
+        assert!(matches!(
+            app.modal,
+            Some(ModalState::New {
+                replace_active: true,
+                ..
+            })
+        ));
+        app.confirm_new(4, 4, Background::White, true);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.active_tab().label(),
+            "無題4",
+            "recreating the last tab as blank must mint a fresh untitled number, just \
+             like a normal Ctrl+N tab does, instead of keeping the stale old label"
+        );
+    }
+
+    // ===================================================================
+    // V5-M3(SPEC §30/§17.4): 未保存ガードの一般化・タブを閉じる
+    // ===================================================================
+
+    #[test]
+    fn close_tab_on_an_unmodified_background_tab_closes_immediately_without_a_modal() {
+        // 2枚以上あるうちの1枚が未変更なら、確認モーダルを出さず即座に閉じる
+        // (v1〜v4 と同じ「変更が無ければガードは発動しない」規則の延長)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert!(!app.active_tab().doc.modified);
+
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            app.modal.is_none(),
+            "an unmodified tab must not trigger the unsaved-changes guard"
+        );
+    }
+
+    #[test]
+    fn close_tab_on_a_modified_background_tab_activates_it_before_confirming() {
+        // v5 §17.4: 「そのタブの doc.modified が true なら該当タブを
+        // アクティブ化した上で…ConfirmUnsaved モーダルを出す」。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs[0].doc.modified = true;
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert_eq!(
+            app.active_tab, 1,
+            "tab 1 is active, tab 0 is in the background"
+        );
+
+        app.close_tab(0);
+
+        // まだ何も削除されていない(モーダルの結果を待つ)。
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(
+            app.active_tab, 0,
+            "the tab being closed must become active so its unsaved content is visible"
+        );
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+
+        // 破棄を選ぶと、そのタブだけが実際に取り除かれる(タブは0枚に
+        // ならず、常に1枚以上を維持するルールとは別の経路)。
+        app.confirm_unsaved_discard();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.active_tab().doc.width,
+            5,
+            "the remaining tab must be the one that was never closed"
+        );
+    }
+
+    #[test]
+    fn close_tab_on_a_modified_background_tab_cancel_leaves_both_tabs_untouched() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs[0].doc.modified = true;
+        app.open_new_tab(Document::new(5, 5, Background::White));
+
+        app.close_tab(0);
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+
+        app.confirm_unsaved_cancel();
+
+        assert_eq!(app.tabs.len(), 2, "cancelling must not close anything");
+        assert!(app.tabs[0].doc.modified, "the unsaved change must survive");
+        assert!(app.pending_action.is_none());
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_active_unmodified_tab_via_shortcut() {
+        // v5 §30/§32: Ctrl+W(`Action::CloseTab`、`keymap.rs` 参照)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert_eq!(app.tabs.len(), 2);
+
+        let ctx = ctx_with_key_event(Key::W, Modifiers::CTRL);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tabs.len(), 1, "Ctrl+W must close the active tab");
+        assert_eq!(
+            app.active_tab().doc.width,
+            4,
+            "the background tab must survive"
+        );
+    }
+
+    #[test]
+    fn begin_quit_walks_every_modified_tab_in_order_and_skips_unmodified_ones() {
+        // v5 §17.4: 「未保存のタブがあればタブごとに順番に確認ダイアログを
+        // 出す」。3枚のうち先頭と末尾だけが未保存。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs[0].doc.modified = true;
+        app.open_new_tab(Document::new(5, 5, Background::White)); // index 1, unmodified
+        app.open_new_tab(Document::new(6, 6, Background::White)); // index 2
+        app.tabs[2].doc.modified = true;
+
+        app.begin_quit();
+
+        assert_eq!(
+            app.active_tab, 0,
+            "must confirm the first modified tab (index 0) first, skipping the unmodified one"
+        );
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+
+        // 破棄すると、次に未保存のタブ(index 2、1 は未変更なので飛ばす)へ進む。
+        app.confirm_unsaved_discard();
+        assert_eq!(app.active_tab, 2);
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+    }
+
+    #[test]
+    fn begin_quit_cancel_mid_queue_aborts_the_whole_close_all_tabs_flow() {
+        // ARCHITECTURE.md §17.4: 「途中でキャンセルされたら全体を中止」。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs[0].doc.modified = true;
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        app.tabs[1].doc.modified = true;
+
+        app.begin_quit();
+        assert_eq!(app.active_tab, 0);
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+
+        app.confirm_unsaved_cancel();
+
+        assert!(
+            app.pending_action.is_none(),
+            "cancelling must drop the rest of the queue, not just this one tab"
+        );
+        assert_eq!(app.tabs.len(), 2, "no tab may be closed by an aborted quit");
+        assert!(app.tabs[0].doc.modified);
+        assert!(app.tabs[1].doc.modified);
+    }
+
+    #[test]
+    fn handle_close_request_checks_every_tab_not_just_the_active_one() {
+        // v5 §17.4: v1〜v4 は単一ドキュメントだったので活性タブだけ見れば
+        // 足りたが、v5 では非アクティブな未保存タブも見なければならない。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs[0].doc.modified = true;
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        assert_eq!(app.active_tab, 1);
+        assert!(!app.active_tab().doc.modified);
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        });
+
+        app.handle_close_request(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
+            "a background tab's unsaved change must still arm the unsaved-changes guard"
+        );
+        assert_eq!(
+            app.active_tab, 0,
+            "must have switched to the modified tab to show its confirmation"
+        );
+    }
+
+    #[test]
+    fn open_path_in_new_tab_switches_to_an_already_open_tab_instead_of_duplicating() {
+        let dir = temp_dir_for_app_test("dedupe_open");
+        let path = dir.join("shared.png");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &path,
+            SaveFormat::Png,
+        )
+        .expect("seed file should save");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_path_in_new_tab(path.clone());
+        assert_eq!(app.tabs.len(), 2);
+        app.switch_tab(0);
+        assert_eq!(app.active_tab, 0);
+
+        // SPEC §30: 「開こうとしたファイルが既に開いているタブがあれば
+        // (パスを正規化して比較)、新規タブを作らずそのタブへ切り替える」。
+        app.open_path_in_new_tab(path.clone());
+
+        assert_eq!(
+            app.tabs.len(),
+            2,
+            "opening an already-open file must not create a duplicate tab"
+        );
+        assert_eq!(app.active_tab, 1, "must switch to the existing tab");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_path_in_new_tab_refuses_past_the_tab_limit_and_shows_a_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        for _ in 0..(MAX_TABS - 1) {
+            app.open_new_tab(Document::new(4, 4, Background::White));
+        }
+        assert_eq!(app.tabs.len(), MAX_TABS);
+
+        let dir = temp_dir_for_app_test("tab_limit");
+        let path = dir.join("one_too_many.png");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &path,
+            SaveFormat::Png,
+        )
+        .expect("seed file should save");
+
+        app.open_path_in_new_tab(path);
+
+        assert_eq!(
+            app.tabs.len(),
+            MAX_TABS,
+            "must refuse to exceed MAX_TABS (SPEC §30: 上限 24)"
+        );
+        assert!(app.toast.is_some(), "must show a toast when refusing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_new_tab_refuses_past_the_tab_limit_and_shows_a_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        for _ in 0..(MAX_TABS - 1) {
+            app.open_new_tab(Document::new(4, 4, Background::White));
+        }
+        assert_eq!(app.tabs.len(), MAX_TABS);
+
+        app.begin_new_tab();
+
+        assert_eq!(app.tabs.len(), MAX_TABS);
+        assert!(app.modal.is_none(), "must not even show the New dialog");
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn tab_label_numbers_untitled_tabs_sequentially_and_never_reuses_a_number() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        assert_eq!(
+            app.tabs[0].label(),
+            "無題",
+            "the very first tab has no suffix"
+        );
+
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        assert_eq!(app.tabs[1].label(), "無題2");
+        assert_eq!(app.tabs[2].label(), "無題3");
+
+        // 途中のタブを閉じても、残っているタブの番号は採番し直さない。
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[0].label(), "無題");
+        assert_eq!(
+            app.tabs[1].label(),
+            "無題3",
+            "closing another tab must not renumber the remaining ones"
+        );
+
+        // 新しく開くタブは、既に使われた番号を飛ばしてさらに先へ進む。
+        app.open_new_tab(Document::new(4, 4, Background::White));
+        assert_eq!(app.tabs[2].label(), "無題4");
+    }
+
+    #[test]
+    fn tab_label_uses_the_file_name_once_a_path_is_set() {
+        let dir = temp_dir_for_app_test("tab_label_path");
+        let path = dir.join("photo.png");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &path,
+            SaveFormat::Png,
+        )
+        .expect("seed file should save");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_path_in_new_tab(path);
+
+        assert_eq!(app.tabs[1].label(), "photo.png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v5 §31(ARCHITECTURE.md §17.5): 選択範囲を新規タブに複製 -------------
+
+    #[test]
+    fn duplicate_selection_to_new_tab_is_a_no_op_without_a_selection_or_floating() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.duplicate_selection_to_new_tab();
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "no selection/floating means nothing to duplicate"
+        );
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn duplicate_selection_to_new_tab_with_a_static_selection_preserves_layer_structure_and_leaves_the_source_untouched(
+    ) {
+        let mut app = new_for_test(Document::new(6, 6, Background::White));
+        app.active_tab_mut().doc.layers[0] =
+            crate::document::Layer::filled("下", 6, 6, [255, 255, 255, 255]);
+        app.layer_add();
+        app.active_tab_mut().doc.layers[1] =
+            crate::document::Layer::filled("上", 6, 6, [10, 20, 30, 200]);
+        app.active_tab_mut().doc.layers[1].visible = false;
+        app.active_tab_mut().doc.layers[1].opacity = 128;
+        assert_eq!(
+            app.active_tab().doc.active,
+            1,
+            "layer_add activates the new layer"
+        );
+
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 1,
+            y0: 1,
+            x1: 4,
+            y1: 4,
+        })));
+
+        let before_layers_0 = app.active_tab().doc.layers[0].pixels.clone();
+        let before_layers_1 = app.active_tab().doc.layers[1].pixels.clone();
+
+        app.duplicate_selection_to_new_tab();
+
+        assert_eq!(app.tabs.len(), 2, "must insert exactly one new tab");
+        assert_eq!(app.active_tab, 1, "the new tab must become active");
+
+        // 元のタブは一切変更されていない(SPEC §31: 「元のタブは一切変更
+        // しない」)。
+        assert!(
+            app.tabs[0].selection.is_some(),
+            "the source tab keeps its selection"
+        );
+        assert_eq!(app.tabs[0].doc.layers[0].pixels, before_layers_0);
+        assert_eq!(app.tabs[0].doc.layers[1].pixels, before_layers_1);
+        assert_eq!(app.tabs[0].doc.active, 1);
+        assert_eq!(app.tabs[0].doc.layers[1].opacity, 128);
+        assert!(!app.tabs[0].doc.layers[1].visible);
+
+        // 新規タブ: bbox サイズ・レイヤー構成(名前・表示・不透明度・重ね順・
+        // アクティブレイヤー)を保ったまま複製されている。
+        let new_doc = &app.tabs[1].doc;
+        assert_eq!((new_doc.width, new_doc.height), (3, 3));
+        assert_eq!(new_doc.layers.len(), 2);
+        assert_eq!(new_doc.layers[0].name, "下");
+        assert_eq!(new_doc.layers[1].name, "上");
+        assert!(new_doc.layers[0].visible);
+        assert!(!new_doc.layers[1].visible);
+        assert_eq!(new_doc.layers[1].opacity, 128);
+        assert_eq!(new_doc.active, 1, "active layer index is preserved");
+        assert!(new_doc.path.is_none(), "duplicated tab has no path (無題)");
+        assert!(new_doc.modified, "duplicated tab starts as unsaved");
+        // 矩形選択(全 1 マスク)なので、選択範囲の全画素がそのまま複製される。
+        assert_eq!(new_doc.layers[0].pixels[0..4], [255, 255, 255, 255]);
+        assert_eq!(new_doc.layers[1].pixels[0..4], [10, 20, 30, 200]);
+
+        assert_eq!(app.tabs[1].label(), "無題2");
+        assert!(
+            !app.tabs[1].history.can_undo() && !app.tabs[1].history.can_redo(),
+            "the new tab starts with an empty undo history"
+        );
+    }
+
+    #[test]
+    fn duplicate_selection_to_new_tab_with_a_floating_piece_masks_pixels_and_does_not_touch_the_source_tab(
+    ) {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        // `begin_floating_from_selection` が実際にやること(切り出し元を
+        // 透明化する)を模倣し、「複製後も元タブが一切変わらない」ことを
+        // 確認できるようにする。
+        for y in 2..4 {
+            for x in 2..4 {
+                app.active_tab_mut().doc.set_pixel(x, y, [0, 0, 0, 0]);
+            }
+        }
+        let cut_from = crate::document::SelMask {
+            bbox: IRect {
+                x0: 2,
+                y0: 2,
+                x1: 4,
+                y1: 4,
+            },
+            mask: vec![255, 255, 255, 255],
+        };
+        // 2x2: 左上・右下だけ選択。右上・左下は mask=0 だが、pixels 側には
+        // わざと不透明な値を入れておく(ハンドルの再サンプリング後に
+        // 起こりうる状態、`floating_layer_pixels` がそれでも透明にすることを
+        // 確認するため)。
+        let pixels = vec![
+            10, 20, 30, 255, // top-left, masked in
+            9, 9, 9, 255, // top-right, masked out but "dirty"
+            9, 9, 9, 255, // bottom-left, masked out but "dirty"
+            40, 50, 60, 128, // bottom-right, masked in
+        ];
+        let mask = vec![255, 0, 0, 255];
+        let floating = Floating::new(pixels, 2, 2, mask, pos2(2.0, 2.0), Some(cut_from), 42);
+        app.active_tab_mut().floating = Some(floating);
+        app.active_tab_mut().selection = None;
+
+        app.duplicate_selection_to_new_tab();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+
+        // 元のタブは一切変更されていない: 浮動片はまだそこにあり(合成
+        // されていない)、切り出し元も透明のままである。
+        assert!(
+            app.tabs[0].floating.is_some(),
+            "the source tab's floating piece must not be flushed/merged"
+        );
+        assert_eq!(app.tabs[0].floating.as_ref().unwrap().id, 42);
+        assert_eq!(app.tabs[0].doc.get_pixel(2, 2), Some([0, 0, 0, 0]));
+        assert_eq!(app.tabs[0].doc.get_pixel(0, 0), Some([255, 255, 255, 255]));
+
+        let new_doc = &app.tabs[1].doc;
+        assert_eq!((new_doc.width, new_doc.height), (2, 2));
+        assert_eq!(
+            new_doc.layers.len(),
+            1,
+            "a floating piece becomes a single layer"
+        );
+        assert_eq!(new_doc.active, 0);
+        assert!(new_doc.modified);
+        assert!(new_doc.path.is_none());
+        let px = &new_doc.layers[0].pixels;
+        assert_eq!(&px[0..4], &[10, 20, 30, 255], "masked-in top-left kept");
+        assert_eq!(&px[4..8], &[0, 0, 0, 0], "masked-out top-right zeroed");
+        assert_eq!(&px[8..12], &[0, 0, 0, 0], "masked-out bottom-left zeroed");
+        assert_eq!(
+            &px[12..16],
+            &[40, 50, 60, 128],
+            "masked-in bottom-right kept"
+        );
+    }
+
+    #[test]
+    fn duplicate_selection_to_new_tab_inserts_immediately_after_the_active_tab_and_shifts_later_tabs(
+    ) {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_new_tab(Document::new(5, 5, Background::White));
+        app.open_new_tab(Document::new(6, 6, Background::White));
+        assert_eq!(app.tabs.len(), 3);
+
+        app.switch_tab(1);
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        })));
+
+        app.duplicate_selection_to_new_tab();
+
+        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(
+            app.active_tab, 2,
+            "the new tab lands right after the source tab"
+        );
+        assert_eq!(
+            (app.tabs[2].doc.width, app.tabs[2].doc.height),
+            (2, 2),
+            "index 2 is the freshly duplicated tab"
+        );
+        assert_eq!(
+            app.tabs[3].doc.width, 6,
+            "the tab that used to be at index 2 must have shifted to index 3"
+        );
+    }
+
+    #[test]
+    fn duplicate_selection_to_new_tab_refuses_past_the_tab_limit_and_shows_a_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        for _ in 0..(MAX_TABS - 1) {
+            app.open_new_tab(Document::new(4, 4, Background::White));
+        }
+        assert_eq!(app.tabs.len(), MAX_TABS);
+
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        })));
+        app.duplicate_selection_to_new_tab();
+
+        assert_eq!(
+            app.tabs.len(),
+            MAX_TABS,
+            "must refuse to exceed MAX_TABS (SPEC §30: 上限 24)"
+        );
+        assert!(app.toast.is_some(), "must show a toast when refusing");
+    }
+
+    #[test]
+    fn duplicate_selection_to_new_tab_ends_another_tools_in_progress_gesture_without_touching_the_selection(
+    ) {
+        // v5 §17.8-1: 進行中のジェスチャ(ここではなげなわの自由選択の軌跡)を
+        // タブ挿入前に確定/破棄しないと、複製後にタブを跨いだ座標のまま
+        // 古い軌跡へ点が継ぎ足されてしまう。浮動片は Select/EllipseSelect/
+        // Move 中しか存在し得ないため、ここでは浮動片を伴わないプレーンな
+        // 選択+ 別ツール(なげなわ)の進行中状態、という組み合わせを検証する。
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        })));
+        app.tool = ToolKind::Lasso;
+        app.lasso_freehand_points = vec![pos2(1.0, 1.0), pos2(2.0, 2.0)];
+
+        app.duplicate_selection_to_new_tab();
+
+        assert!(
+            app.lasso_freehand_points.is_empty(),
+            "the lasso's in-progress trail must be ended before switching tabs"
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!((app.tabs[1].doc.width, app.tabs[1].doc.height), (4, 4));
+    }
+
+    #[test]
+    fn normalize_path_for_compare_resolves_existing_paths_to_the_same_canonical_form() {
+        let dir = temp_dir_for_app_test("normalize_path");
+        let path = dir.join("a.png");
+        io::save_image(
+            &mut Document::new(2, 2, Background::White),
+            &path,
+            SaveFormat::Png,
+        )
+        .expect("seed file should save");
+
+        // 同じファイルを指す 2 つの異なる書き方(`./` を挟む)が同一の
+        // 正規化結果になること。
+        let via_current_dir = dir.join(".").join("a.png");
+        assert_eq!(
+            normalize_path_for_compare(&path),
+            normalize_path_for_compare(&via_current_dir)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_path_for_compare_falls_back_to_the_original_path_when_missing() {
+        // 存在しないパスは canonicalize が失敗するため、panic せず元の
+        // パスをそのまま返す(CLAUDE.md 鉄則: I/O 経路で unwrap しない)。
+        let missing = PathBuf::from("__darask_paint_definitely_missing_dir__/x.png");
+        assert_eq!(normalize_path_for_compare(&missing), missing);
     }
 
     #[test]
@@ -6422,7 +8255,11 @@ mod tests {
             button: PointerButton::Primary,
         });
 
-        let selection = app.selection.expect("a real drag must create a selection");
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("a real drag must create a selection");
         let expected = select::ellipse_mask(IRect {
             x0: 0,
             y0: 0,
@@ -6458,7 +8295,11 @@ mod tests {
             button: PointerButton::Primary,
         });
 
-        let selection = app.selection.expect("a real drag must create a selection");
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("a real drag must create a selection");
         let bbox = selection.mask.bbox;
         assert_eq!(
             bbox.width(),
@@ -6550,7 +8391,9 @@ mod tests {
         });
 
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("closing the free-hand trail must create a selection");
         assert!(selection.mask.contains(5, 5));
         assert!(
@@ -6574,7 +8417,7 @@ mod tests {
             button: PointerButton::Primary,
         });
 
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().selection.is_none());
     }
 
     #[test]
@@ -6596,7 +8439,7 @@ mod tests {
         app.set_tool(ToolKind::Pen);
 
         assert!(app.lasso_freehand_points.is_empty());
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().selection.is_none());
     }
 
     // -- なげなわ(多角形) --------------------------------------------------
@@ -6619,7 +8462,9 @@ mod tests {
 
         assert!(app.lasso_polygon.is_none());
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("closing near the start point must create a selection");
         assert!(selection.mask.contains(5, 5));
     }
@@ -6641,7 +8486,7 @@ mod tests {
             app.lasso_polygon.is_none(),
             "a double click must close the polygon (SPEC §22)"
         );
-        assert!(app.selection.is_some());
+        assert!(app.active_tab().selection.is_some());
     }
 
     #[test]
@@ -6664,7 +8509,9 @@ mod tests {
 
         assert!(app.lasso_polygon.is_none());
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("Enter must commit the in-progress polygon (SPEC §22)");
         assert!(selection.mask.contains(5, 5));
     }
@@ -6686,7 +8533,7 @@ mod tests {
             app.lasso_polygon.is_none(),
             "Esc must discard the in-progress polygon (SPEC §22)"
         );
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().selection.is_none());
     }
 
     #[test]
@@ -6711,7 +8558,7 @@ mod tests {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         for y in 0..10 {
             for x in 5..10 {
-                app.doc.set_pixel(x, y, [0, 0, 0, 255]);
+                app.active_tab_mut().doc.set_pixel(x, y, [0, 0, 0, 255]);
             }
         }
         app.tool = ToolKind::MagicWand;
@@ -6720,7 +8567,9 @@ mod tests {
         app.magic_wand_select(pos2(1.0, 1.0));
 
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("magic wand must select the connected white region");
         assert!(selection.mask.contains(0, 0));
         assert!(
@@ -6733,7 +8582,7 @@ mod tests {
     fn magic_wand_select_replaces_any_existing_selection() {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         app.tool = ToolKind::MagicWand;
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 0,
             y0: 0,
             x1: 3,
@@ -6743,7 +8592,9 @@ mod tests {
         app.magic_wand_select(pos2(5.0, 5.0));
 
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("magic wand always creates a fresh selection");
         assert_eq!(
             selection.mask.bbox,
@@ -6766,7 +8617,7 @@ mod tests {
         app.tool = ToolKind::MagicWand;
         app.magic_wand_select(pos2(1.0, 1.0));
         assert!(
-            app.selection.is_some(),
+            app.active_tab().selection.is_some(),
             "W + click must have created a selection"
         );
 
@@ -6774,7 +8625,7 @@ mod tests {
         app.handle_shortcuts(&ctx);
 
         assert!(
-            app.selection.is_none(),
+            app.active_tab().selection.is_none(),
             "SPEC §18: Esc must deselect regardless of the active tool"
         );
     }
@@ -6784,12 +8635,12 @@ mod tests {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         app.tool = ToolKind::MagicWand;
         app.magic_wand_select(pos2(1.0, 1.0));
-        assert!(app.selection.is_some());
+        assert!(app.active_tab().selection.is_some());
 
         let ctx = ctx_with_key_event(Key::Enter, Modifiers::NONE);
         app.handle_shortcuts(&ctx);
 
-        assert!(app.selection.is_none());
+        assert!(app.active_tab().selection.is_none());
     }
 
     // -- v4 レビューで発見・修正したバグ: 色調補正が進行中ストロークを
@@ -6800,7 +8651,7 @@ mod tests {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Pen;
         app.primary = Color32::BLACK;
-        let pristine = app.doc.active_pixels().to_vec();
+        let pristine = app.active_tab().doc.active_pixels().to_vec();
 
         // ドラッグ開始(まだ Up していない = 開いたストローク)。
         app.dispatch_canvas_events(vec![ToolEvent::Down {
@@ -6814,11 +8665,14 @@ mod tests {
             mods: Modifiers::NONE,
         }]);
         assert!(
-            app.history.has_open_stroke(),
+            app.active_tab().history.has_open_stroke(),
             "the pen drag must still be open"
         );
-        assert!(!app.history.can_undo(), "nothing committed yet");
-        let mid_stroke_pixels = app.doc.active_pixels().to_vec();
+        assert!(
+            !app.active_tab().history.can_undo(),
+            "nothing committed yet"
+        );
+        let mid_stroke_pixels = app.active_tab().doc.active_pixels().to_vec();
         assert_ne!(
             mid_stroke_pixels, pristine,
             "the drag must have painted something already"
@@ -6836,32 +8690,44 @@ mod tests {
             px[1] = 255 - px[1];
             px[2] = 255 - px[2];
         }
-        assert_eq!(app.doc.active_pixels(), expected_inverted.as_slice());
+        assert_eq!(
+            app.active_tab().doc.active_pixels(),
+            expected_inverted.as_slice()
+        );
         assert!(
-            !app.history.has_open_stroke(),
+            !app.active_tab().history.has_open_stroke(),
             "Ctrl+I must fully commit the drag, not leave it dangling"
         );
 
         // ペンストロークと反転はそれぞれ独立した undo 単位でなければならない
         // (バグ版では前者が `History::begin_stroke` の無警告置換で undo
         // 履歴に一切残らず、1 回しか undo できない)。
-        assert!(app.history.undo(&mut app.doc), "undo #1: revert the invert");
+        assert!(
+            {
+                let tab = app.active_tab_mut();
+                tab.history.undo(&mut tab.doc)
+            },
+            "undo #1: revert the invert"
+        );
         assert_eq!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             mid_stroke_pixels.as_slice(),
             "undoing the invert must restore the pre-invert (mid-stroke) pixels exactly"
         );
         assert!(
-            app.history.undo(&mut app.doc),
+            {
+                let tab = app.active_tab_mut();
+                tab.history.undo(&mut tab.doc)
+            },
             "undo #2: the pen stroke drawn before Ctrl+I must be its own undo unit, \
              not silently discarded"
         );
         assert_eq!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             pristine.as_slice(),
             "undoing everything must restore the pristine canvas byte-exactly"
         );
-        assert!(!app.history.can_undo());
+        assert!(!app.active_tab().history.can_undo());
     }
 
     #[test]
@@ -6880,18 +8746,18 @@ mod tests {
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         }]);
-        assert!(app.history.has_open_stroke());
-        assert!(!app.history.can_undo());
+        assert!(app.active_tab().history.has_open_stroke());
+        assert!(!app.active_tab().history.can_undo());
 
         app.open_hue_saturation_modal();
 
         assert!(
-            app.history.can_undo(),
+            app.active_tab().history.can_undo(),
             "the pen drag must have been committed as its own undo unit before Ctrl+U's \
              own live-preview snapshot stroke begins"
         );
         assert!(
-            app.history.has_open_stroke(),
+            app.active_tab().history.has_open_stroke(),
             "begin_tone_adjust_stroke itself opens a fresh snapshot stroke for the live preview"
         );
         assert!(app.modal.is_some());
@@ -6905,7 +8771,7 @@ mod tests {
         let mut app = new_for_test(Document::new(10, 10, Background::White));
         app.tool = ToolKind::Pen;
         app.primary = Color32::BLACK;
-        let pristine = app.doc.active_pixels().to_vec();
+        let pristine = app.active_tab().doc.active_pixels().to_vec();
 
         app.modal = Some(ModalState::About);
         app.dispatch_canvas_events(vec![
@@ -6926,12 +8792,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            app.doc.active_pixels(),
+            app.active_tab().doc.active_pixels(),
             pristine.as_slice(),
             "no pointer event may reach the canvas while a modal is open (ARCHITECTURE.md §10)"
         );
-        assert!(!app.history.has_open_stroke());
-        assert!(!app.history.can_undo());
+        assert!(!app.active_tab().history.has_open_stroke());
+        assert!(!app.active_tab().history.can_undo());
     }
 
     // -- v4 レビューで発見・修正したバグ: undo/redo が選択を新しい文書寸法へ
@@ -6941,18 +8807,21 @@ mod tests {
     fn redo_of_a_shrinking_resize_drops_a_selection_that_no_longer_overlaps_the_document() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.confirm_canvas_resize(5, 5);
-        assert_eq!((app.doc.width, app.doc.height), (5, 5));
+        assert_eq!(
+            (app.active_tab().doc.width, app.active_tab().doc.height),
+            (5, 5)
+        );
 
         app.handle_menu_action(MenuAction::Undo);
         assert_eq!(
-            (app.doc.width, app.doc.height),
+            (app.active_tab().doc.width, app.active_tab().doc.height),
             (20, 20),
             "undo must restore the original 20x20 canvas"
         );
 
         // 元の(20x20 の)キャンバスの右下領域を選択する。redo 後の 5x5 の
         // 範囲には一切かからない。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 10,
             y0: 10,
             x1: 18,
@@ -6961,13 +8830,13 @@ mod tests {
 
         app.handle_menu_action(MenuAction::Redo);
         assert_eq!(
-            (app.doc.width, app.doc.height),
+            (app.active_tab().doc.width, app.active_tab().doc.height),
             (5, 5),
             "redo must reapply the canvas resize to 5x5"
         );
 
         assert!(
-            app.selection.is_none(),
+            app.active_tab().selection.is_none(),
             "a selection that no longer overlaps the resized document must be dropped, \
              not left dangling with stale out-of-bounds coordinates"
         );
@@ -6978,10 +8847,13 @@ mod tests {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.confirm_canvas_resize(10, 10);
         app.handle_menu_action(MenuAction::Undo);
-        assert_eq!((app.doc.width, app.doc.height), (20, 20));
+        assert_eq!(
+            (app.active_tab().doc.width, app.active_tab().doc.height),
+            (20, 20)
+        );
 
         // (5,5)-(15,15) は 10x10 に縮小すると右下半分がはみ出す。
-        app.selection = Some(Selection::new(select::rect_mask(IRect {
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
             x1: 15,
@@ -6989,9 +8861,12 @@ mod tests {
         })));
 
         app.handle_menu_action(MenuAction::Redo);
-        assert_eq!((app.doc.width, app.doc.height), (10, 10));
+        assert_eq!(
+            (app.active_tab().doc.width, app.active_tab().doc.height),
+            (10, 10)
+        );
 
-        let selection = app.selection.as_ref().expect(
+        let selection = app.active_tab().selection.as_ref().expect(
             "the selection still partially overlaps the new bounds, so it must be kept (clamped), \
              not dropped",
         );
@@ -7024,7 +8899,7 @@ mod tests {
             },
         ]);
         assert_ne!(
-            app.doc.get_pixel(7, 7),
+            app.active_tab().doc.get_pixel(7, 7),
             Some([255, 255, 255, 255]),
             "painting inside the clamped selection must work"
         );
@@ -7041,7 +8916,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            app.doc.get_pixel(1, 1),
+            app.active_tab().doc.get_pixel(1, 1),
             Some([255, 255, 255, 255]),
             "painting outside the selection must still be clipped"
         );
@@ -7062,7 +8937,9 @@ mod tests {
         app.select_up(pos2(100.0, 100.0));
 
         let selection = app
+            .active_tab()
             .selection
+            .as_ref()
             .expect("a non-degenerate ellipse drag must produce a selection");
 
         // 期待値: raster::fill_ellipse と同じ判定式(非クランプの外接矩形

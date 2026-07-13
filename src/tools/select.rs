@@ -317,6 +317,29 @@ pub fn extract_region(doc: &Document, mask: &SelMask) -> Vec<u8> {
     out
 }
 
+/// v5 §31(ARCHITECTURE.md §17.5): 「選択範囲を新規タブに複製」の浮動片
+/// ケース専用。`floating.pixels` をそのまま新規タブのレイヤーにすると、
+/// マスク外の画素(ハンドルでリサイズした際の再サンプリングなどで不透明な
+/// 値が残っていてもおかしくない、`composite_floating_skips_pixels_outside_mask`
+/// 参照)が「選択されていないのに見えてしまう」ことになる。`composite_floating`
+/// が実際の合成時にマスク外を無視するのと同じ意味論を、新規レイヤーの
+/// ピクセルバッファ自体にも焼き込む(SPEC §31: 「その浮動片のピクセル
+/// (mask込み)をそのまま新規タブの唯一のレイヤーにする」)。
+pub fn floating_layer_pixels(floating: &Floating) -> Vec<u8> {
+    let count = (floating.w as usize).saturating_mul(floating.h as usize);
+    let mut out = vec![0u8; count * 4];
+    for i in 0..count {
+        if floating.mask.get(i).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let idx = i * 4;
+        if let Some(src) = floating.pixels.get(idx..idx + 4) {
+            out[idx..idx + 4].copy_from_slice(src);
+        }
+    }
+    out
+}
+
 /// `mask` で選択されている画素だけを透明で埋める(v4 §16.3: 「元領域は
 /// mask の画素だけ透明化」。SPEC §6: 浮動化時の元領域のクリア、および
 /// Delete での消去。矩形選択=全 1 マスクのときは従来どおり矩形全体を
@@ -830,6 +853,37 @@ mod tests {
         assert_eq!(&region[0..4], &[255, 255, 255, 255]); // (0,0) 選択済み
         assert_eq!(&region[8..12], &[0, 0, 0, 0]); // (2,0) 非選択
         let _ = &mut doc; // 未使用警告回避(get_pixel を経由しないため)。
+    }
+
+    // -- v5 §31(ARCHITECTURE.md §17.5): 選択範囲を新規タブに複製・浮動片 -----
+
+    #[test]
+    fn floating_layer_pixels_zeroes_out_pixels_outside_mask() {
+        // `composite_floating_skips_pixels_outside_mask` と同じ意味論:
+        // pixels 側が不透明な値を持っていても、mask==0 の画素は透明として
+        // 扱う(SPEC §31: 「そのピクセル(mask込み)をそのまま」)。
+        let pixels = [9u8, 9, 9, 255].repeat(4); // 2x2 全画素不透明
+        let mask = vec![255, 0, 0, 255]; // 左上・右下だけ選択
+        let floating = Floating::new(pixels, 2, 2, mask, pos2(0.0, 0.0), None, 1);
+        let out = floating_layer_pixels(&floating);
+        assert_eq!(&out[0..4], &[9, 9, 9, 255], "masked-in top-left kept");
+        assert_eq!(&out[4..8], &[0, 0, 0, 0], "masked-out top-right zeroed");
+        assert_eq!(&out[8..12], &[0, 0, 0, 0], "masked-out bottom-left zeroed");
+        assert_eq!(&out[12..16], &[9, 9, 9, 255], "masked-in bottom-right kept");
+    }
+
+    #[test]
+    fn floating_layer_pixels_keeps_fully_masked_pixels_as_is() {
+        let floating = Floating::new_rect(
+            vec![1, 2, 3, 255, 4, 5, 6, 128],
+            2,
+            1,
+            pos2(0.0, 0.0),
+            None,
+            1,
+        );
+        let out = floating_layer_pixels(&floating);
+        assert_eq!(out, vec![1, 2, 3, 255, 4, 5, 6, 128]);
     }
 
     #[test]

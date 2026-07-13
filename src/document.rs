@@ -325,6 +325,35 @@ impl Document {
         Self::from_layers(width, height, vec![layer], Some(path))
     }
 
+    /// v5 §31(ARCHITECTURE.md §17.5): 「選択範囲を新規タブに複製」専用の
+    /// コンストラクタ。呼び出し側(`app.rs::duplicate_selection_to_new_tab`)が
+    /// 組み立てた `layers`(名前・表示・不透明度・重ね順は呼び出し側が既存の
+    /// レイヤーからそのまま引き継ぐ)と、複製元でアクティブだったレイヤーの
+    /// 添字をそのまま新規ドキュメントに反映する。新規タブは常に「無題」系の
+    /// 命名になるため `path` は持たない(SPEC §31: 「パスは無し」)。
+    /// `layers` が空(呼び出し側の想定外の入力)なら 1 枚以上の不変条件を守る
+    /// ため透明の 1 枚にフォールバックする(`apply_snapshot` と同じ安全側の
+    /// パターン)。
+    pub fn from_duplicated_layers(
+        width: u32,
+        height: u32,
+        layers: Vec<Layer>,
+        active: usize,
+    ) -> Self {
+        let layers = if layers.is_empty() {
+            vec![Layer::filled("背景", width, height, [0, 0, 0, 0])]
+        } else {
+            layers
+        };
+        let active = active.min(layers.len() - 1);
+        let mut doc = Self::from_layers(width, height, layers, None);
+        doc.active = active;
+        // SPEC §31: 「新規タブの未保存フラグは true(ファイルに存在しない
+        // 新しい内容のため)」。
+        doc.modified = true;
+        doc
+    }
+
     fn from_layers(width: u32, height: u32, layers: Vec<Layer>, path: Option<PathBuf>) -> Self {
         let mut doc = Self {
             width,

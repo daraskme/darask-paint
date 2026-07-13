@@ -14,4 +14,5 @@ pub mod menu;
 pub mod options_bar;
 pub mod side_panel;
 pub mod status_bar;
+pub mod tab_bar;
 pub mod toolbar;

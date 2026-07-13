@@ -23,6 +23,8 @@ pub enum MenuAction {
     OpenRecent(usize),
     Save,
     SaveAs,
+    /// v5 §30/§32(V5-M3、ARCHITECTURE.md §17.6): 「タブを閉じる (Ctrl+W)」。
+    CloseTab,
     Exit,
     Undo,
     Redo,
@@ -35,6 +37,8 @@ pub enum MenuAction {
     ImageResize,
     CanvasResize,
     Crop,
+    /// v5 §31(ARCHITECTURE.md §17.5): 「選択範囲を新規タブに複製」。
+    DuplicateSelectionToTab,
     FlipHorizontal,
     FlipVertical,
     RotateCw,
@@ -69,6 +73,9 @@ pub struct MenuState<'a> {
     pub can_redo: bool,
     /// 選択または浮動片がある(切り取り/コピー/削除/トリミングを有効にする)。
     pub has_selection: bool,
+    /// v5 §31(ARCHITECTURE.md §17.6): 「選択範囲を新規タブに複製」の有効/
+    /// 無効(`has_selection` と同じ値でよい)。
+    pub can_duplicate_selection_to_tab: bool,
     // -- v2 §13: レイヤーメニューの有効/無効(document.rs の各操作の成否
     // 条件と 1:1 に対応させる、ARCHITECTURE.md §14.8 V2-M2) -------------
     pub can_add_layer: bool,
@@ -133,6 +140,15 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     .clicked()
                 {
                     action = Some(MenuAction::SaveAs);
+                    ui.close();
+                }
+                // v5 §17.6: 「ファイルメニューに「タブを閉じる (Ctrl+W)」を
+                // 追加(名前を付けて保存の後、終了の前)」。
+                if ui
+                    .button(keymap::menu_label("タブを閉じる", Action::CloseTab))
+                    .clicked()
+                {
+                    action = Some(MenuAction::CloseTab);
                     ui.close();
                 }
                 ui.separator();
@@ -240,6 +256,17 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     .clicked()
                 {
                     action = Some(MenuAction::Crop);
+                    ui.close();
+                }
+                // v5 §31: 「選択範囲でトリミング」の直後に追加。
+                if ui
+                    .add_enabled(
+                        state.can_duplicate_selection_to_tab,
+                        egui::Button::new("選択範囲を新規タブに複製"),
+                    )
+                    .clicked()
+                {
+                    action = Some(MenuAction::DuplicateSelectionToTab);
                     ui.close();
                 }
                 ui.separator();

@@ -172,6 +172,15 @@ pub enum Action {
     Save,
     SaveAs,
 
+    // -- v5 §30/§32: タブ(ARCHITECTURE.md §17.6) ---------------------------
+    /// `Ctrl+Tab`: 次のタブへ(端では先頭へ循環)。
+    NextTab,
+    /// `Ctrl+Shift+Tab`: 前のタブへ(端では末尾へ循環)。
+    PrevTab,
+    /// v5 §30/§32(V5-M3、ARCHITECTURE.md §17.4): `Ctrl+W`: アクティブタブを
+    /// 閉じる(未保存なら確認ダイアログ、`app.rs::close_tab` 参照)。
+    CloseTab,
+
     // -- 表示(SPEC §20「表示」) ---------------------------------------------
     ZoomIn,
     ZoomOut,
@@ -302,6 +311,22 @@ pub const KEYMAP: &[Entry] = &[
         Key::S,
         Action::SaveAs,
     ),
+    // -- v5 §30/§32: タブ ---------------------------------------------------
+    // ARCHITECTURE.md §17.8-2: egui 自身のフォーカス移動は Tab キーの修飾
+    // なし(`FocusDirection::Next`)/ Shift のみ(`FocusDirection::Previous`)
+    // のときだけ発火する(egui 0.35 `memory/mod.rs` の `begin_pass` で確認
+    // 済み)。Ctrl を伴うこの 2 バインドはどちらにも該当しないため、egui の
+    // 既定フォーカス移動と衝突しない。
+    e(Modifiers::CTRL, Key::Tab, Action::NextTab),
+    e(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::Tab,
+        Action::PrevTab,
+    ),
+    // v5 §30/§32(V5-M3): `Ctrl+W`(単一キーの `W` は既に自動選択
+    // `ToolKind::MagicWand` に束縛済みだが、`Ctrl` 修飾があるので衝突しない、
+    // `no_two_entries_share_the_same_binding` 参照)。
+    e(Modifiers::CTRL, Key::W, Action::CloseTab),
     // -- 表示 ------------------------------------------------------------
     e(Modifiers::CTRL, Key::Plus, Action::ZoomIn),
     e(Modifiers::CTRL, Key::Minus, Action::ZoomOut),
@@ -712,6 +737,43 @@ mod tests {
         );
     }
 
+    // -- v5 §30/§32: タブ(Ctrl+Tab / Ctrl+Shift+Tab) -----------------------
+
+    #[test]
+    fn tab_switch_keys_match_spec_30_32() {
+        assert_eq!(
+            binding_for(Action::NextTab),
+            Some(Binding::new(Modifiers::CTRL, Key::Tab))
+        );
+        assert_eq!(
+            binding_for(Action::PrevTab),
+            Some(Binding::new(
+                Modifiers::CTRL.plus(Modifiers::SHIFT),
+                Key::Tab
+            ))
+        );
+    }
+
+    #[test]
+    fn close_tab_key_matches_spec_30_32() {
+        assert_eq!(
+            binding_for(Action::CloseTab),
+            Some(Binding::new(Modifiers::CTRL, Key::W))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_tab_takes_priority_over_ctrl_tab() {
+        // ARCHITECTURE.md §15.4 ②と同じ理由(Ctrl+Shift+Z が Ctrl+Z より先の
+        // ケースと同型): `poll` が specificity 降順で consume するため、
+        // Ctrl+Shift+Tab は Ctrl+Tab のパターンに誤ってマッチする前に
+        // 消費される必要がある。
+        let ctrl_tab = Binding::new(Modifiers::CTRL, Key::Tab).specificity();
+        let ctrl_shift_tab =
+            Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab).specificity();
+        assert!(ctrl_shift_tab > ctrl_tab);
+    }
+
     /// SPEC §20 の全項目数(ツール9 + 色4(X/D/数字10種をまとめて1項目と
     /// 数えず個別カウント) …ここでは「表の行」ではなく「区別できる実際の
     /// キー割り当て数」で数える: 数字キーは 10 個で 10 バインド)。
@@ -728,7 +790,10 @@ mod tests {
         // `SelectTool(Fill)` → `SelectLastFillTool` に置き換わっただけで
         // バインド数は変わらない) + Ctrl+U(HueSaturation) +
         // Ctrl+I(Invert) + Ctrl+Shift+U(Grayscale) = 55 + 4 = 59。
-        assert_eq!(KEYMAP.len(), 59);
+        // v5 §30/§32(V5-M2)でさらに 2 件追加: Ctrl+Tab(NextTab) +
+        // Ctrl+Shift+Tab(PrevTab) = 59 + 2 = 61。
+        // v5 §30/§32(V5-M3)でさらに 1 件追加: Ctrl+W(CloseTab) = 61 + 1 = 62。
+        assert_eq!(KEYMAP.len(), 62);
     }
 
     #[test]

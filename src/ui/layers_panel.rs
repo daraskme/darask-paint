@@ -194,6 +194,15 @@ fn show_layer_row(
                     if !trimmed.is_empty() {
                         if let Some(layer) = doc.layers.get_mut(idx) {
                             layer.name = trimmed;
+                            // バグ修正: 上の表示切替・下の不透明度ハンドラは
+                            // どちらも変更時に `doc.modified` を立てるが、
+                            // リネームだけこれを欠いていた。立てないと
+                            // `doc_is_pristine()`(`path.is_none() &&
+                            // !modified` のみ判定)がリネーム済みの文書を
+                            // 「白紙」のまま誤判定し、Ctrl+V の白紙置換
+                            // パス(`replace_document_with_pasted_image`)に
+                            // 載ってドキュメントごと差し替わってしまう。
+                            doc.modified = true;
                         }
                     }
                 }
