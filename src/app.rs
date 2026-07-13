@@ -54,15 +54,18 @@ use crate::document::{Background, Document, Interpolation, MAX_LAYERS};
 use crate::history::{History, HistoryOp};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
+use crate::raster;
+use crate::settings::{self, Settings};
 use crate::text;
 use crate::tools::color_to_straight_rgba;
 use crate::tools::eraser::EraserTool;
 use crate::tools::fill::FillTool;
+use crate::tools::gradient::GradientTool;
 use crate::tools::pen::PenTool;
 use crate::tools::picker::PickerTool;
 use crate::tools::select::{self, Floating, Selection};
-use crate::tools::shapes::ShapeTool;
-use crate::tools::{Tool, ToolCtx, ToolEvent, ToolKind};
+use crate::tools::shapes::{ShapeMode, ShapeTool};
+use crate::tools::{LassoMode, Tool, ToolCtx, ToolEvent, ToolKind};
 use crate::ui::color_panel::{self, ColorPanelCtx};
 use crate::ui::color_wheel::ColorWheelState;
 use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
@@ -78,20 +81,34 @@ const MAX_RECENT_COLORS: usize = 8;
 const MIN_BRUSH_SIZE: f32 = 1.0;
 const MAX_BRUSH_SIZE: f32 = 64.0;
 
-/// SPEC §17: 硬さ 0–100%(デフォルト 100)。
+/// SPEC §17: 硬さ 0–100%(デフォルト値は `settings::DEFAULT_BRUSH_HARDNESS`
+/// — v4 §26 で永続化対象になったため、既定値の情報源は `settings.rs` に
+/// 一本化した)。
 const MIN_BRUSH_HARDNESS: u8 = 0;
 const MAX_BRUSH_HARDNESS: u8 = 100;
-const DEFAULT_BRUSH_HARDNESS: u8 = 100;
 /// SPEC §17: 「Shift+[ / Shift+] で ±10」。
 const HARDNESS_STEP: u8 = 10;
 
-/// SPEC §17: 不透明度 1–100%(デフォルト 100。消しゴムは「強さ」として表示)。
+/// SPEC §17: 不透明度 1–100%(消しゴムは「強さ」として表示。既定値は
+/// `settings::DEFAULT_BRUSH_OPACITY`、上と同じ理由)。
 const MIN_BRUSH_OPACITY: u8 = 1;
 const MAX_BRUSH_OPACITY: u8 = 100;
-const DEFAULT_BRUSH_OPACITY: u8 = 100;
 
 /// SPEC §8: トーストは約 4 秒表示する。
 const TOAST_DURATION: Duration = Duration::from_secs(4);
+
+/// v4 §22: 多角形なげなわの「始点クリックで閉じる」判定距離(スクリーン
+/// 論理ポイント。SPEC §16 のハンドルサイズ(7pt)と同程度の当たり判定)。
+const LASSO_CLOSE_DISTANCE: f32 = 8.0;
+/// v4 §22: 多角形なげなわの「ダブルクリックで閉じる」判定時間窓。
+const LASSO_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// v4 §22: ダブルクリック判定の距離しきい値。`LASSO_CLOSE_DISTANCE`
+/// (始点クリック用、狙って当てる操作なので少し広め)とは別に、こちらは
+/// 「ほぼ同じ位置を素早く 2 回クリックした」ことを狙う小さめの値にする —
+/// 広すぎると、細かい頂点を素早く連続でクリックして多角形を描く通常操作
+/// (隣り合う頂点同士がこの距離より近いことは普通にありうる)を誤ってダブル
+/// クリックと判定し、意図せず多角形を閉じてしまう。
+const LASSO_DOUBLE_CLICK_DISTANCE: f32 = 4.0;
 
 /// SPEC §7: 「新規」ダイアログのデフォルト値。
 const DEFAULT_NEW_WIDTH: u32 = 1280;
@@ -99,6 +116,10 @@ const DEFAULT_NEW_HEIGHT: u32 = 720;
 
 /// SPEC §8: JPEG 品質のデフォルト値。
 const DEFAULT_JPEG_QUALITY: u8 = 90;
+
+/// SPEC §26: 「ヘルプ > バージョン情報」に表示するリポジトリ URL。
+/// `Cargo.toml` の `repository` フィールドが単一情報源。
+const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// SPEC §19: フォントサイズ 8–144px(デフォルト 24。範囲そのものは
 /// `ui/options_bar.rs` のスライダーに直接持たせている、`brush_size`
@@ -115,12 +136,20 @@ const DEFAULT_TEXT_FONT_SIZE: f32 = 24.0;
 const TEXT_PREVIEW_MIN_PX: f32 = 6.0;
 const TEXT_PREVIEW_MAX_PX: f32 = 200.0;
 
-/// DARASK_BENCH=1 のときのみ存在する、起動計測用の状態(SPEC §11)。
+/// DARASK_BENCH=1 のときのみ存在する、起動計測用の状態(SPEC §11、
+/// v4 §16.2: フェーズ内訳)。
 struct BenchState {
     /// `main()` 冒頭で取得した `Instant`(プロセス起動からの経過測定用)。
     process_start: Instant,
     /// これまでに `ui()` が呼ばれ描画された回数。
     frames_drawn: u32,
+    /// v4 §16.2: `bench.txt` に書き出すフェーズ内訳。
+    /// `(ラベル, process_start からの経過ミリ秒)` を、到達した順に積む。
+    /// `DaraskApp::new` が「window」(ウィンドウ/GL コンテキスト作成完了
+    /// ≈ `new()` 開始時点)・「font」(フォント読込完了)・「app_new」
+    /// (`new()` 完了)を積み、`update()` が「first_frame」・「second_frame」
+    /// を追加する。
+    phases: Vec<(&'static str, u128)>,
 }
 
 /// 起動直後 1 回だけ実行するウィンドウの微小リサイズ(白画面ワークアラウンド)。
@@ -167,7 +196,9 @@ const STARTUP_NUDGE_RESTORE_DELAY: Duration = Duration::from_millis(100);
 /// フィールドとして直接持つ(ARCHITECTURE.md §10 の状態機械どおり)が、
 /// 「今まさにドラッグ中か、それは新規選択か浮動片移動か」はこの型でだけ
 /// 追跡する。
-#[derive(Debug, Clone, Copy)]
+/// v4 §16.3: `PendingFloating` が `SelMask`(`Vec<u8>` を持つ)を保持するため、
+/// もはや `Copy` にできない(`Clone` のみ)。
+#[derive(Debug, Clone)]
 enum SelectDrag {
     /// 新規の矩形選択をドラッグ中。
     NewSelection { start: Pos2, current: Pos2 },
@@ -180,9 +211,11 @@ enum SelectDrag {
     /// 再合成」という before==after の無意味な undo エントリが積まれ、
     /// Ctrl+Z が 1 回「何も起きない」まま消費されていた)。実際に動いた
     /// (`select_drag_move` で座標が変化した)時点で初めて浮動化する
-    /// (SPEC §6: 「選択内部をドラッグ→浮動化」)。
+    /// (SPEC §6: 「選択内部をドラッグ→浮動化」)。v4 §16.3: 浮動化される
+    /// マスク(選択があればその形状、無ければ対象範囲の全 1 矩形マスク)を
+    /// そのまま保持しておく。
     PendingFloating {
-        rect: crate::document::IRect,
+        mask: crate::document::SelMask,
         down_img: Pos2,
     },
     /// スケールハンドルをドラッグ中(SPEC §16、ARCHITECTURE.md §14.6)。
@@ -195,6 +228,15 @@ enum SelectDrag {
         start_h: f32,
         start_center: Pos2,
     },
+}
+
+/// v4 §22: 多角形なげなわの進行中状態(ARCHITECTURE.md §16.3)。
+/// 「クリックで頂点追加、ダブルクリック/Enter/始点クリックで閉じる、Esc で
+/// 中止」の状態機械: `points` が積み上がった頂点列(画像座標)、
+/// `last_click` が直近のクリック時刻・スクリーン座標(ダブルクリック判定用)。
+struct LassoPolygonState {
+    points: Vec<Pos2>,
+    last_click: Option<(Instant, Pos2)>,
 }
 
 /// v3 §19: テキストツールのインライン編集状態(ARCHITECTURE.md §15.3)。
@@ -251,6 +293,24 @@ enum ModalState {
         path: PathBuf,
     },
     ConfirmUnsaved,
+    /// SPEC §24: 「明るさ・コントラスト…」(各 -100..100、ライブプレビュー)。
+    /// `rect` はモーダルを開いた時点の対象領域(選択 bbox、無ければアクティブ
+    /// レイヤー全体。ARCHITECTURE.md §16.5)。開いた時点で
+    /// `History::begin_stroke`/`ensure_tiles_saved(rect)` 済み。
+    BrightnessContrast {
+        brightness: i32,
+        contrast: i32,
+        rect: crate::document::IRect,
+    },
+    /// SPEC §24: 「色相・彩度・明度…」(Ctrl+U)。上と同じ仕組み。
+    HueSaturation {
+        hue: i32,
+        saturation: i32,
+        lightness: i32,
+        rect: crate::document::IRect,
+    },
+    /// v4 §26: 「ヘルプ > バージョン情報」。表示するだけで状態を持たない。
+    About,
 }
 
 /// rfd のネイティブダイアログはブロッキングでイベントループを止めるため、
@@ -262,6 +322,69 @@ enum DialogRequest {
     SaveAs,
 }
 
+/// v4 §26(ARCHITECTURE.md §16.7): 設定から復元する起動時のツール状態の
+/// 純粋な計算部分。`DaraskApp::new` は `eframe::CreationContext` を要求する
+/// ためユニットテストできないが(`new_for_test` のドキュメントコメント
+/// 参照)、これは `Settings` だけから計算できる純関数なのでテストできる。
+struct StartupToolState {
+    brush_size: f32,
+    brush_hardness: u8,
+    brush_opacity: u8,
+    brush_smoothing: u8,
+    rect_mode: ShapeMode,
+    ellipse_mode: ShapeMode,
+    fill_tolerance: u8,
+    gradient_kind: raster::GradientKind,
+    gradient_colors: crate::tools::gradient::GradientColors,
+    last_shape_tool: ToolKind,
+    last_marquee_tool: ToolKind,
+    last_fill_tool: ToolKind,
+}
+
+impl StartupToolState {
+    /// `settings::parse` は型の範囲(例: u8 なら 0–255)までしか検証しない
+    /// ため、各 UI が実際に許す範囲へここでクランプする(手編集・破損した
+    /// 設定ファイルからの防御、ARCHITECTURE.md §16.10-5)。
+    fn resolve(settings: &Settings) -> Self {
+        // SPEC §20/§22/§23: `last_shape_tool`/`last_marquee_tool`/
+        // `last_fill_tool` は `U`/`M`/`G` が戻る先(`set_tool` のドキュメント
+        // コメント参照)。復元した `last_tool` がそれぞれの巡回グループに
+        // 属していれば引き継ぎ、そうでなければ各グループの既定値(SPEC の
+        // 表の先頭)のままにする。
+        let last_shape_tool = match settings.last_tool {
+            ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => settings.last_tool,
+            _ => ToolKind::Line,
+        };
+        let last_marquee_tool = match settings.last_tool {
+            ToolKind::Select | ToolKind::EllipseSelect => settings.last_tool,
+            _ => ToolKind::Select,
+        };
+        let last_fill_tool = match settings.last_tool {
+            ToolKind::Fill | ToolKind::Gradient => settings.last_tool,
+            _ => ToolKind::Fill,
+        };
+        Self {
+            brush_size: settings.brush_size.clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE),
+            brush_hardness: settings
+                .brush_hardness
+                .clamp(MIN_BRUSH_HARDNESS, MAX_BRUSH_HARDNESS),
+            brush_opacity: settings
+                .brush_opacity
+                .clamp(MIN_BRUSH_OPACITY, MAX_BRUSH_OPACITY),
+            // SPEC §25: スムージングは 0–100%(オプションバーのスライダー範囲)。
+            brush_smoothing: settings.brush_smoothing.min(100),
+            rect_mode: settings.rect_mode,
+            ellipse_mode: settings.ellipse_mode,
+            fill_tolerance: settings.fill_tolerance,
+            gradient_kind: settings.gradient_kind,
+            gradient_colors: settings.gradient_colors,
+            last_shape_tool,
+            last_marquee_tool,
+            last_fill_tool,
+        }
+    }
+}
+
 pub struct DaraskApp {
     doc: Document,
     view: CanvasView,
@@ -271,6 +394,14 @@ pub struct DaraskApp {
     /// `Ellipse` のいずれか(`set_tool` が唯一の更新箇所、`keymap::Action::
     /// SelectLastShapeTool`/`CycleShapeTool` 参照)。
     last_shape_tool: ToolKind,
+    /// SPEC §22: 「M / Shift+M で巡回」。`ToolKind::Select`(矩形)/
+    /// `EllipseSelect`(楕円)のいずれか(`last_shape_tool` と全く同じ役割、
+    /// `set_tool`/`cycle_marquee_tool` 参照)。
+    last_marquee_tool: ToolKind,
+    /// SPEC §23: 「G / Shift+G で巡回」。`ToolKind::Fill`/`Gradient` の
+    /// いずれか(`last_shape_tool`/`last_marquee_tool` と全く同じ役割、
+    /// `set_tool`/`cycle_fill_tool` 参照)。
+    last_fill_tool: ToolKind,
     pen: PenTool,
     eraser: EraserTool,
     line: ShapeTool,
@@ -278,6 +409,19 @@ pub struct DaraskApp {
     ellipse: ShapeTool,
     fill: FillTool,
     picker: PickerTool,
+    /// v4 §23: グラデーション(種類・色の組み合わせも自身で持つ、
+    /// `ShapeTool::mode` と同じ設計)。
+    gradient: GradientTool,
+    /// v4 §22: なげなわの自由/多角形モード(Shift+L で切替)。
+    lasso_mode: LassoMode,
+    /// v4 §22: 自由なげなわのドラッグ中に記録した軌跡(画像座標)。ドラッグ
+    /// 外・多角形モード中は空。
+    lasso_freehand_points: Vec<Pos2>,
+    /// v4 §22: 多角形なげなわの進行中状態(`None` = 未着手)。
+    lasso_polygon: Option<LassoPolygonState>,
+    /// v4 §22: 自動選択の許容値(SPEC §22: 「クリック画素から許容値
+    /// (0–255、オプションバー)の連結領域」)。
+    magic_wand_tolerance: u8,
     primary: Color32,
     secondary: Color32,
     brush_size: f32,
@@ -289,11 +433,18 @@ pub struct DaraskApp {
     brush_opacity: u8,
     /// SPEC §17: 鉛筆モード(デフォルト OFF)。
     pencil_mode: bool,
+    /// SPEC §25: ブラシ/消しゴム/鉛筆共通のスムージング(0–100%、デフォルト
+    /// 0)。`ToolCtx::smoothing` へ 0.0–1.0 に正規化して渡す。
+    brush_smoothing: u8,
     /// 最近使った色(SPEC §5: 最大 8、先頭が最新)。
     recent_colors: VecDeque<Color32>,
     /// Alt+クリックによる一時スポイト(SPEC §4)の最中、対応するボタンの
     /// Up が来るまで通常のツール処理を止めておくためのフラグ。
     alt_eyedropper_active: bool,
+    /// SPEC §25: 「ピクセルグリッド…デフォルト ON」。表示メニューのトグル。
+    /// `zoom >= 8.0`(800%)のときだけ実際に描かれる(`canvas_view::
+    /// draw_pixel_grid`)。
+    show_pixel_grid: bool,
 
     // -- v2 §14: カラーパネル(ARCHITECTURE.md §14.3/§14.4, V2-M3) --------
     /// 色相リング + SV 三角形の編集中状態(ドラッグ中は HSV を正とする、
@@ -301,7 +452,9 @@ pub struct DaraskApp {
     color_wheel: ColorWheelState,
     /// HEX 入力欄の編集中テキスト(`ui/color_panel.rs` 参照)。
     color_hex_buffer: String,
-    /// ユーザーパレット(SPEC §14: 「＋」で追加、永続化はしない)。
+    /// ユーザーパレット(SPEC §14: 「＋」で追加)。v4 §26 で永続化対象に
+    /// なった(`current_settings`/`DaraskApp::new` 参照。以前は「永続化は
+    /// しない」だったが、SPEC §26 の一覧に明記されたため方針が変わった)。
     user_palette: Vec<Color32>,
 
     // -- M4: 選択・フローティング(ARCHITECTURE.md §7) --------------------
@@ -337,6 +490,11 @@ pub struct DaraskApp {
     /// ステータスバーのトースト(SPEC §8: 約 4 秒表示)。
     toast: Option<(String, Instant)>,
 
+    // -- v4 §26: 設定の永続化・最近使ったファイル(ARCHITECTURE.md §16.7) --
+    /// 最近使ったファイル(SPEC §26: 最大 8、先頭が最新)。「ファイル >
+    /// 最近使ったファイル」サブメニュー(`ui/menu.rs`)がこれを表示する。
+    recent_files: VecDeque<PathBuf>,
+
     // -- v2 §13: レイヤーパネル(ARCHITECTURE.md §14.8 V2-M2) --------------
     /// ダブルクリックで開始した名前編集の状態(`ui/layers_panel.rs`)。
     layer_rename: RenameState,
@@ -351,6 +509,19 @@ pub struct DaraskApp {
     /// `ui()` 冒頭の「追加提示」ワークアラウンドのコメント参照)。
     last_screen_rect: egui::Rect,
 
+    // -- v4 §26: 終了時のウィンドウ状態保存用(ARCHITECTURE.md §16.7) ------
+    /// 直近フレームで観測したウィンドウの内寸(論理ポイント)。終了処理
+    /// (`on_exit`/`exit_process`)は `egui::Context` を持たないため、
+    /// 「終了時の値」を都度ここへ観測しておいて使う(`ui()` 冒頭で毎フレーム
+    /// 更新。SPEC §26 の「ウィンドウ寸法・最大化状態」の保存元)。
+    window_size: egui::Vec2,
+    /// 直近フレームで観測した最大化状態。
+    window_maximized: bool,
+    /// `false` ならユニットテスト(`new_for_test`)。実 `%APPDATA%` を汚さない
+    /// ため `save_settings` を無効化する(`save_settings` のドキュメント
+    /// コメント参照)。実アプリ(`DaraskApp::new`)は常に `true`。
+    persist_settings: bool,
+
     bench: Option<BenchState>,
 }
 
@@ -358,13 +529,46 @@ impl DaraskApp {
     /// `process_start` は `main()` 冒頭で取得した `Instant`。
     /// `bench_mode` は環境変数 `DARASK_BENCH=1` が設定されていたかどうか。
     /// `cli_path` は SPEC §3 の「プログラムから開く」用の起動引数(あれば)。
+    /// `font_handle` は `main()` がウィンドウ作成と並行して起こしておいた
+    /// 日本語フォント読込スレッド(v4 §16.2)。
+    /// `settings` は `main()` が起動時に 1 回読み込んだ永続設定(v4 §26、
+    /// `settings::load`)。`settings_loaded_ms` はベンチモード時のみ
+    /// `Some`(`main()` が `settings::load` 直後に計測した経過ミリ秒。
+    /// ARCHITECTURE.md §16.2 の「設定読込完了」フェーズ)。
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         process_start: Instant,
         bench_mode: bool,
         cli_path: Option<PathBuf>,
+        font_handle: std::thread::JoinHandle<Option<Vec<u8>>>,
+        settings: Settings,
+        settings_loaded_ms: Option<u128>,
     ) -> Self {
-        let text_font = setup_japanese_fonts(&cc.egui_ctx);
+        // v4 §16.2: 「設定読込完了」フェーズ(`main()` 側で計測済みの値を
+        // そのまま記録する。設定ファイルの読み込みはウィンドウ作成より前に
+        // 行われるため、ここが `phases` の先頭になる)。
+        let mut phases: Vec<(&'static str, u128)> = Vec::new();
+        if let Some(ms) = settings_loaded_ms {
+            phases.push(("settings", ms));
+        }
+        // `new()` が呼ばれた時点 ≈ eframe のウィンドウ/GL コンテキスト作成が
+        // 完了した時点(`run_native` はこのクロージャをウィンドウ作成後に
+        // 呼ぶ)。ここまでの経過を「window」フェーズとして記録する。
+        if bench_mode {
+            phases.push(("window", process_start.elapsed().as_millis()));
+        }
+
+        // main() が別スレッドで先に開始していたフォント読込を join する
+        // (ウィンドウ作成と並行していたぶん、実質の待ち時間は短縮される)。
+        // `JoinHandle::join()` の `Err`(読み込みスレッドのパニック)は
+        // `unwrap()` せず `None` にフォールバックする(CLAUDE.md 鉄則:
+        // I/O・ユーザー入力経路で unwrap しない。`text::load_font_bytes` 自体は
+        // パニックしない実装だが、スレッド境界を挟む以上は防御的に扱う)。
+        let font_bytes = font_handle.join().unwrap_or(None);
+        if bench_mode {
+            phases.push(("font", process_start.elapsed().as_millis()));
+        }
+        let text_font = register_japanese_font(&cc.egui_ctx, font_bytes);
 
         // M4 で発見・修正したバグ: egui 0.35 は `Options::zoom_with_keyboard`
         // がデフォルト `true` で、`Context::end_pass` が Ctrl+Plus/Ctrl+Equals/
@@ -382,47 +586,87 @@ impl DaraskApp {
         // (SPEC §3: 「プログラムから開く」対応)。
         let mut doc = Document::new(DEFAULT_NEW_WIDTH, DEFAULT_NEW_HEIGHT, Background::White);
         let mut startup_error = None;
+        // 開けたら「最近使ったファイル」にも反映する(`app` 構築後に
+        // `remember_recent_file` を呼ぶ。SPEC §26)。
+        let mut opened_cli_path = None;
         if let Some(path) = cli_path {
             match io::load_image(&path) {
-                Ok(loaded) => doc = loaded,
+                Ok(loaded) => {
+                    doc = loaded;
+                    opened_cli_path = Some(path);
+                }
                 Err(e) => startup_error = Some(format!("開けませんでした: {e}")),
             }
         }
 
-        let bench = bench_mode.then(|| BenchState {
+        // v4 §16.2: `new()` を抜ける直前を「app_new」フェーズとして記録する
+        // (この後は `run_native` が最初の `update()` を呼ぶだけ)。
+        if bench_mode {
+            phases.push(("app_new", process_start.elapsed().as_millis()));
+        }
+        let bench = bench_mode.then_some(BenchState {
             process_start,
             frames_drawn: 0,
+            phases,
         });
+
+        // v4 §26(ARCHITECTURE.md §16.7): 設定から復元するツール状態。
+        // `DaraskApp::new` 自体は `eframe::CreationContext` を要求するため
+        // ユニットテストできないが(`new_for_test` のドキュメントコメント
+        // 参照)、この計算部分は純粋なので `StartupToolState::resolve` に
+        // 切り出してテストしている。
+        let startup = StartupToolState::resolve(&settings);
+        let mut rect_tool = ShapeTool::new_rect();
+        rect_tool.mode = startup.rect_mode;
+        let mut ellipse = ShapeTool::new_ellipse();
+        ellipse.mode = startup.ellipse_mode;
+        let mut fill = FillTool::new();
+        fill.tolerance = startup.fill_tolerance;
+        let mut gradient = GradientTool::new();
+        gradient.kind = startup.gradient_kind;
+        gradient.colors = startup.gradient_colors;
+        let window_size = egui::vec2(settings.window_width as f32, settings.window_height as f32);
 
         let mut app = Self {
             doc,
             view: CanvasView::new(),
             history: History::new(),
-            tool: ToolKind::Pen,
-            // SPEC §20: `U` の初期値。直線を最初の図形として扱う(SPEC §20:
-            // 「Shift+U で 直線→矩形→楕円 を巡回」の巡回順の先頭)。
-            last_shape_tool: ToolKind::Line,
+            // SPEC §26: 「最後に使ったツール」。
+            tool: settings.last_tool,
+            last_shape_tool: startup.last_shape_tool,
+            last_marquee_tool: startup.last_marquee_tool,
+            last_fill_tool: startup.last_fill_tool,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
             line: ShapeTool::new_line(),
-            rect_tool: ShapeTool::new_rect(),
-            ellipse: ShapeTool::new_ellipse(),
-            fill: FillTool::new(),
+            rect_tool,
+            ellipse,
+            fill,
             picker: PickerTool::new(),
-            // MS ペイント等と同様、初期値はプライマリ=黒・セカンダリ=白。
-            primary: Color32::BLACK,
-            secondary: Color32::WHITE,
-            brush_size: 4.0,
-            brush_hardness: DEFAULT_BRUSH_HARDNESS,
-            brush_opacity: DEFAULT_BRUSH_OPACITY,
-            pencil_mode: false,
+            gradient,
+            // SPEC §22: 「自由: …」が表の先頭に書かれている方をデフォルトにする。
+            // なげなわのモードは SPEC §26 の永続化対象に含まれていない。
+            lasso_mode: LassoMode::Freehand,
+            lasso_freehand_points: Vec::new(),
+            lasso_polygon: None,
+            magic_wand_tolerance: settings.magic_wand_tolerance,
+            primary: settings.primary,
+            secondary: settings.secondary,
+            brush_size: startup.brush_size,
+            brush_hardness: startup.brush_hardness,
+            brush_opacity: startup.brush_opacity,
+            pencil_mode: settings.pencil_mode,
+            brush_smoothing: startup.brush_smoothing,
+            // SPEC §26 の永続化対象に「最近使った色」は含まれていない
+            // (対象は「最近使ったファイル」のみ)。
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
+            show_pixel_grid: settings.show_pixel_grid,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
-            // だけ空欄がちらつく)。プライマリの初期値(黒)に合わせる。
-            color_hex_buffer: color_panel::format_hex(Color32::BLACK),
-            user_palette: Vec::new(),
+            // だけ空欄がちらつく)。
+            color_hex_buffer: color_panel::format_hex(settings.primary),
+            user_palette: settings.user_palette,
             selection: None,
             floating: None,
             select_drag: None,
@@ -437,6 +681,7 @@ impl DaraskApp {
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
             last_title: String::new(),
             toast: None,
+            recent_files: settings.recent_files,
             layer_rename: None,
             next_layer_number: 1,
             // ベンチモードは 2 フレームで自動終了する決定的なスモーク
@@ -449,10 +694,16 @@ impl DaraskApp {
                 }
             },
             last_screen_rect: egui::Rect::NOTHING,
+            window_size,
+            window_maximized: settings.window_maximized,
+            persist_settings: true,
             bench,
         };
         if let Some(message) = startup_error {
             app.show_toast(message);
+        }
+        if let Some(path) = opened_cli_path {
+            app.remember_recent_file(path);
         }
         app
     }
@@ -525,7 +776,21 @@ impl DaraskApp {
         // v3 §18: Enter(確定)/Esc(キャンセル)は選択/移動ツール使用中のみ
         // 有効(移動ツールも選択と同じ `Selection`/`Floating` 浮動化パスを
         // 使うため、`commit_open_gesture`/`move_down` と同じ扱い)。
-        let is_select_or_move = matches!(self.tool, ToolKind::Select | ToolKind::Move);
+        // v4 §22: 楕円選択もこの仲間(`Select` と全く同じ状態機械を共有)。
+        //
+        // v4 レビューで発見・修正したバグ: `MagicWand`(自動選択)がここに
+        // 含まれていなかったため、「W でクリックして選択を作る→Esc」が
+        // 無反応だった(SPEC §18: 「Esc は…選択を解除する」はツール限定なし
+        // の規定)。`magic_wand_select` は `Floating` を作らずプレーンな
+        // `Selection` だけを設定するツールなので、`commit_selection`/
+        // `cancel_floating` を素通りする(いずれも浮動片が無ければ選択解除
+        // だけを行うため、`MagicWand` に対しても安全にそのまま使える)。
+        // なげなわの Esc=進行中多角形の中止(選択には影響しない)は SPEC
+        // §22 の明示的な例外規定なのでこのままでよい。
+        let is_select_move_or_wand = matches!(
+            self.tool,
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move | ToolKind::MagicWand
+        );
 
         for action in keymap::poll(ctx) {
             match action {
@@ -534,6 +799,22 @@ impl DaraskApp {
                 Action::SelectLastShapeTool => self.set_tool(self.last_shape_tool),
                 // SPEC §20: 「Shift+U で 直線→矩形→楕円 を巡回」。
                 Action::CycleShapeTool => self.cycle_shape_tool(),
+                // SPEC §22: 「M: 矩形選択/楕円選択(直前に使った形状)」。
+                Action::SelectLastMarqueeTool => self.set_tool(self.last_marquee_tool),
+                // SPEC §22 §27: 「Shift+M で巡回」。
+                Action::CycleMarquee => self.cycle_marquee_tool(),
+                // SPEC §23: 「G: 塗りつぶし系(直前に使ったツール)」。
+                Action::SelectLastFillTool => self.set_tool(self.last_fill_tool),
+                // SPEC §23 §27: 「Shift+G で巡回」。
+                Action::CycleFillTool => self.cycle_fill_tool(),
+                // SPEC §22 §27: 「Shift+L で自由↔多角形の切替」。進行中の
+                // 多角形なげなわは(モードが変わる以上)継続不能なので破棄する
+                // (Esc 中止と同じ挙動、選択自体には影響しない)。
+                Action::CycleLassoMode => {
+                    self.lasso_mode = self.lasso_mode.toggled();
+                    self.lasso_polygon = None;
+                    self.lasso_freehand_points.clear();
+                }
 
                 Action::SwapColors => std::mem::swap(&mut self.primary, &mut self.secondary),
                 // SPEC §20: 「D 初期色(黒・白)」。MS ペイント等と同じ初期値
@@ -553,10 +834,8 @@ impl DaraskApp {
                     self.brush_size = (self.brush_size + 1.0).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
                 }
                 Action::BrushHardnessDec => {
-                    self.brush_hardness = self
-                        .brush_hardness
-                        .saturating_sub(HARDNESS_STEP)
-                        .max(MIN_BRUSH_HARDNESS);
+                    // u8::saturating_sub は既に 0(MIN_BRUSH_HARDNESS)で床止めされる。
+                    self.brush_hardness = self.brush_hardness.saturating_sub(HARDNESS_STEP);
                 }
                 Action::BrushHardnessInc => {
                     self.brush_hardness = self
@@ -572,10 +851,12 @@ impl DaraskApp {
                 Action::Undo => {
                     self.commit_open_gesture();
                     self.history.undo(&mut self.doc);
+                    self.clamp_selection_to_doc();
                 }
                 Action::Redo => {
                     self.commit_open_gesture();
                     self.history.redo(&mut self.doc);
+                    self.clamp_selection_to_doc();
                 }
 
                 Action::Cut => self.cut_selection_to_clipboard(),
@@ -588,15 +869,28 @@ impl DaraskApp {
                 Action::Deselect => self.commit_selection(),
                 Action::FreeTransform => self.free_transform(),
                 Action::CommitFloating => {
-                    if is_select_or_move {
+                    if is_select_move_or_wand {
                         self.commit_selection();
+                    } else if self.tool == ToolKind::Lasso {
+                        // SPEC §22: 「Enter…で閉じる」(多角形なげなわ)。
+                        self.finish_polygon_lasso_if_ready();
                     }
                 }
                 Action::CancelFloating => {
-                    if is_select_or_move {
+                    if is_select_move_or_wand {
                         self.cancel_floating();
+                    } else if self.tool == ToolKind::Lasso {
+                        // SPEC §22: 「Esc で中止」(多角形なげなわ)。選択には
+                        // 何も影響しない(履歴にも積まない)。
+                        self.lasso_polygon = None;
+                        self.lasso_freehand_points.clear();
                     }
                 }
+
+                // SPEC §24 §27: 色調補正のショートカット。
+                Action::HueSaturation => self.open_hue_saturation_modal(),
+                Action::Invert => self.apply_invert(),
+                Action::Grayscale => self.apply_grayscale(),
 
                 Action::LayerAdd => self.layer_add(),
                 Action::LayerDuplicate => self.layer_duplicate(),
@@ -641,6 +935,15 @@ impl DaraskApp {
         ) {
             self.last_shape_tool = new_tool;
         }
+        // SPEC §22: 「M / Shift+M で巡回」。`last_shape_tool` と全く同じ
+        // 役割(`tool_shortcut_label`/`cycle_marquee_tool` 参照)。
+        if matches!(new_tool, ToolKind::Select | ToolKind::EllipseSelect) {
+            self.last_marquee_tool = new_tool;
+        }
+        // SPEC §23: 「G / Shift+G で巡回」。同上。
+        if matches!(new_tool, ToolKind::Fill | ToolKind::Gradient) {
+            self.last_fill_tool = new_tool;
+        }
         if new_tool == self.tool {
             return;
         }
@@ -670,6 +973,35 @@ impl DaraskApp {
         self.set_tool(next);
     }
 
+    /// SPEC §22: 「Shift+M で巡回」。`cycle_shape_tool` の選択版
+    /// (矩形選択↔楕円選択の 2 つだけを行き来する)。
+    fn cycle_marquee_tool(&mut self) {
+        let current = if matches!(self.tool, ToolKind::Select | ToolKind::EllipseSelect) {
+            self.tool
+        } else {
+            self.last_marquee_tool
+        };
+        let next = match current {
+            ToolKind::EllipseSelect => ToolKind::Select,
+            _ => ToolKind::EllipseSelect,
+        };
+        self.set_tool(next);
+    }
+
+    /// SPEC §23: 「Shift+G で巡回」。`cycle_marquee_tool` と同じ形の 2 値巡回。
+    fn cycle_fill_tool(&mut self) {
+        let current = if matches!(self.tool, ToolKind::Fill | ToolKind::Gradient) {
+            self.tool
+        } else {
+            self.last_fill_tool
+        };
+        let next = match current {
+            ToolKind::Gradient => ToolKind::Fill,
+            _ => ToolKind::Gradient,
+        };
+        self.set_tool(next);
+    }
+
     /// 進行中のジェスチャ(選択ツールの浮動片、または他ツールのドラッグ中
     /// ストローク)を、それを中断させる操作の前に確定させる共通フック
     /// (ARCHITECTURE.md §14.2/§14.9-3: 「レイヤー操作・アンドゥは、浮動片や
@@ -678,13 +1010,31 @@ impl DaraskApp {
     /// レイヤーの切り替えの前にも呼ぶ)。
     fn commit_open_gesture(&mut self) {
         // v3 §18: 移動(V)も選択と同じ `Selection`/`Floating` 浮動化パスを
-        // 使う(`move_down`/`handle_move_event` 参照)ため、ここでも
-        // `commit_selection` を経由させる必要がある。そうしないと、移動
-        // ツールでドラッグ中に他ツールへ切り替えたとき浮動片が確定されず
-        // 消えてしまう(M4 で選択ツールについて発見・修正したバグと同じ
-        // クラス、`Tool::cancel` のコメント参照)。
-        if matches!(self.tool, ToolKind::Select | ToolKind::Move) {
-            self.commit_selection();
+        // 使う(`move_down`/`handle_move_event` 参照)ため、ここでも浮動片の
+        // 確定を経由させる必要がある。そうしないと、移動ツールでドラッグ中に
+        // 他ツールへ切り替えたとき浮動片が確定されず消えてしまう(M4 で
+        // 選択ツールについて発見・修正したバグと同じクラス、`Tool::cancel`
+        // のコメント参照)。
+        // v4 §22: `EllipseSelect` は `Select` と全く同じ `Selection`/
+        // `Floating` 状態機械を共有する(唯一の違いは新規選択確定時のマスク
+        // 形状だけ)ため、ここでも同列に扱う。
+        //
+        // v4 §23/§24 で発見・修正したバグ: 以前はここで `commit_selection`
+        // (浮動片の確定に加え、無条件で `self.selection` もクリアする)を
+        // 呼んでいたため、「M/Lasso/W で選択してから、ツールを切り替えて
+        // グラデーション/色調補正を選択範囲に適用する」という SPEC §21 が
+        // 前提とする最も基本的な使い方で、ツール切替(=このメソッドの呼び出し)
+        // の瞬間に選択そのものが消えてしまい、クリップ対象が無くなっていた
+        // (`free_transform` が Ctrl+T について既に同じ理由で `commit_selection`
+        // を避けていたのと同一クラスの問題、
+        // `free_transform_from_select_tool_with_a_plain_selection_does_not_
+        // lose_it` 参照)。浮動片だけを確定し、まだ浮動化していないプレーンな
+        // 選択は残す(`flush_floating_keep_selection`)よう修正した。
+        if matches!(
+            self.tool,
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move
+        ) {
+            self.flush_floating_keep_selection();
         } else {
             self.end_active_gesture();
         }
@@ -703,6 +1053,19 @@ impl DaraskApp {
             self.commit_pending_text_edit_and_composite();
             return;
         }
+        // v4 §22: なげなわは `Tool`/`ToolCtx` を経由しない独自の進行中状態
+        // (`lasso_freehand_points`/`lasso_polygon`)を持つ。ドキュメントには
+        // まだ一切触れていない(選択が確定するのは `finish_lasso_points` の
+        // 時点)ため、ツール切替時は単に破棄すればよい(SPEC §18 の「先に
+        // 確定してから実行」は History ストローク/浮動片が対象であり、
+        // なげなわの未確定な軌跡・頂点列はどちらでもない)。破棄せずに残すと、
+        // 別ツールへ切り替えて戻ってきたときに古い頂点列へ継ぎ足されてしまう
+        // バグになる。
+        if self.tool == ToolKind::Lasso {
+            self.lasso_freehand_points.clear();
+            self.lasso_polygon = None;
+            return;
+        }
         let mut used_colors = Vec::new();
         let mut ctx = ToolCtx {
             doc: &mut self.doc,
@@ -713,7 +1076,9 @@ impl DaraskApp {
             hardness: self.brush_hardness as f32 / 100.0,
             opacity: self.brush_opacity as f32 / 100.0,
             pencil: self.pencil_mode,
+            smoothing: self.brush_smoothing as f32 / 100.0,
             used_colors: &mut used_colors,
+            clip: self.selection.as_ref().map(|s| &s.mask),
         };
         match self.tool {
             ToolKind::Pen => self.pen.cancel(&mut ctx),
@@ -721,6 +1086,9 @@ impl DaraskApp {
             ToolKind::Line => self.line.cancel(&mut ctx),
             ToolKind::Rect => self.rect_tool.cancel(&mut ctx),
             ToolKind::Ellipse => self.ellipse.cancel(&mut ctx),
+            // v4 §23: グラデーションもドラッグ状態を持つツール(図形と同じ、
+            // ツール切替時は直近のドラッグ位置で確定する)。
+            ToolKind::Gradient => self.gradient.cancel(&mut ctx),
             // 塗りつぶし/スポイト/手のひらはドラッグ状態(進行中のジェス
             // チャ)を持たない(塗りつぶしは Down で即座に確定する 1 ショット
             // のツール)。選択・移動は `commit_open_gesture` の分岐で別途
@@ -733,7 +1101,15 @@ impl DaraskApp {
             | ToolKind::Pan
             | ToolKind::Move
             | ToolKind::Zoom
-            | ToolKind::Text => {}
+            | ToolKind::Text
+            // v4 §22: `EllipseSelect` は `commit_open_gesture` が Select と
+            // 同じ扱い(`commit_selection` 経由)にするため、ここには来ない
+            // (網羅性のためだけに列挙)。`MagicWand` は塗りつぶしと同じ
+            // 1 ショットのツールでドラッグ状態を持たない。`Lasso` は上で
+            // 早期リターン済み(ここには来ない)。
+            | ToolKind::EllipseSelect
+            | ToolKind::MagicWand
+            | ToolKind::Lasso => {}
         }
         for color in used_colors {
             self.push_recent_color(color);
@@ -750,9 +1126,17 @@ impl DaraskApp {
             ToolKind::Rect => self.rect_tool.cursor(),
             ToolKind::Ellipse => self.ellipse.cursor(),
             ToolKind::Fill => self.fill.cursor(),
+            ToolKind::Gradient => self.gradient.cursor(),
             ToolKind::Picker => self.picker.cursor(),
             ToolKind::Pan => egui::CursorIcon::Grab,
-            ToolKind::Select | ToolKind::Move => self.select_cursor(),
+            // v4 §22: `EllipseSelect` は `Select` と同じハンドル/浮動片状態
+            // 機械を共有するので、カーソルも同じ規則(ハンドルホバーでリサイズ
+            // カーソル)にする。
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move => self.select_cursor(),
+            // v4 §22: なげなわ・自動選択は塗りつぶし/スポイトと同じ
+            // クロスヘア(ドラッグ中の意匠は `draw_selection_overlay` 側の
+            // プレビュー描画に任せる)。
+            ToolKind::Lasso | ToolKind::MagicWand => egui::CursorIcon::Crosshair,
             // SPEC §18: 「カーソルは虫眼鏡」。ARCHITECTURE.md §15.2 は
             // ZoomIn/ZoomOut を明示する。
             ToolKind::Zoom => {
@@ -811,8 +1195,8 @@ impl DaraskApp {
     /// 同じ 1 フレーム遅延、`status_bar::show` 呼び出し箇所のコメント参照)
     /// だが、連続したポインタ移動で駆動されるため実用上は無視できる。
     fn select_cursor(&self) -> egui::CursorIcon {
-        if let Some(SelectDrag::ResizeFloating { handle, .. }) = self.select_drag {
-            return select::handle_cursor(handle);
+        if let Some(SelectDrag::ResizeFloating { handle, .. }) = &self.select_drag {
+            return select::handle_cursor(*handle);
         }
         if let Some(hover) = self.view.hover_img() {
             if let Some(handle) = self.hit_resize_handle(hover) {
@@ -824,7 +1208,24 @@ impl DaraskApp {
 
     /// キャンバスから出た `ToolEvent` を、Alt+一時スポイト(SPEC §4)または
     /// 現在のツールへディスパッチする。
+    ///
+    /// v4 レビューで発見・修正したバグ: ARCHITECTURE.md §10「モーダル表示中は
+    /// キャンバスへの入力を渡さない」が、`handle_shortcuts`(app.rs 777行)や
+    /// `handle_dropped_files` は `self.modal.is_some()` でガードしているのに、
+    /// ここ(ポインタイベント経路)にはガードが無かった。`CanvasView::
+    /// handle_pointer` の進行中ジェスチャ分岐は生のポインタ状態だけで
+    /// Drag/Up を発行し `egui::Modal` のバックドロップ(新規の press にしか
+    /// 効かない)をすり抜けるため、ブラシでドラッグ中に Ctrl+U 等でモーダルを
+    /// 開き、ボタンを押したままマウスをモーダル上へ動かすと、その軌跡が
+    /// モーダルの裏でレイヤーに描画され続けていた。モーダル表示中はここで
+    /// 一括して何もディスパッチしない(`CanvasView` 側の内部状態
+    /// (`gesture`/`hover_img`)はそのまま更新され続けてよい — パンやカーソル
+    /// 追従だけで文書は一切変更しないため、モーダルを閉じた後の操作性を
+    /// 損なわない)。
     fn dispatch_canvas_events(&mut self, events: Vec<ToolEvent>) {
+        if self.modal.is_some() {
+            return;
+        }
         for ev in events {
             if let ToolEvent::Down { img, button, mods } = ev {
                 // v3 §18: ズームツールは Alt+クリックに「縮小」という独自の
@@ -855,8 +1256,11 @@ impl DaraskApp {
 
             // 選択ツール(SPEC §6)も同様に、`Selection`/`Floating` が
             // `ToolCtx` の外(app.rs 直結)にあるため、ここで直接処理する
-            // (tools/select.rs のモジュールコメント参照)。
-            if self.tool == ToolKind::Select {
+            // (tools/select.rs のモジュールコメント参照)。v4 §22: 楕円選択
+            // (`EllipseSelect`)は矩形選択と全く同じ状態機械を共有する
+            // (`handle_select_event` 内部で新規選択確定時のマスク形状だけ
+            // `self.tool` を見て切り替える)。
+            if matches!(self.tool, ToolKind::Select | ToolKind::EllipseSelect) {
                 self.handle_select_event(ev);
                 continue;
             }
@@ -865,6 +1269,22 @@ impl DaraskApp {
             // 使う(`move_down` のみ選択と異なる、それ以外は共有)。
             if self.tool == ToolKind::Move {
                 self.handle_move_event(ev);
+                continue;
+            }
+
+            // v4 §22: なげなわ。自由/多角形のどちらのモードかは
+            // `self.lasso_mode` を見て `handle_lasso_event` 内で分岐する。
+            if self.tool == ToolKind::Lasso {
+                self.handle_lasso_event(ev);
+                continue;
+            }
+
+            // v4 §22: 自動選択。塗りつぶしと同じ 1 ショットのクリック操作
+            // (ドラッグ/プレビューはない)。
+            if self.tool == ToolKind::MagicWand {
+                if let ToolEvent::Down { img, .. } = ev {
+                    self.magic_wand_select(img);
+                }
                 continue;
             }
 
@@ -908,7 +1328,9 @@ impl DaraskApp {
                 hardness: self.brush_hardness as f32 / 100.0,
                 opacity: self.brush_opacity as f32 / 100.0,
                 pencil: self.pencil_mode,
+                smoothing: self.brush_smoothing as f32 / 100.0,
                 used_colors: &mut used_colors,
+                clip: self.selection.as_ref().map(|s| &s.mask),
             };
             match self.tool {
                 ToolKind::Pen => self.pen.event(ev, &mut ctx),
@@ -917,14 +1339,19 @@ impl DaraskApp {
                 ToolKind::Rect => self.rect_tool.event(ev, &mut ctx),
                 ToolKind::Ellipse => self.ellipse.event(ev, &mut ctx),
                 ToolKind::Fill => self.fill.event(ev, &mut ctx),
+                ToolKind::Gradient => self.gradient.event(ev, &mut ctx),
                 // 手のひら(canvas_view が横取り)・選択・移動・ズーム・
-                // スポイト・テキストは上で処理済み。
+                // スポイト・テキスト・楕円選択・なげなわ・自動選択は上で
+                // 処理済み。
                 ToolKind::Select
                 | ToolKind::Pan
                 | ToolKind::Picker
                 | ToolKind::Move
                 | ToolKind::Zoom
-                | ToolKind::Text => {}
+                | ToolKind::Text
+                | ToolKind::EllipseSelect
+                | ToolKind::Lasso
+                | ToolKind::MagicWand => {}
             }
             for color in used_colors {
                 self.push_recent_color(color);
@@ -1008,6 +1435,129 @@ impl DaraskApp {
         }
     }
 
+    // -----------------------------------------------------------------
+    // v4 §22: なげなわ(自由/多角形)
+    // -----------------------------------------------------------------
+
+    fn handle_lasso_event(&mut self, ev: ToolEvent) {
+        match self.lasso_mode {
+            LassoMode::Freehand => self.handle_lasso_freehand_event(ev),
+            // 多角形モードはクリック列で状態を持つ(ドラッグではない)ため
+            // `Down` だけを見る(SPEC §22: 「クリックで頂点追加」)。
+            LassoMode::Polygon => {
+                if let ToolEvent::Down { img, .. } = ev {
+                    self.lasso_polygon_click(img);
+                }
+            }
+        }
+    }
+
+    /// SPEC §22: 「自由: ドラッグの軌跡を閉じてマスク化」。
+    fn handle_lasso_freehand_event(&mut self, ev: ToolEvent) {
+        match ev {
+            ToolEvent::Down { img, .. } => {
+                // v4 §22: 新規選択は既存の選択/浮動片を置き換える。浮動片が
+                // あれば先に合成して(通常のツール切替と同じ確定順序)から
+                // 新しい軌跡の記録を始める。
+                self.commit_selection();
+                self.lasso_freehand_points = vec![img];
+            }
+            ToolEvent::Drag { img, .. } => {
+                if !self.lasso_freehand_points.is_empty() {
+                    self.lasso_freehand_points.push(img);
+                }
+            }
+            ToolEvent::Up { .. } => {
+                let points = std::mem::take(&mut self.lasso_freehand_points);
+                self.finish_lasso_points(points);
+            }
+            ToolEvent::Hover { .. } => {}
+        }
+    }
+
+    /// SPEC §22: 「多角形: クリックで頂点追加、ダブルクリック/Enter/始点
+    /// クリックで閉じる、Esc で中止」。始点クリック・ダブルクリックのどちらも
+    /// スクリーン論理ポイント距離で判定する(ズームに関係なく一定の当たり
+    /// 判定になる、SPEC §16 のハンドルサイズと同じ考え方)。
+    fn lasso_polygon_click(&mut self, img: Pos2) {
+        let now = Instant::now();
+        let screen_pos = self.view.img_to_screen_pos(img);
+        if let Some(state) = &mut self.lasso_polygon {
+            if state.points.len() >= 3 {
+                let start_screen = self.view.img_to_screen_pos(state.points[0]);
+                if (screen_pos - start_screen).length() <= LASSO_CLOSE_DISTANCE {
+                    let points = std::mem::take(&mut state.points);
+                    self.lasso_polygon = None;
+                    self.finish_lasso_points(points);
+                    return;
+                }
+                if let Some((last_time, last_pos)) = state.last_click {
+                    if now.duration_since(last_time) <= LASSO_DOUBLE_CLICK_WINDOW
+                        && (screen_pos - last_pos).length() <= LASSO_DOUBLE_CLICK_DISTANCE
+                    {
+                        // ダブルクリックで閉じる: 2 回目のクリックは新しい
+                        // 頂点として追加しない(ほぼ同じ位置の重複頂点を
+                        // 避ける)。
+                        let points = std::mem::take(&mut state.points);
+                        self.lasso_polygon = None;
+                        self.finish_lasso_points(points);
+                        return;
+                    }
+                }
+            }
+            state.points.push(img);
+            state.last_click = Some((now, screen_pos));
+        } else {
+            // v4 §22: 新規選択は既存の選択/浮動片を置き換える。
+            self.commit_selection();
+            self.lasso_polygon = Some(LassoPolygonState {
+                points: vec![img],
+                last_click: Some((now, screen_pos)),
+            });
+        }
+    }
+
+    /// Enter(`Action::CommitFloating`)で多角形なげなわを確定する
+    /// (SPEC §22: 「Enter…で閉じる」)。進行中でなければ何もしない。
+    fn finish_polygon_lasso_if_ready(&mut self) {
+        if let Some(state) = self.lasso_polygon.take() {
+            self.finish_lasso_points(state.points);
+        }
+    }
+
+    /// 軌跡・頂点列から選択マスクを作って確定する(自由/多角形どちらの
+    /// なげなわも最終的にここへ合流する)。3 点未満(実質的な選択にならない)
+    /// なら選択を作らない(矩形選択の「単クリックは選択を残さない」と同じ
+    /// 考え方)。
+    fn finish_lasso_points(&mut self, points: Vec<Pos2>) {
+        let mask = select::polygon_mask(&points).clamp_to(self.doc.width, self.doc.height);
+        self.selection = if mask.is_empty() {
+            None
+        } else {
+            Some(Selection::new(mask))
+        };
+    }
+
+    // -----------------------------------------------------------------
+    // v4 §22: 自動選択(マジックワンド)
+    // -----------------------------------------------------------------
+
+    /// SPEC §22: 「クリック画素から許容値の連結領域をマスク選択(flood fill
+    /// と同じ判定、アクティブレイヤー基準)」。塗りつぶしと同じ 1 ショットの
+    /// クリック操作。新規選択は既存の選択/浮動片を置き換える。
+    fn magic_wand_select(&mut self, img: Pos2) {
+        self.commit_selection();
+        let x = img.x.floor() as i32;
+        let y = img.y.floor() as i32;
+        let surface = self.doc.active_surface_mut(None);
+        let mask = raster::flood_mask(&surface, x, y, self.magic_wand_tolerance);
+        self.selection = if mask.is_empty() {
+            None
+        } else {
+            Some(Selection::new(mask))
+        };
+    }
+
     fn move_down(&mut self, img: Pos2) {
         if let Some(handle) = self.hit_resize_handle(img) {
             self.begin_resize_handle(handle, img);
@@ -1027,12 +1577,13 @@ impl DaraskApp {
         // 経由にすることで、実際にドラッグしなかった単クリックは選択ツール
         // と同じく浮動化せず、undo エントリも積まない
         // (`select_drag_move`/`select_up` の `PendingFloating` 分岐参照)。
-        let rect = self
+        let mask = self
             .selection
-            .map(|s| s.rect)
-            .unwrap_or_else(|| self.doc_full_rect());
+            .as_ref()
+            .map(|s| s.mask.clone())
+            .unwrap_or_else(|| select::rect_mask(self.doc_full_rect()));
         self.select_drag = Some(SelectDrag::PendingFloating {
-            rect,
+            mask,
             down_img: img,
         });
     }
@@ -1043,7 +1594,7 @@ impl DaraskApp {
         if let Some(floating) = &self.floating {
             return Some(select::floating_target_rect(floating));
         }
-        self.selection.map(|s| s.rect)
+        self.selection.as_ref().map(|s| s.mask.bbox)
     }
 
     /// `img`(画像座標)がどのスケールハンドルに当たっているか
@@ -1065,10 +1616,10 @@ impl DaraskApp {
     /// 内部ドラッグと同様にまず浮動化してから拡縮する(SPEC §16)。
     fn begin_resize_handle(&mut self, handle: select::Handle, img: Pos2) {
         if self.floating.is_none() {
-            let Some(selection) = self.selection else {
+            let Some(mask) = self.selection.as_ref().map(|s| s.mask.clone()) else {
                 return;
             };
-            self.begin_floating_from_selection(selection.rect, img);
+            self.begin_floating_from_selection(mask, img);
         }
         let Some(floating) = &self.floating else {
             return;
@@ -1120,9 +1671,19 @@ impl DaraskApp {
         let new_w_px = (new_w.round() as u32).max(1);
         let new_h_px = (new_h.round() as u32).max(1);
         let resampled = if new_w_px != floating.w || new_h_px != floating.h {
+            // v4 §16.3/SPEC §16: ピクセルは bilinear、マスクは nearest で、
+            // どちらも「浮動化時点の元」(`original`/`orig_mask`)から毎回
+            // 再サンプリングする(累積劣化させない)。
             Some((
                 select::resample_bilinear(
                     &floating.original,
+                    floating.orig_w,
+                    floating.orig_h,
+                    new_w_px,
+                    new_h_px,
+                ),
+                select::resample_mask_nearest(
+                    &floating.orig_mask,
                     floating.orig_w,
                     floating.orig_h,
                     new_w_px,
@@ -1136,8 +1697,9 @@ impl DaraskApp {
         let Some(floating) = self.floating.as_mut() else {
             return;
         };
-        if let Some((pixels, id)) = resampled {
+        if let Some((pixels, mask, id)) = resampled {
             floating.pixels = pixels;
+            floating.mask = mask;
             floating.w = new_w_px;
             floating.h = new_h_px;
             floating.id = id;
@@ -1161,8 +1723,8 @@ impl DaraskApp {
             // 扱う(SPEC §6: 「選択外クリック」で確定)。
             self.commit_selection();
         }
-        if let Some(selection) = self.selection {
-            if select::rect_contains(selection.rect, img) {
+        if let Some(selection) = &self.selection {
+            if select::point_in_mask(&selection.mask, img) {
                 // M4 で発見・修正したバグ: ここで即座に `begin_floating_from_
                 // selection` を呼んでいたため、ドラッグせずに離すだけの
                 // 単クリックでも浮動化(元領域の透明化+同位置への再合成)が
@@ -1171,7 +1733,7 @@ impl DaraskApp {
                 // するよう、まずは「保留」状態を記録するだけにする
                 // (SPEC §6: 「選択内部をドラッグ→浮動化」)。
                 self.select_drag = Some(SelectDrag::PendingFloating {
-                    rect: selection.rect,
+                    mask: selection.mask.clone(),
                     down_img: img,
                 });
                 return;
@@ -1185,27 +1747,39 @@ impl DaraskApp {
     }
 
     fn select_drag_move(&mut self, img: Pos2, mods: Modifiers) {
-        match self.select_drag {
+        // v4 §16.3: `PendingFloating` が `SelMask`(`Vec<u8>`)を保持するように
+        // なり `SelectDrag` はもう `Copy` にできないため、`self.select_drag`
+        // を(一時的に `None` にして)`take()` で取り出し、各アームが必要なら
+        // 明示的に書き戻す形にした(以前は `Copy` によって暗黙にコピーを
+        // 読んでいた)。
+        match self.select_drag.take() {
             Some(SelectDrag::NewSelection { start, .. }) => {
-                self.select_drag = Some(SelectDrag::NewSelection {
-                    start,
-                    current: img,
-                });
+                // SPEC §22: 「Shift ドラッグで正方形/正円」。矩形選択の図形
+                // ツールと全く同じ拘束計算(`shapes::snap_square`)を使う。
+                let current = if mods.shift {
+                    crate::tools::shapes::snap_square(start, img)
+                } else {
+                    img
+                };
+                self.select_drag = Some(SelectDrag::NewSelection { start, current });
             }
             Some(SelectDrag::MoveFloating { offset }) => {
                 if let Some(floating) = &mut self.floating {
                     floating.pos = img - offset;
                 }
+                self.select_drag = Some(SelectDrag::MoveFloating { offset });
             }
-            Some(SelectDrag::PendingFloating { rect, down_img }) => {
+            Some(SelectDrag::PendingFloating { mask, down_img }) => {
                 if img != down_img {
                     // 実際に動いた: ここで初めて浮動化する。
                     // `begin_floating_from_selection` は `select_drag` を
                     // `MoveFloating` に設定するので、続けて同じ `img` で
                     // 再度呼び出すことで、浮動片を 1 フレーム遅れず現在位置
                     // まで追従させる。
-                    self.begin_floating_from_selection(rect, down_img);
+                    self.begin_floating_from_selection(mask, down_img);
                     self.select_drag_move(img, mods);
+                } else {
+                    self.select_drag = Some(SelectDrag::PendingFloating { mask, down_img });
                 }
             }
             Some(SelectDrag::ResizeFloating {
@@ -1225,6 +1799,13 @@ impl DaraskApp {
                     img,
                     mods.shift,
                 );
+                self.select_drag = Some(SelectDrag::ResizeFloating {
+                    handle,
+                    anchor,
+                    start_w,
+                    start_h,
+                    start_center,
+                });
             }
             None => {}
         }
@@ -1232,26 +1813,56 @@ impl DaraskApp {
 
     fn select_up(&mut self, img: Pos2) {
         match self.select_drag.take() {
-            Some(SelectDrag::NewSelection { start, .. }) => {
+            Some(SelectDrag::NewSelection { start, current }) => {
                 // v2 レビューで発見・修正したバグ: `irect_from_points` は
-                // floor/ceil で外側に丸めるため、`start`/`img` の画像座標が
+                // floor/ceil で外側に丸めるため、`start`/終点の画像座標が
                 // 整数ちょうどでない限り(高 DPI スケーリングや 100% 以外の
                 // ズーム、端数パンでは頻繁に起こる)、ドラッグせずに離した
                 // だけの単クリックでも幅・高さ 1 の非空矩形が残ってしまって
                 // いた(SPEC §6: 「ドラッグで矩形選択」、単クリックは選択を
-                // 残さないのが期待動作)。ポインタが実際に動いていなければ
-                // (`img` が Down 時の `start` と一致していれば)選択を作らない
-                // (`PendingFloating` の `img != down_img` チェックと同じ
-                // 考え方)。
-                self.selection = if img == start {
+                // 残さないのが期待動作)。
+                //
+                // v4 §22: `current` は `select_drag_move`(Drag イベント)が
+                // Shift 拘束(正方形/正円)込みで更新する値。ただし `Down`→
+                // `Up` の間に一度も `Drag` が届かない(1 フレームに満たない
+                // 高速なクリック&ドラッグ)場合は `current` が `start` の
+                // ままになるため、その場合だけ `Up` の生のポインタ位置
+                // `img`(Shift 拘束はできないが、従来どおりの矩形になる)を
+                // 使う。`Drag` が 1 回でも届いていれば(`current != start`)
+                // Shift 拘束済みの `current` を優先する(`Up` イベント自体は
+                // Shift の状態を運ばないため、`apply_resize_floating` と
+                // 同じ「離す瞬間の数ピクセルのズレは無視する」割り切り)。
+                let end = if current != start { current } else { img };
+                self.selection = if end == start {
                     None
                 } else {
-                    let rect = select::irect_from_points(start, img)
-                        .clamp_to(self.doc.width, self.doc.height);
-                    if rect.is_empty() {
+                    // v4 レビューで発見・修正したバグ: 以前はここで先に
+                    // `irect_from_points(..).clamp_to(doc)` と矩形をキャン
+                    // バス境界へクランプしてから `ellipse_mask` に渡していた。
+                    // 矩形選択はクランプ=クリップで同値だが、楕円は
+                    // 「クランプ後の(小さい)矩形に内接する別の楕円」に
+                    // なってしまい、`raster::fill_ellipse`(非クランプの
+                    // 外接矩形から楕円方程式を評価し、はみ出し分だけ切り
+                    // 落とす)と選択の楕円の画素集合が、ドラッグがキャン
+                    // バス境界を跨ぐ場合に食い違っていた(select.rs の
+                    // `ellipse_mask` ドキュメントコメントが保証する「同じ
+                    // 外接矩形なら図形と選択の楕円が画素単位で一致する」が
+                    // 破れる、SPEC §22 の見た目一致に反する)。
+                    // `begin_floating_from_selection` と同じ「先に作って
+                    // から `SelMask::clamp_to` でクリップする」順序に直す。
+                    let rect = select::irect_from_points(start, end);
+                    // SPEC §22: 楕円選択ツールなら楕円マスク、それ以外
+                    // (矩形選択)は従来どおり矩形マスク。
+                    let mask = if self.tool == ToolKind::EllipseSelect {
+                        select::ellipse_mask(rect)
+                    } else {
+                        select::rect_mask(rect)
+                    };
+                    let mask = mask.clamp_to(self.doc.width, self.doc.height);
+                    if mask.is_empty() {
                         None
                     } else {
-                        Some(Selection { rect })
+                        Some(Selection::new(mask))
                     }
                 };
             }
@@ -1274,31 +1885,34 @@ impl DaraskApp {
         }
     }
 
-    /// 選択内部をドラッグ開始 = 浮動化(SPEC §6)。領域ピクセルを `Floating`
-    /// に複写し、元領域を透明化する。この透明化は History のストロークを
-    /// 開いたまま(まだ push しない)にしておき、確定時(`commit_selection`)
-    /// に「切り出し元の透明化+合成先」をまとめて 1 つの `Patch` にする
-    /// (ARCHITECTURE.md §7)。
-    fn begin_floating_from_selection(&mut self, rect: crate::document::IRect, img: Pos2) {
-        let rect = rect.clamp_to(self.doc.width, self.doc.height);
+    /// 選択内部をドラッグ開始 = 浮動化(SPEC §6、v4 §16.3: マスク形状のまま)。
+    /// `mask` の画素だけ `Floating` に複写し、元領域も `mask` の画素だけ透明化
+    /// する。この透明化は History のストロークを開いたまま(まだ push しない)
+    /// にしておき、確定時(`commit_selection`)に「切り出し元の透明化+合成先」
+    /// をまとめて 1 つの `Patch` にする(ARCHITECTURE.md §7)。
+    fn begin_floating_from_selection(&mut self, mask: crate::document::SelMask, img: Pos2) {
+        let mask = mask.clamp_to(self.doc.width, self.doc.height);
+        let rect = mask.bbox;
         if rect.is_empty() {
             self.selection = None;
             return;
         }
         self.history.begin_stroke(self.doc.active);
         self.history.ensure_tiles_saved(&self.doc, rect);
-        let pixels = select::extract_region(&self.doc, rect);
-        select::clear_region_transparent(&mut self.doc, rect);
+        let pixels = select::extract_region(&self.doc, &mask);
+        select::clear_region_transparent(&mut self.doc, &mask);
         self.doc.modified = true;
 
         let pos = pos2(rect.x0 as f32, rect.y0 as f32);
         let id = self.alloc_floating_id();
+        let mask_bits = mask.mask.clone();
         self.floating = Some(Floating::new(
             pixels,
             rect.width() as u32,
             rect.height() as u32,
+            mask_bits,
             pos,
-            Some(rect),
+            Some(mask),
             id,
         ));
         self.selection = None;
@@ -1316,6 +1930,16 @@ impl DaraskApp {
     /// Esc はここではなく `cancel_floating` に切り替わった)。浮動片が無い
     /// (単なる矩形選択だけ、または何も無い)場合は選択を解除するだけ。
     fn commit_selection(&mut self) {
+        self.flush_floating_keep_selection();
+        self.selection = None;
+    }
+
+    /// `commit_selection` から浮動片の確定処理だけを切り出したもの
+    /// (`self.selection` はクリアしない)。SPEC §21 の「選択がある間は他
+    /// ツールの描画をクリップし続ける」を満たすため、まだ浮動化していない
+    /// プレーンな選択を保持したまま浮動片だけを確定したい呼び出し元
+    /// (`commit_open_gesture`、`free_transform` と同じ理由)向け。
+    fn flush_floating_keep_selection(&mut self) {
         self.select_drag = None;
         if let Some(floating) = self.floating.take() {
             let target = select::floating_target_rect(&floating);
@@ -1323,7 +1947,6 @@ impl DaraskApp {
             select::composite_floating(&mut self.doc, &floating);
             self.history.commit_stroke(&mut self.doc);
         }
-        self.selection = None;
     }
 
     /// SPEC §18(v1 §6 を上書き): Esc = キャンセル。浮動片を破棄して元の
@@ -1341,11 +1964,45 @@ impl DaraskApp {
         self.select_drag = None;
         if let Some(floating) = self.floating.take() {
             if let Some(cut_from) = floating.cut_from {
-                self.history.restore_stroke_region(&mut self.doc, cut_from);
+                // v4 §16.3: `cut_from` は `SelMask` になったが、復元は
+                // `bbox` 全体をタイルから一括コピーするだけでよい —
+                // マスク外の画素は浮動化時に一切変更していない(`SelMask`
+                // の画素だけ透明化する `clear_region_transparent`)ため、
+                // bbox 全体を復元してもマスク外は「既に元の値のまま」で
+                // 変化しない(ARCHITECTURE.md §16.1 のタイル一括コピーと
+                // 同じ考え方を維持できる)。
+                self.history
+                    .restore_stroke_region(&mut self.doc, cut_from.bbox);
             }
         }
         self.history.cancel_stroke();
         self.selection = None;
+    }
+
+    /// v4 レビューで発見・修正したバグ: `Action`/`MenuAction` の
+    /// Undo/Redo は `commit_open_gesture` 後に `history.undo`/`redo` を
+    /// 呼ぶだけで、`self.selection` のクランプ/解除を一切行っていなかった。
+    /// `HistoryOp::ReplaceAll`(サイズ変更/キャンバスサイズ変更/トリミング/
+    /// 回転)を undo/redo するとドキュメント寸法が変わるが、選択はそのまま
+    /// 残るため、古い(縮んだ後の寸法から見て範囲外の)座標を指した選択が
+    /// 残ってしまう。以後はブラシ/塗りつぶし/グラデーション/色調補正が
+    /// すべて `ToolCtx::clip` 経由で `SelMask::contains` を通すため、選択
+    /// bbox が文書の外にはみ出していると全画素が「選択外」判定になり、
+    /// エラーも出ずに 1 画素も描けなくなる(`SelMask::clamp_to` のドキュメント
+    /// コメント参照)。Undo/Redo の直後に必ずこれを呼び、新しい寸法へ
+    /// クランプする(空になれば選択解除。`begin_floating_from_selection` と
+    /// 同じ「作ってからクリップ」の安全弁パターン)。寸法が変わらない
+    /// 一般的な undo/redo(ブラシの Patch 等)ではクランプは恒等写像になり
+    /// コストもほぼゼロ。
+    fn clamp_selection_to_doc(&mut self) {
+        if let Some(selection) = &self.selection {
+            let clamped = selection.mask.clamp_to(self.doc.width, self.doc.height);
+            self.selection = if clamped.is_empty() {
+                None
+            } else {
+                Some(Selection::new(clamped))
+            };
+        }
     }
 
     /// SPEC §18: Ctrl+T(自由変形)。選択範囲があれば浮動化してハンドル表示。
@@ -1359,24 +2016,33 @@ impl DaraskApp {
         // (ARCHITECTURE.md §15.2: 「選択範囲があれば浮動化して」を壊さない
         // ため)。
         match self.tool {
-            ToolKind::Select | ToolKind::Move if self.floating.is_some() => {
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move
+                if self.floating.is_some() =>
+            {
                 self.commit_selection();
             }
-            ToolKind::Select | ToolKind::Move => self.select_drag = None,
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move => {
+                self.select_drag = None;
+            }
+            ToolKind::Lasso => {
+                self.lasso_freehand_points.clear();
+                self.lasso_polygon = None;
+            }
             _ => self.end_active_gesture(),
         }
         self.tool = ToolKind::Select;
 
-        let rect = self
+        let mask = self
             .selection
-            .map(|s| s.rect)
-            .unwrap_or_else(|| self.doc_full_rect());
-        let rect = rect.clamp_to(self.doc.width, self.doc.height);
-        if rect.is_empty() {
+            .as_ref()
+            .map(|s| s.mask.clone())
+            .unwrap_or_else(|| select::rect_mask(self.doc_full_rect()));
+        let mask = mask.clamp_to(self.doc.width, self.doc.height);
+        if mask.is_empty() {
             return;
         }
-        let anchor = pos2(rect.x0 as f32, rect.y0 as f32);
-        self.begin_floating_from_selection(rect, anchor);
+        let anchor = pos2(mask.bbox.x0 as f32, mask.bbox.y0 as f32);
+        self.begin_floating_from_selection(mask, anchor);
     }
 
     /// 選択領域(または浮動片)を消去する(SPEC §6: Delete)。浮動片がある
@@ -1407,11 +2073,11 @@ impl DaraskApp {
             return;
         }
         if let Some(selection) = self.selection.take() {
-            let rect = selection.rect.clamp_to(self.doc.width, self.doc.height);
-            if !rect.is_empty() {
+            let mask = selection.mask.clamp_to(self.doc.width, self.doc.height);
+            if !mask.is_empty() {
                 self.history.begin_stroke(self.doc.active);
-                self.history.ensure_tiles_saved(&self.doc, rect);
-                select::clear_region_transparent(&mut self.doc, rect);
+                self.history.ensure_tiles_saved(&self.doc, mask.bbox);
+                select::clear_region_transparent(&mut self.doc, &mask);
                 self.history.commit_stroke(&mut self.doc);
             }
         }
@@ -1423,14 +2089,15 @@ impl DaraskApp {
             return Some((floating.w, floating.h, floating.pixels.clone()));
         }
         if let Some(selection) = &self.selection {
-            let rect = selection.rect.clamp_to(self.doc.width, self.doc.height);
-            if rect.is_empty() {
+            let mask = selection.mask.clamp_to(self.doc.width, self.doc.height);
+            if mask.is_empty() {
                 return None;
             }
+            let rect = mask.bbox;
             return Some((
                 rect.width() as u32,
                 rect.height() as u32,
-                select::extract_region(&self.doc, rect),
+                select::extract_region(&self.doc, &mask),
             ));
         }
         None
@@ -1476,14 +2143,12 @@ impl DaraskApp {
             self.selection = None;
             return;
         }
-        self.selection = Some(Selection {
-            rect: crate::document::IRect {
-                x0: 0,
-                y0: 0,
-                x1: self.doc.width as i32,
-                y1: self.doc.height as i32,
-            },
-        });
+        self.selection = Some(Selection::new(select::rect_mask(crate::document::IRect {
+            x0: 0,
+            y0: 0,
+            x1: self.doc.width as i32,
+            y1: self.doc.height as i32,
+        })));
     }
 
     /// SPEC §6: 「ドキュメントが完全に未編集・未保存(起動直後の白紙)」の
@@ -1580,7 +2245,7 @@ impl DaraskApp {
         // は呼ばない(confirm 時に合成先だけ保存すれば十分、
         // `commit_selection` 参照)。
         self.history.begin_stroke(self.doc.active);
-        self.floating = Some(Floating::new(pixels, w, h, pos, None, id));
+        self.floating = Some(Floating::new_rect(pixels, w, h, pos, None, id));
         self.selection = None;
         // M4 で発見・修正したバグ: 浮動片は画面に見えている未保存の変更
         // だが、以前は `commit_selection` で合成されるまで `doc.modified` が
@@ -1606,10 +2271,22 @@ impl DaraskApp {
     }
 
     fn draw_selection_overlay(&mut self, painter: &egui::Painter) {
-        if let Some(SelectDrag::NewSelection { start, current }) = self.select_drag {
-            let rect = select::irect_from_points(start, current);
+        if let Some(SelectDrag::NewSelection { start, current }) = &self.select_drag {
+            let rect = select::irect_from_points(*start, *current);
             self.view.draw_selection_outline(painter, rect);
             return;
+        }
+        // v4 §22: なげなわの進行中の軌跡/頂点列(確定前のプレビュー)。
+        if self.tool == ToolKind::Lasso {
+            if !self.lasso_freehand_points.is_empty() {
+                self.view
+                    .draw_lasso_preview(painter, &self.lasso_freehand_points);
+                return;
+            }
+            if let Some(state) = &self.lasso_polygon {
+                self.view.draw_lasso_preview(painter, &state.points);
+                return;
+            }
         }
         if let Some(floating) = self.floating.as_ref() {
             self.view.draw_floating(painter, floating);
@@ -1619,8 +2296,13 @@ impl DaraskApp {
             return;
         }
         if let Some(selection) = &self.selection {
-            self.view.draw_selection_outline(painter, selection.rect);
-            self.view.draw_resize_handles(painter, selection.rect);
+            // v4 §16.3: 矩形限定の `draw_selection_outline` ではなく、選択
+            // 確定時に 1 回だけ計算済みのマスク境界線分(`Selection::
+            // boundary`)を描く(既存の矩形選択は 4 本の線分になるので見た目
+            // は変わらない、ARCHITECTURE.md §16.10-1)。
+            self.view
+                .draw_selection_mask_outline(painter, &selection.boundary);
+            self.view.draw_resize_handles(painter, selection.mask.bbox);
         }
     }
 
@@ -1631,7 +2313,8 @@ impl DaraskApp {
             return Some((floating.w, floating.h));
         }
         self.selection
-            .map(|s| (s.rect.width() as u32, s.rect.height() as u32))
+            .as_ref()
+            .map(|s| (s.mask.bbox.width() as u32, s.mask.bbox.height() as u32))
     }
 
     // -----------------------------------------------------------------
@@ -1754,7 +2437,7 @@ impl DaraskApp {
         };
         // id は合成後すぐ破棄する使い捨ての `Floating` なので値は問わない
         // (`canvas_view` のテクスチャキャッシュには載らない)。
-        let floating = Floating::new(pixels, w, h, state.pos, None, 0);
+        let floating = Floating::new_rect(pixels, w, h, state.pos, None, 0);
         let target = select::floating_target_rect(&floating);
         self.history.begin_stroke(self.doc.active);
         self.history.ensure_tiles_saved(&self.doc, target);
@@ -1978,7 +2661,7 @@ impl DaraskApp {
             }
             PendingAction::Open(Some(path)) => self.open_path(path),
             PendingAction::Open(None) => self.pending_dialog = Some(DialogRequest::OpenFile),
-            PendingAction::Close => std::process::exit(0),
+            PendingAction::Close => self.exit_process(),
         }
     }
 
@@ -1994,6 +2677,10 @@ impl DaraskApp {
     fn reset_tool_state_for_new_document(&mut self) {
         self.pen.reset_for_new_document();
         self.eraser.reset_for_new_document();
+        // v4 §22: 新規/開く/貼り付け置換の直後になげなわの進行中状態が
+        // 古いドキュメント座標のまま残ってしまわないようにする。
+        self.lasso_freehand_points.clear();
+        self.lasso_polygon = None;
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -2008,6 +2695,8 @@ impl DaraskApp {
                 self.layer_rename = None;
                 self.next_layer_number = 1;
                 self.reset_tool_state_for_new_document();
+                // SPEC §26: 「最近使ったファイル」。
+                self.remember_recent_file(path);
             }
             Err(e) => self.show_toast(format!("開けませんでした: {e}")),
         }
@@ -2067,11 +2756,15 @@ impl DaraskApp {
         let had_multiple_layers = self.doc.layers.len() > 1;
         match io::save_image(&mut self.doc, &path, format) {
             Ok(()) => {
-                self.doc.path = Some(path);
+                self.doc.path = Some(path.clone());
                 self.doc.modified = false;
                 if had_multiple_layers {
                     self.show_toast("レイヤーは統合して保存されました".to_owned());
                 }
+                // SPEC §26: 「最近使ったファイル」。保存先も対象にする
+                // (MS ペイント等と同様、開いたファイルだけでなく保存先も
+                // 「最近使った」に含める)。
+                self.remember_recent_file(path);
                 if let Some(action) = self.after_save_action.take() {
                     self.execute_pending_action(action);
                 }
@@ -2109,6 +2802,109 @@ impl DaraskApp {
         self.layer_rename = None;
         self.next_layer_number = 1;
         self.reset_tool_state_for_new_document();
+    }
+
+    // -----------------------------------------------------------------
+    // v4 §26: 設定の永続化・最近使ったファイル(ARCHITECTURE.md §16.7)
+    // -----------------------------------------------------------------
+
+    /// 現在の状態から保存用の `Settings` スナップショットを組み立てる。
+    /// `current_settings`/`save_settings` は `on_exit`(`egui::Context` を
+    /// 持たない)からも呼ばれるため、ウィンドウ寸法は毎フレーム観測して
+    /// おいた `self.window_size`/`window_maximized` を使う
+    /// (`ui()` 冒頭の更新箇所参照)。
+    fn current_settings(&self) -> Settings {
+        Settings {
+            window_width: self.window_size.x.round().max(1.0) as u32,
+            window_height: self.window_size.y.round().max(1.0) as u32,
+            window_maximized: self.window_maximized,
+            recent_files: self.recent_files.clone(),
+            brush_size: self.brush_size,
+            brush_hardness: self.brush_hardness,
+            brush_opacity: self.brush_opacity,
+            pencil_mode: self.pencil_mode,
+            brush_smoothing: self.brush_smoothing,
+            fill_tolerance: self.fill.tolerance,
+            magic_wand_tolerance: self.magic_wand_tolerance,
+            rect_mode: self.rect_tool.mode,
+            ellipse_mode: self.ellipse.mode,
+            gradient_kind: self.gradient.kind,
+            gradient_colors: self.gradient.colors,
+            primary: self.primary,
+            secondary: self.secondary,
+            user_palette: self.user_palette.clone(),
+            last_tool: self.tool,
+            show_pixel_grid: self.show_pixel_grid,
+        }
+    }
+
+    /// ARCHITECTURE.md §16.7: 「書き込みは終了時と最近使ったファイル更新時
+    /// のみ」。この 2 箇所(`remember_recent_file`/`on_exit`/`exit_process`)
+    /// だけがこれを呼ぶ。書き込み失敗は無視する(`settings::save` 自体が
+    /// パニックしない、SPEC §26)。
+    ///
+    /// `self.persist_settings` が `false`(`new_for_test` 経由のユニット
+    /// テストは常にこう)なら何もしない — `open_path`/`finish_save` 等の
+    /// 既存テストがこの関数を間接的に何度も踏むため、素朴に実装すると
+    /// `cargo test` のたびに実 `%APPDATA%\darask-paint\settings.txt`
+    /// (開発者・CI 実行環境の実ファイル)を上書きしてしまう。テストは
+    /// 副作用としてグローバルな実ファイルへ書き込んではならない
+    /// (`settings.rs` 自体の I/O テストは temp dir 経由の
+    /// `save_to_path`/`load_from_path` で既に検証済み、ここでの実書き込みは
+    /// 不要)。
+    fn save_settings(&self) {
+        if self.persist_settings {
+            settings::save(&self.current_settings());
+        }
+    }
+
+    /// 確認済みの終了(SPEC §8 の未保存ガードを通過済み、または最初から
+    /// 不要だった)を実行する唯一の入口。`std::process::exit` は Rust の
+    /// 通常のアンワインドを経ないため `eframe::App::on_exit` は呼ばれない
+    /// (`impl eframe::App for DaraskApp` のコメント参照) — ここで明示的に
+    /// 設定を保存してから終了する。
+    ///
+    /// ベンチモード(`ui()` 内の `bench.frames_drawn >= 2` の終了)は意図的に
+    /// これを経由させない: ベンチはユーザー操作を伴わない決定的なスモーク
+    /// テストであり、実行するたびに実 `%APPDATA%` の設定ファイルを上書きする
+    /// のは望ましくない副作用になる。
+    fn exit_process(&self) -> ! {
+        self.save_settings();
+        std::process::exit(0);
+    }
+
+    /// 「最近使ったファイル」を更新する(SPEC §26: 最大 8、先頭が最新。
+    /// 既存の同一パスは先頭へ移動)。開く(`open_path`)・保存
+    /// (`finish_save`)の成功時、および CLI 引数で開いた場合(`new`)に呼ぶ。
+    /// 更新のたびに即座に保存する(ARCHITECTURE.md §16.7)。
+    fn remember_recent_file(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.push_front(path);
+        self.recent_files.truncate(settings::MAX_RECENT_FILES);
+        self.save_settings();
+    }
+
+    /// 「ファイル > 最近使ったファイル」のクリック(SPEC §26: 「存在しない
+    /// パスは選択時に一覧から除去してトースト」)。存在しなければここで
+    /// 一覧から除去して終わる(未保存ガードを通す前に確認するので、開けない
+    /// と分かっているファイルのために保存確認を挟まずに済む)。存在すれば
+    /// 通常の「開く」(未保存ガード込み)に委ねる。
+    fn open_recent_file(&mut self, index: usize) {
+        let Some(path) = self.recent_files.get(index).cloned() else {
+            return;
+        };
+        if path.exists() {
+            self.request_action(PendingAction::Open(Some(path)));
+        } else {
+            self.recent_files.retain(|p| p != &path);
+            self.save_settings();
+            self.show_toast(format!("ファイルが見つかりません: {}", path.display()));
+        }
+    }
+
+    /// SPEC §26: 「ヘルプ > バージョン情報」。
+    fn open_about_modal(&mut self) {
+        self.modal = Some(ModalState::About);
     }
 
     // -----------------------------------------------------------------
@@ -2157,8 +2953,10 @@ impl DaraskApp {
     /// SPEC §7: 「選択範囲でトリミング」。選択(または浮動片)が無ければ
     /// 何もしない(メニュー側で無効化もしている)。
     fn apply_crop_to_selection(&mut self) {
+        // SPEC §21: 「選択範囲でトリミング」は bbox でトリミング(マスク形状は
+        // 見ない)。
         let rect = match (&self.selection, &self.floating) {
-            (Some(sel), _) => Some(sel.rect),
+            (Some(sel), _) => Some(sel.mask.bbox),
             (None, Some(floating)) => Some(select::floating_target_rect(floating)),
             (None, None) => None,
         };
@@ -2188,6 +2986,159 @@ impl DaraskApp {
         let before = self.doc.snapshot();
         self.doc.resize_canvas(width.max(1), height.max(1));
         self.push_replace_all(before);
+    }
+
+    // -----------------------------------------------------------------
+    // v4 §24: 色調補正(ARCHITECTURE.md §16.5)
+    //
+    // すべてアクティブレイヤー対象、選択があればその中だけ(選択 bbox に
+    // クリップする、ブラシ/グラデーションと同じ `Surface::clip` 経由)。
+    // 即時適用(反転・グレースケール化)は「現在のピクセルを読んで書き換える」
+    // 1 回のループ、ライブプレビュー付きモーダル(明るさ・コントラスト/
+    // 色相・彩度・明度)は「モーダルを開いた時点のスナップショットから毎回
+    // 計算し直す」ループ(スライダーを往復しても劣化する累積適用にならない、
+    // ARCHITECTURE.md §16.10-4)。
+    // -----------------------------------------------------------------
+
+    /// 色調補正の対象領域(SPEC §24: 「選択範囲があればその中だけ」)。
+    fn tone_adjust_target_rect(&self) -> crate::document::IRect {
+        self.selection
+            .as_ref()
+            .map(|s| s.mask.bbox)
+            .unwrap_or_else(|| self.doc_full_rect())
+    }
+
+    /// 即時適用の色調補正(階調の反転・グレースケール化)。1 undo 単位。
+    ///
+    /// v4 レビューで発見・修正した重大なバグ: 以前はここで
+    /// `flush_floating_keep_selection`(浮動片だけを確定し、ブラシ等の
+    /// 進行中ストロークは見ない)しか呼んでいなかった。keymap.rs で
+    /// Ctrl+I/Ctrl+Shift+U はテキスト入力中・モーダル中以外は常に有効
+    /// (`handle_shortcuts` のガードはキーボードフォーカスと modal のみ、
+    /// キャンバスは `Sense::click_and_drag` で `request_focus` しない)ため、
+    /// ブラシ/消しゴム/図形/グラデーションで左ボタンを押したままドラッグ
+    /// 中でも発火する。その状態で直後の `history.begin_stroke` を呼ぶと、
+    /// `History::begin_stroke` は進行中の `StrokeRecorder` を無警告で置換し、
+    /// 退避済みの「ストローク開始前」タイルが `HistoryOp` を積まずに失われる
+    /// (`delete_selection` のドキュメントコメントに記録されている、v2 で
+    /// 発見・修正したのと同じクラスのバグ)。その結果、反転/グレースケール
+    /// の `before` に描きかけの画素が「元からあった画素」として混入し、
+    /// かつストローク後半は `History::stroke == None` のまま描画され続けて
+    /// 一切 undo できなくなる。`delete_selection`/`paste_pixels` と同じ
+    /// 規則で、進行中のジェスチャ(ブラシ等のドラッグ、または選択の浮動片)
+    /// を種類を問わず先に確定する `commit_open_gesture` を呼ぶ(選択自体は
+    /// 残す、SPEC §21)。
+    fn apply_tone_adjustment_immediate(&mut self, f: impl Fn([u8; 4]) -> [u8; 4]) {
+        self.commit_open_gesture();
+        let bounds = self
+            .tone_adjust_target_rect()
+            .clamp_to(self.doc.width, self.doc.height);
+        if bounds.is_empty() {
+            return;
+        }
+        self.history.begin_stroke(self.doc.active);
+        self.history.ensure_tiles_saved(&self.doc, bounds);
+        let clip = self.selection.as_ref().map(|s| &s.mask);
+        {
+            let mut surface = self.doc.active_surface_mut(clip);
+            for y in bounds.y0..bounds.y1 {
+                for x in bounds.x0..bounds.x1 {
+                    if let Some(px) = surface.get_pixel(x, y) {
+                        surface.set_pixel(x, y, f(px));
+                    }
+                }
+            }
+        }
+        self.doc.mark_dirty(bounds);
+        self.history.commit_stroke(&mut self.doc);
+    }
+
+    /// SPEC §24: 「階調の反転 (Ctrl+I) — 即時(RGB反転、アルファ不変)」。
+    fn apply_invert(&mut self) {
+        self.apply_tone_adjustment_immediate(raster::invert_pixel);
+    }
+
+    /// SPEC §24: 「グレースケール化 (Ctrl+Shift+U) — 即時(Rec.709 輝度)」。
+    fn apply_grayscale(&mut self) {
+        self.apply_tone_adjustment_immediate(raster::grayscale_pixel);
+    }
+
+    /// ライブプレビュー付きモーダルを開く共通処理。開いた時点で
+    /// `History::begin_stroke`/`ensure_tiles_saved` により対象領域全体を
+    /// 退避しておく(以後のプレビュー再計算がこのスナップショットから行われる、
+    /// ARCHITECTURE.md §16.5)。
+    ///
+    /// v4 レビューで発見・修正した重大なバグ: `apply_tone_adjustment_
+    /// immediate` と全く同じ理由で、ここも以前は `flush_floating_keep_
+    /// selection` しか呼んでいなかった。ブラシ等でドラッグ中に Ctrl+U を
+    /// 押すと `history.begin_stroke` が進行中の `StrokeRecorder` を無警告で
+    /// 置換し、部分ストロークがモーダルの `before` スナップショットに
+    /// 混入したまま undo 不能になる(OK 時)、またはキャンセル時も
+    /// `restore_stroke_region` はモーダルを開いた時点(部分ストローク込み)
+    /// へ戻すだけで、その部分ストロークの履歴自体は失われたまま。
+    /// `commit_open_gesture` で先に進行中のジェスチャ(ブラシ等のドラッグ、
+    /// または選択の浮動片)を種類を問わず確定してから対象領域を退避する
+    /// (選択自体は残す、SPEC §21)。
+    fn begin_tone_adjust_stroke(&mut self) -> crate::document::IRect {
+        self.commit_open_gesture();
+        let bounds = self
+            .tone_adjust_target_rect()
+            .clamp_to(self.doc.width, self.doc.height);
+        self.history.begin_stroke(self.doc.active);
+        if !bounds.is_empty() {
+            self.history.ensure_tiles_saved(&self.doc, bounds);
+        }
+        bounds
+    }
+
+    /// SPEC §24: 「明るさ・コントラスト…」モーダルを開く。
+    fn open_brightness_contrast_modal(&mut self) {
+        let rect = self.begin_tone_adjust_stroke();
+        self.modal = Some(ModalState::BrightnessContrast {
+            brightness: 0,
+            contrast: 0,
+            rect,
+        });
+    }
+
+    /// SPEC §24: 「色相・彩度・明度… (Ctrl+U)」モーダルを開く。
+    fn open_hue_saturation_modal(&mut self) {
+        let rect = self.begin_tone_adjust_stroke();
+        self.modal = Some(ModalState::HueSaturation {
+            hue: 0,
+            saturation: 0,
+            lightness: 0,
+            rect,
+        });
+    }
+
+    /// ライブプレビューの再計算(ARCHITECTURE.md §16.5: 「スナップショットから
+    /// 毎回計算」)。`rect` はモーダルを開いた時点の対象領域。値が変わった
+    /// フレームだけ呼ぶこと(ARCHITECTURE.md §14.9-8 と同じ「変わったフレーム
+    /// だけ再適用」方式、呼び出し元の `show_modal` 参照)。
+    fn reapply_tone_preview(
+        &mut self,
+        rect: crate::document::IRect,
+        f: impl Fn([u8; 4]) -> [u8; 4],
+    ) {
+        let bounds = rect.clamp_to(self.doc.width, self.doc.height);
+        if bounds.is_empty() {
+            return;
+        }
+        let clip = self.selection.as_ref().map(|s| &s.mask);
+        // v4-M2 性能改善(ARCHITECTURE.md §16.1、`OriginalPixelCursor` の
+        // ドキュメント参照): 対象領域全体の画素ループで 1 個のカーソルを
+        // 使い回し、行ごとに `stroke.tiles` の `HashMap` を引き直さない。
+        let mut original_cursor = self.history.original_pixel_cursor();
+        let mut surface = self.doc.active_surface_mut(clip);
+        for y in bounds.y0..bounds.y1 {
+            for x in bounds.x0..bounds.x1 {
+                if let Some(original) = original_cursor.get(x, y) {
+                    surface.set_pixel(x, y, f(original));
+                }
+            }
+        }
+        self.doc.mark_dirty(bounds);
     }
 
     // -----------------------------------------------------------------
@@ -2361,6 +3312,7 @@ impl DaraskApp {
         match action {
             MenuAction::New => self.request_action(PendingAction::New),
             MenuAction::Open => self.request_action(PendingAction::Open(None)),
+            MenuAction::OpenRecent(index) => self.open_recent_file(index),
             MenuAction::Save => self.begin_save(),
             MenuAction::SaveAs => self.begin_save_as(),
             MenuAction::Exit => self.request_action(PendingAction::Close),
@@ -2370,10 +3322,12 @@ impl DaraskApp {
                 // 同じ規則)。
                 self.commit_open_gesture();
                 self.history.undo(&mut self.doc);
+                self.clamp_selection_to_doc();
             }
             MenuAction::Redo => {
                 self.commit_open_gesture();
                 self.history.redo(&mut self.doc);
+                self.clamp_selection_to_doc();
             }
             MenuAction::Cut => self.cut_selection_to_clipboard(),
             MenuAction::Copy => {
@@ -2402,10 +3356,15 @@ impl DaraskApp {
             MenuAction::FlipVertical => self.apply_flip_vertical(),
             MenuAction::RotateCw => self.apply_rotate_cw(),
             MenuAction::RotateCcw => self.apply_rotate_ccw(),
+            MenuAction::BrightnessContrast => self.open_brightness_contrast_modal(),
+            MenuAction::HueSaturation => self.open_hue_saturation_modal(),
+            MenuAction::Invert => self.apply_invert(),
+            MenuAction::Grayscale => self.apply_grayscale(),
             MenuAction::ZoomIn => self.view.zoom_in(),
             MenuAction::ZoomOut => self.view.zoom_out(),
             MenuAction::Zoom100 => self.view.zoom_to_100(),
             MenuAction::FitWindow => self.view.fit_to_window(&self.doc),
+            MenuAction::TogglePixelGrid => self.show_pixel_grid = !self.show_pixel_grid,
             MenuAction::LayerAdd => self.layer_add(),
             MenuAction::LayerDuplicate => self.layer_duplicate(),
             MenuAction::LayerDelete => self.layer_delete(),
@@ -2413,6 +3372,7 @@ impl DaraskApp {
             MenuAction::LayerMoveDown => self.layer_move_down(),
             MenuAction::LayerMergeDown => self.layer_merge_down(),
             MenuAction::LayerFlatten => self.layer_flatten(),
+            MenuAction::About => self.open_about_modal(),
         }
     }
 
@@ -2492,6 +3452,67 @@ impl DaraskApp {
                     DialogOutcome::Pending => {}
                 }
             }
+            ModalState::BrightnessContrast {
+                brightness,
+                contrast,
+                rect,
+            } => {
+                let rect = *rect;
+                let (outcome, changed) =
+                    dialogs::show_brightness_contrast(ctx, brightness, contrast);
+                if changed {
+                    let lut = raster::brightness_contrast_lut(*brightness, *contrast);
+                    self.reapply_tone_preview(rect, |px| raster::apply_lut_pixel(px, &lut));
+                }
+                match outcome {
+                    DialogOutcome::Confirmed => {
+                        self.history.commit_stroke(&mut self.doc);
+                        keep_open = false;
+                    }
+                    DialogOutcome::Cancelled => {
+                        self.history.restore_stroke_region(&mut self.doc, rect);
+                        self.history.cancel_stroke();
+                        keep_open = false;
+                    }
+                    DialogOutcome::Pending => {}
+                }
+            }
+            ModalState::HueSaturation {
+                hue,
+                saturation,
+                lightness,
+                rect,
+            } => {
+                let rect = *rect;
+                let (outcome, changed) =
+                    dialogs::show_hue_saturation(ctx, hue, saturation, lightness);
+                if changed {
+                    let (h, s, l) = (*hue, *saturation, *lightness);
+                    self.reapply_tone_preview(rect, move |px| {
+                        raster::adjust_hsl_pixel(px, h, s, l)
+                    });
+                }
+                match outcome {
+                    DialogOutcome::Confirmed => {
+                        self.history.commit_stroke(&mut self.doc);
+                        keep_open = false;
+                    }
+                    DialogOutcome::Cancelled => {
+                        self.history.restore_stroke_region(&mut self.doc, rect);
+                        self.history.cancel_stroke();
+                        keep_open = false;
+                    }
+                    DialogOutcome::Pending => {}
+                }
+            }
+            ModalState::About => {
+                // SPEC §26: 「バージョン(CARGO_PKG_VERSION)・リポジトリ URL
+                // を表示する小モーダル」。
+                match dialogs::show_about(ctx, env!("CARGO_PKG_VERSION"), REPOSITORY_URL) {
+                    DialogOutcome::Confirmed | DialogOutcome::Cancelled => keep_open = false,
+                    DialogOutcome::Pending => {}
+                }
+            }
             ModalState::ConfirmUnsaved => {
                 let label = self.window_doc_label();
                 match dialogs::show_confirm_unsaved(ctx, &label) {
@@ -2535,7 +3556,7 @@ impl DaraskApp {
             self.modal = Some(ModalState::ConfirmUnsaved);
         } else {
             self.pending_action = None;
-            std::process::exit(0);
+            self.exit_process();
         }
     }
 
@@ -2577,6 +3598,21 @@ impl eframe::App for DaraskApp {
             self.last_screen_rect = content_rect;
             ui.ctx().request_repaint_after(Duration::from_millis(150));
         }
+
+        // v4 §26(ARCHITECTURE.md §16.7): 終了時に設定へ書き出すウィンドウ
+        // 寸法・最大化状態を、毎フレーム観測して覚えておく。終了経路
+        // (`on_exit`/`exit_process`)は `egui::Context` を持たないため、
+        // 「今の値」をここで先に控えておく必要がある(`Option` が `None` の
+        // 場合 — Android/Wayland 等 — は前回値のまま据え置く)。
+        ui.ctx().input(|i| {
+            let viewport = i.viewport();
+            track_window_size(
+                &mut self.window_size,
+                &mut self.window_maximized,
+                viewport.maximized,
+                viewport.inner_rect,
+            );
+        });
 
         // ARCHITECTURE.md §12-9: rfd はブロッキングなので、直前のフレームで
         // 要求されたダイアログはここ(フレーム冒頭、まだパネル/painter を
@@ -2632,6 +3668,8 @@ impl eframe::App for DaraskApp {
             can_move_layer_down: active_layer_index > 0,
             can_merge_layer_down: layer_count > 1 && active_layer_index > 0,
             can_flatten_layers: layer_count > 1,
+            pixel_grid_visible: self.show_pixel_grid,
+            recent_files: &self.recent_files,
         };
         if let Some(action) = menu::show(ui, &menu_state) {
             self.handle_menu_action(action);
@@ -2649,7 +3687,7 @@ impl eframe::App for DaraskApp {
             toast_text.as_deref(),
         );
 
-        if let Some(new_tool) = toolbar::show(ui, self.tool) {
+        if let Some(new_tool) = toolbar::show(ui, self.tool, self.lasso_mode) {
             self.set_tool(new_tool);
         }
 
@@ -2694,9 +3732,14 @@ impl eframe::App for DaraskApp {
                     brush_hardness: &mut self.brush_hardness,
                     brush_opacity: &mut self.brush_opacity,
                     pencil_mode: &mut self.pencil_mode,
+                    brush_smoothing: &mut self.brush_smoothing,
                     shape_mode,
                     fill_tolerance: &mut self.fill.tolerance,
+                    gradient_kind: &mut self.gradient.kind,
+                    gradient_colors: &mut self.gradient.colors,
                     text_font_size: &mut self.text_font_size,
+                    lasso_mode: self.lasso_mode,
+                    magic_wand_tolerance: &mut self.magic_wand_tolerance,
                 },
             );
         }
@@ -2708,6 +3751,11 @@ impl eframe::App for DaraskApp {
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(64)))
             .show(ui, |ui| {
                 let output = self.view.show(ui, &mut self.doc, force_pan, cursor);
+                // SPEC §25: ピクセルグリッド(トグル ON かつズーム 800% 以上
+                // のときだけ)。画像の直後・ツールプレビューより前に描く。
+                if self.show_pixel_grid {
+                    self.view.draw_pixel_grid(&output.painter, &self.doc);
+                }
                 // ARCHITECTURE.md §3: 市松模様→画像→ツールプレビュー→選択枠の順。
                 match self.tool {
                     ToolKind::Pen => self.pen.draw_preview(
@@ -2745,8 +3793,18 @@ impl eframe::App for DaraskApp {
                         self.secondary,
                         self.brush_size,
                     ),
-                    // 選択・移動は `draw_selection_overlay` が浮動片/ハンドルを
-                    // 描く(下記)。ズームはプレビューを持たない。テキストは
+                    ToolKind::Gradient => self.gradient.draw_preview(
+                        &output.painter,
+                        &self.view,
+                        self.primary,
+                        self.secondary,
+                        self.brush_size,
+                    ),
+                    // 選択・移動・楕円選択は `draw_selection_overlay` が
+                    // 浮動片/ハンドルを描く(下記、v4 §22: 楕円選択も同じ
+                    // オーバーレイを共有する)。なげなわは同じ
+                    // `draw_selection_overlay` の中で進行中の軌跡/頂点列も
+                    // 描く。ズーム・自動選択はプレビューを持たない。テキストは
                     // `draw_text_edit_overlay`(下記)が別枠で描く。
                     ToolKind::Fill
                     | ToolKind::Picker
@@ -2754,7 +3812,10 @@ impl eframe::App for DaraskApp {
                     | ToolKind::Pan
                     | ToolKind::Move
                     | ToolKind::Zoom
-                    | ToolKind::Text => {}
+                    | ToolKind::Text
+                    | ToolKind::EllipseSelect
+                    | ToolKind::Lasso
+                    | ToolKind::MagicWand => {}
                 }
                 // SPEC §17: ブラシ/消しゴム使用中は OS カーソルの代わりに
                 // 円アウトラインを描く(ARCHITECTURE.md §15.6 落とし穴5:
@@ -2787,13 +3848,30 @@ impl eframe::App for DaraskApp {
 
         // ①ベンチ処理(SPEC §11): 2 フレーム目の描画が終わった時点で
         // bench.txt に経過ミリ秒を書き出し、直ちにプロセスを終了する。
+        // v4 §16.2(SPEC §28): フェーズ内訳(設定読込/フォント/ウィンドウ
+        // 作成/初フレーム)も合わせて書き出す。
         if let Some(bench) = &mut self.bench {
             bench.frames_drawn += 1;
+            if bench.frames_drawn == 1 {
+                bench
+                    .phases
+                    .push(("first_frame", bench.process_start.elapsed().as_millis()));
+            }
             if bench.frames_drawn >= 2 {
                 let elapsed_ms = bench.process_start.elapsed().as_millis();
+                bench.phases.push(("second_frame", elapsed_ms));
+                // 1 行目は `total_ms`(後方互換、SPEC §11)。以降は
+                // `phase\tms` 行(ARCHITECTURE.md §16.2)。
+                let mut content = elapsed_ms.to_string();
+                for (name, ms) in &bench.phases {
+                    content.push('\n');
+                    content.push_str(name);
+                    content.push('\t');
+                    content.push_str(&ms.to_string());
+                }
                 // I/O エラーでパニックしないこと(SPEC §12)。書き込みに
                 // 失敗してもスモークテストとしてはプロセスを終了させる。
-                let _ = std::fs::write("bench.txt", elapsed_ms.to_string());
+                let _ = std::fs::write("bench.txt", content);
                 std::process::exit(0);
             }
             // 通常運用では無条件の request_repaint() は禁止(アイドル CPU 0%
@@ -2805,20 +3883,73 @@ impl eframe::App for DaraskApp {
             ui.ctx().request_repaint();
         }
     }
+
+    /// SPEC §26(ARCHITECTURE.md §16.7): 「書き込みは終了時…のみ」。
+    /// `eframe` は「未保存変更が無い状態でウィンドウの X を閉じる/Alt+F4」
+    /// のように `handle_close_request` が `CancelClose` を送らずに戻った
+    /// 場合、通常の(`std::process::exit` を経ない)シャットダウン処理として
+    /// これを 1 回だけ呼ぶ。一方、本アプリが未保存確認を経て自ら終了する
+    /// 経路(`exit_process`、`メニュー>終了`・確認モーダルの保存/破棄後)は
+    /// `std::process::exit` で即座にプロセスを終了するため、この
+    /// `on_exit` は呼ばれない(Rust の通常のアンワインド/デストラクタ・
+    /// トレイトメソッド呼び出しを経ないため) — その経路では
+    /// `exit_process` 自身が `save_settings` を呼ぶことで同じ保証を満たす。
+    /// ベンチモード(SPEC §11)は `std::process::exit` で終了するためここは
+    /// 呼ばれず、実 `%APPDATA%` を書き換えない(意図的、`exit_process` の
+    /// ドキュメントコメント参照)。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_settings();
+    }
+}
+
+/// v4 §26(ARCHITECTURE.md §16.7)の「終了時に保存するウィンドウ寸法・
+/// 最大化状態」の追跡ロジック(`DaraskApp::ui` から毎フレーム呼ぶ)。
+/// egui の `Context` に依存しない純粋関数として切り出してあるのでテスト
+/// できる。
+///
+/// v4 レビューで発見・修正したバグ: 以前は `maximized` 中でも `inner_rect`
+/// (最大化時は画面全体のクライアント寸法)を無条件で `window_size` に
+/// 上書きしていた。そのため設定保存時に `window.maximized=1` と「最大化時の
+/// 寸法」が同時に書き出され、次回起動が最大化で復元された後にユーザーが
+/// 最大化を解除すると、ウィンドウはほぼ画面いっぱいのサイズになり、元の
+/// (最大化前の)サイズはどこにも残っていなかった。`maximized` フラグを
+/// 先に更新してから、それが偽のフレームでだけ `window_size` を更新する
+/// ことで、「直近の非最大化時サイズ」を保持し続ける。`viewport_maximized`/
+/// `viewport_inner_rect` が `None`(Android/Wayland 等でウィンドウ情報が
+/// 取れない場合)なら、それぞれ前回値のまま据え置く。
+fn track_window_size(
+    window_size: &mut egui::Vec2,
+    window_maximized: &mut bool,
+    viewport_maximized: Option<bool>,
+    viewport_inner_rect: Option<egui::Rect>,
+) {
+    if let Some(maximized) = viewport_maximized {
+        *window_maximized = maximized;
+    }
+    if !*window_maximized {
+        if let Some(inner_rect) = viewport_inner_rect {
+            *window_size = inner_rect.size();
+        }
+    }
 }
 
 /// ARCHITECTURE.md §9: egui のデフォルトフォントに日本語グリフは無いため、
-/// Windows システムフォントを実行時に読み込んで追加する。
-/// `App::new` 相当(ここでは `DaraskApp::new`)で一度だけ呼ぶ。
+/// Windows システムフォントを追加する。`App::new` 相当(ここでは
+/// `DaraskApp::new`)で一度だけ呼ぶ。
+///
+/// v4 §16.2: ファイル読み込み自体(`text::load_font_bytes`)は `main()` が
+/// ウィンドウ作成と並行する別スレッドで先に行い、ここでは読み込み済みの
+/// バイト列(見つからなければ `None`)を受け取って egui へ登録するだけに
+/// した(旧実装は `ctx.add_font` の直前でファイル読み込みも行っており、
+/// ウィンドウ作成と直列だった)。
 ///
 /// v3 §19(ARCHITECTURE.md §15.3)でテキストツールが同じバイト列を
 /// `ab_glyph::FontRef` の構築に使うため、読み込んだバイト列を `Arc<Vec<u8>>`
-/// として返す(見つからなければ `None`)。egui にはこのバイト列の複製を渡す
-/// (egui 側は `FontData` として所有権ごと消費するため、テキストツール用に
-/// 別途保持する分は 1 回だけメモリ上でクローンする — ディスク読み込みは
-/// 1 回きりで済み、読み込み自体を 2 度行う旧実装より効率的)。
-fn setup_japanese_fonts(ctx: &egui::Context) -> Option<Arc<Vec<u8>>> {
-    let Some(bytes) = text::load_font_bytes() else {
+/// として返す。egui にはこのバイト列の複製を渡す(egui 側は `FontData` と
+/// して所有権ごと消費するため、テキストツール用に別途保持する分は 1 回だけ
+/// メモリ上でクローンする — ディスク読み込みは 1 回きりで済む)。
+fn register_japanese_font(ctx: &egui::Context, bytes: Option<Vec<u8>>) -> Option<Arc<Vec<u8>>> {
+    let Some(bytes) = bytes else {
         // ARCHITECTURE.md §9-4: 全部読めなければ警告ログだけ出して続行する
         // (Win11 では起きない想定)。`log` crate は依存に追加しない方針
         // (CLAUDE.md)のため `eprintln!` で代替する。
@@ -2863,6 +3994,8 @@ mod tests {
             history: History::new(),
             tool: ToolKind::Pen,
             last_shape_tool: ToolKind::Line,
+            last_marquee_tool: ToolKind::Select,
+            last_fill_tool: ToolKind::Fill,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
             line: ShapeTool::new_line(),
@@ -2870,14 +4003,21 @@ mod tests {
             ellipse: ShapeTool::new_ellipse(),
             fill: FillTool::new(),
             picker: PickerTool::new(),
+            gradient: GradientTool::new(),
+            lasso_mode: LassoMode::Freehand,
+            lasso_freehand_points: Vec::new(),
+            lasso_polygon: None,
+            magic_wand_tolerance: 0,
             primary: Color32::BLACK,
             secondary: Color32::WHITE,
-            brush_size: 4.0,
-            brush_hardness: DEFAULT_BRUSH_HARDNESS,
-            brush_opacity: DEFAULT_BRUSH_OPACITY,
+            brush_size: settings::DEFAULT_BRUSH_SIZE,
+            brush_hardness: settings::DEFAULT_BRUSH_HARDNESS,
+            brush_opacity: settings::DEFAULT_BRUSH_OPACITY,
             pencil_mode: false,
+            brush_smoothing: settings::DEFAULT_BRUSH_SMOOTHING,
             recent_colors: VecDeque::new(),
             alt_eyedropper_active: false,
+            show_pixel_grid: true,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
             // だけ空欄がちらつく)。プライマリの初期値(黒)に合わせる。
@@ -2897,12 +4037,20 @@ mod tests {
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
             last_title: String::new(),
             toast: None,
+            recent_files: VecDeque::new(),
             layer_rename: None,
             next_layer_number: 1,
             // テストにはウィンドウが無いため、ワークアラウンドは常に完了
             // 状態にしておく。
             startup_nudge: StartupNudge::Done,
             last_screen_rect: egui::Rect::NOTHING,
+            window_size: egui::vec2(
+                settings::DEFAULT_WINDOW_WIDTH as f32,
+                settings::DEFAULT_WINDOW_HEIGHT as f32,
+            ),
+            window_maximized: false,
+            // テストは実 `%APPDATA%` を書き換えない(`save_settings` 参照)。
+            persist_settings: false,
             bench: None,
         }
     }
@@ -3020,10 +4168,11 @@ mod tests {
     }
 
     #[test]
-    fn old_l_r_c_f_keys_no_longer_change_the_tool() {
+    fn old_r_c_f_keys_no_longer_change_the_tool() {
         // SPEC §20: 「旧 L/R/C は廃止」。塗りつぶしは F→G に変わったので F も
-        // 含める。
-        for key in [Key::L, Key::R, Key::C, Key::F] {
+        // 含める。v4 §22 で `L` はなげなわとして復活した(下の
+        // `l_key_selects_lasso` が別途検証する)ので、ここでは対象外にする。
+        for key in [Key::R, Key::C, Key::F] {
             let mut app = new_for_test(Document::new(4, 4, Background::White));
             app.tool = ToolKind::Pen;
 
@@ -3036,6 +4185,18 @@ mod tests {
                 "{key:?} must no longer switch tools"
             );
         }
+    }
+
+    #[test]
+    fn l_key_selects_lasso() {
+        // v4 §22: `L` は廃止された旧ショートカットではなく、なげなわを選ぶ。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Pen;
+
+        let ctx = ctx_with_key_event(Key::L, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tool, ToolKind::Lasso);
     }
 
     #[test]
@@ -3076,7 +4237,7 @@ mod tests {
         app.doc.modified = true; // 白紙ではない状態を再現する。
         app.tool = ToolKind::Pen;
 
-        app.begin_paste_floating(4, 4, vec![255, 0, 0, 255].repeat(16));
+        app.begin_paste_floating(4, 4, [255, 0, 0, 255].repeat(16));
 
         assert_eq!(
             app.tool,
@@ -3097,7 +4258,7 @@ mod tests {
         app.doc.modified = true;
         app.tool = ToolKind::Pen;
 
-        app.begin_paste_floating(4, 4, vec![255, 0, 0, 255].repeat(16));
+        app.begin_paste_floating(4, 4, [255, 0, 0, 255].repeat(16));
         // ペンでキャンバスをクリックしても(tool は既に Select なので)ペンの
         // begin_stroke には届かず、貼り付け用のレコーダは破棄されない。
         app.dispatch_canvas_events(vec![ToolEvent::Down {
@@ -3143,7 +4304,7 @@ mod tests {
         let painted_stroke = app.doc.get_pixel(5, 5);
         assert_ne!(painted_stroke, Some([255, 255, 255, 255]));
 
-        app.paste_pixels(16, 16, vec![0, 255, 0, 255].repeat(256));
+        app.paste_pixels(16, 16, [0, 255, 0, 255].repeat(256));
 
         // 元のペンストロークは、貼り付け用の(まだ未確定の)浮動片とは
         // 独立した undo 単位として、先に確定されているはず。
@@ -3357,10 +4518,10 @@ mod tests {
         let selection = app.selection.expect("a real drag must create a selection");
         assert_eq!(
             (
-                selection.rect.x0,
-                selection.rect.y0,
-                selection.rect.x1,
-                selection.rect.y1
+                selection.mask.bbox.x0,
+                selection.mask.bbox.y0,
+                selection.mask.bbox.x1,
+                selection.mask.bbox.y1
             ),
             (2, 2, 10, 10)
         );
@@ -3376,14 +4537,12 @@ mod tests {
         // 「内部クリック」を検証するにはハンドルの当たり判定(中心から
         // ±3.5pt)から十分離れた点でクリックする必要がある(16x16 の選択で
         // 中心 (10,10) を使えば、どの辺・角ハンドルからも 8pt 以上離れる)。
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 2,
-                y0: 2,
-                x1: 18,
-                y1: 18,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 18,
+            y1: 18,
+        })));
 
         app.handle_select_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
@@ -3417,14 +4576,12 @@ mod tests {
         // v2 §16: 上のテストと同じ理由で、ハンドルの当たり判定を避けた中心
         // 付近でドラッグする(rect 原点 (2,2) からの down オフセットは (8,8)
         // で、旧テストの (3,3) と役割は同じ)。
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 2,
-                y0: 2,
-                x1: 18,
-                y1: 18,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 18,
+            y1: 18,
+        })));
 
         app.handle_select_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
@@ -3527,7 +4684,7 @@ mod tests {
         // 幅/高さ 0 は io::copy_image_to_clipboard が OS クリップボードに
         // 触れる前に決定的に失敗させる(ARCHITECTURE.md §12-8)ので、実際の
         // OS クリップボード状態に依存せずにこの経路をテストできる。
-        app.floating = Some(Floating::new(vec![], 0, 0, pos2(0.0, 0.0), None, 1));
+        app.floating = Some(Floating::new_rect(vec![], 0, 0, pos2(0.0, 0.0), None, 1));
 
         app.cut_selection_to_clipboard();
 
@@ -3785,14 +4942,12 @@ mod tests {
         // v2 §16: ハンドルの当たり判定を避けて内部ドラッグを起こす
         // (上の `dragging_inside_selection_floats_it_and_tracks_the_pointer`
         // と同じ理由)。
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 2,
-                y0: 2,
-                x1: 18,
-                y1: 18,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 18,
+            y1: 18,
+        })));
         app.handle_select_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
@@ -3825,14 +4980,12 @@ mod tests {
 
         app.tool = ToolKind::Select;
         // v2 §16: 同上、ハンドルの当たり判定を避ける。
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 2,
-                y0: 2,
-                x1: 18,
-                y1: 18,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 18,
+            y1: 18,
+        })));
         app.handle_select_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
@@ -3936,6 +5089,343 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- v4 §26: 設定の永続化・最近使ったファイル ---------------------------
+
+    fn temp_dir_for_app_test(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "darask_paint_test_app_{name}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn remember_recent_file_adds_to_front_and_dedupes_existing_entry() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.remember_recent_file(PathBuf::from("a.png"));
+        app.remember_recent_file(PathBuf::from("b.png"));
+        assert_eq!(
+            app.recent_files,
+            VecDeque::from(vec![PathBuf::from("b.png"), PathBuf::from("a.png")])
+        );
+
+        // 既存の同一パスは先頭へ移動するだけ(重複は残らない、SPEC §26)。
+        app.remember_recent_file(PathBuf::from("a.png"));
+        assert_eq!(
+            app.recent_files,
+            VecDeque::from(vec![PathBuf::from("a.png"), PathBuf::from("b.png")])
+        );
+    }
+
+    #[test]
+    fn remember_recent_file_caps_at_max_recent_files() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        for i in 0..(settings::MAX_RECENT_FILES + 3) {
+            app.remember_recent_file(PathBuf::from(format!("{i}.png")));
+        }
+        assert_eq!(app.recent_files.len(), settings::MAX_RECENT_FILES);
+        // 先頭は最後に追加したもの(最新)。
+        assert_eq!(
+            app.recent_files[0],
+            PathBuf::from(format!("{}.png", settings::MAX_RECENT_FILES + 2))
+        );
+    }
+
+    #[test]
+    fn open_recent_file_missing_path_is_removed_and_toast_shown() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let missing = PathBuf::from("__darask_paint_definitely_missing__.png");
+        app.recent_files.push_back(missing.clone());
+
+        app.open_recent_file(0);
+
+        assert!(
+            !app.recent_files.contains(&missing),
+            "a missing recent file must be removed from the list (SPEC §26)"
+        );
+        assert!(
+            app.toast.is_some(),
+            "selecting a missing recent file must show a toast"
+        );
+    }
+
+    #[test]
+    fn open_recent_file_out_of_range_index_does_nothing() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_recent_file(0); // 空の一覧に対するインデックス。
+        assert!(app.recent_files.is_empty());
+        assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn open_recent_file_existing_path_opens_it_and_moves_to_front() {
+        let dir = temp_dir_for_app_test("open_recent");
+        let path = dir.join("existing.png");
+        let mut seed_doc = Document::new(3, 3, Background::White);
+        io::save_image(&mut seed_doc, &path, SaveFormat::Png).expect("seed file should save");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.recent_files.push_back(PathBuf::from("other.png"));
+        app.recent_files.push_back(path.clone());
+
+        app.open_recent_file(1);
+
+        assert_eq!(app.doc.path, Some(path.clone()));
+        assert_eq!(
+            app.recent_files.front(),
+            Some(&path),
+            "opening a recent file must move it to the front (MRU)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_settings_reflects_live_app_state() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.primary = Color32::from_rgb(1, 2, 3);
+        app.secondary = Color32::from_rgb(4, 5, 6);
+        app.brush_size = 22.0;
+        app.brush_hardness = 55;
+        app.brush_opacity = 66;
+        app.pencil_mode = true;
+        app.brush_smoothing = 40;
+        app.show_pixel_grid = false;
+        app.tool = ToolKind::Gradient;
+        app.user_palette.push(Color32::from_rgb(9, 9, 9));
+        app.recent_files.push_back(PathBuf::from("x.png"));
+        app.window_size = egui::vec2(1600.0, 900.0);
+        app.window_maximized = true;
+
+        let s = app.current_settings();
+        assert_eq!(s.primary, app.primary);
+        assert_eq!(s.secondary, app.secondary);
+        assert_eq!(s.brush_size, app.brush_size);
+        assert_eq!(s.brush_hardness, app.brush_hardness);
+        assert_eq!(s.brush_opacity, app.brush_opacity);
+        assert_eq!(s.pencil_mode, app.pencil_mode);
+        assert_eq!(s.brush_smoothing, app.brush_smoothing);
+        assert_eq!(s.show_pixel_grid, app.show_pixel_grid);
+        assert_eq!(s.last_tool, ToolKind::Gradient);
+        assert_eq!(s.user_palette, app.user_palette);
+        assert_eq!(s.recent_files, app.recent_files);
+        assert_eq!(s.window_width, 1600);
+        assert_eq!(s.window_height, 900);
+        assert!(s.window_maximized);
+    }
+
+    // -- v4 レビューで発見・修正したバグ: 最大化中のウィンドウ内寸を
+    // window_size として保存してしまい、復元後の「元に戻す」サイズが
+    // 画面いっぱいになる -----------------------------------------------
+
+    #[test]
+    fn track_window_size_ignores_inner_rect_while_maximized() {
+        let mut size = egui::vec2(1280.0, 800.0);
+        let mut maximized = false;
+
+        // 通常サイズで使用中: inner_rect がそのまま反映される。
+        track_window_size(
+            &mut size,
+            &mut maximized,
+            Some(false),
+            Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+        );
+        assert_eq!(size, egui::vec2(1280.0, 800.0));
+        assert!(!maximized);
+
+        // 最大化: `maximized` は更新されるが、最大化時のクライアント全体の
+        // 寸法(1920x1040 のような画面いっぱいのサイズ)は `window_size` に
+        // 反映してはいけない(バグ版はここで無条件に上書きしていた)。
+        track_window_size(
+            &mut size,
+            &mut maximized,
+            Some(true),
+            Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1040.0),
+            )),
+        );
+        assert!(maximized);
+        assert_eq!(
+            size,
+            egui::vec2(1280.0, 800.0),
+            "the pre-maximize window size must be preserved while maximized"
+        );
+
+        // 最大化解除: 次に報告される(通常サイズの)inner_rect が改めて
+        // 反映される。
+        track_window_size(
+            &mut size,
+            &mut maximized,
+            Some(false),
+            Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+        );
+        assert!(!maximized);
+        assert_eq!(size, egui::vec2(1280.0, 800.0));
+    }
+
+    #[test]
+    fn track_window_size_keeps_previous_values_when_viewport_info_is_unavailable() {
+        let mut size = egui::vec2(640.0, 480.0);
+        let mut maximized = true;
+
+        // Android/Wayland 等で `None` が返る場合は前回値を据え置く。
+        track_window_size(&mut size, &mut maximized, None, None);
+
+        assert!(maximized);
+        assert_eq!(size, egui::vec2(640.0, 480.0));
+    }
+
+    #[test]
+    fn opening_a_file_adds_it_to_recent_files() {
+        let dir = temp_dir_for_app_test("open_adds_recent");
+        let path = dir.join("photo.png");
+        let mut doc = Document::new(3, 3, Background::White);
+        io::save_image(&mut doc, &path, SaveFormat::Png).expect("seed file should save");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.open_path(path.clone());
+
+        assert_eq!(app.recent_files.front(), Some(&path));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_a_file_adds_it_to_recent_files() {
+        let dir = temp_dir_for_app_test("save_adds_recent");
+        let path = dir.join("saved.png");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.begin_save_to_path(path.clone());
+
+        assert_eq!(app.recent_files.front(), Some(&path));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_tool_state_clamps_out_of_range_settings_values() {
+        // settings::parse は型の範囲(u8 なら 0-255)までしか検証しないため、
+        // 手編集・破損した設定ファイルはドメイン範囲外の値を持ちうる
+        // (ARCHITECTURE.md §16.10-5)。
+        let settings = Settings {
+            brush_size: 9999.0,   // MAX_BRUSH_SIZE (64) を大きく超える。
+            brush_hardness: 250,  // MAX_BRUSH_HARDNESS (100) 超え。
+            brush_opacity: 0,     // MIN_BRUSH_OPACITY (1) 未満。
+            brush_smoothing: 200, // 100 超え。
+            ..Default::default()
+        };
+
+        let startup = StartupToolState::resolve(&settings);
+        assert_eq!(startup.brush_size, MAX_BRUSH_SIZE);
+        assert_eq!(startup.brush_hardness, MAX_BRUSH_HARDNESS);
+        assert_eq!(startup.brush_opacity, MIN_BRUSH_OPACITY);
+        assert_eq!(startup.brush_smoothing, 100);
+    }
+
+    #[test]
+    fn startup_tool_state_passes_through_in_range_values_unchanged() {
+        let settings = Settings {
+            brush_size: 22.0,
+            brush_hardness: 55,
+            brush_opacity: 66,
+            brush_smoothing: 40,
+            fill_tolerance: 12,
+            rect_mode: crate::tools::shapes::ShapeMode::Both,
+            ellipse_mode: crate::tools::shapes::ShapeMode::Fill,
+            gradient_kind: raster::GradientKind::Radial,
+            gradient_colors: crate::tools::gradient::GradientColors::PrimaryToTransparent,
+            ..Default::default()
+        };
+
+        let startup = StartupToolState::resolve(&settings);
+        assert_eq!(startup.brush_size, 22.0);
+        assert_eq!(startup.brush_hardness, 55);
+        assert_eq!(startup.brush_opacity, 66);
+        assert_eq!(startup.brush_smoothing, 40);
+        assert_eq!(startup.fill_tolerance, 12);
+        assert_eq!(startup.rect_mode, crate::tools::shapes::ShapeMode::Both);
+        assert_eq!(startup.ellipse_mode, crate::tools::shapes::ShapeMode::Fill);
+        assert_eq!(startup.gradient_kind, raster::GradientKind::Radial);
+        assert_eq!(
+            startup.gradient_colors,
+            crate::tools::gradient::GradientColors::PrimaryToTransparent
+        );
+    }
+
+    #[test]
+    fn startup_tool_state_last_tool_bookkeeping_for_each_cycle_group() {
+        // last_tool が図形/マリキー/塗りつぶし系のいずれかなら、対応する
+        // last_*_tool へそのまま引き継がれる(SPEC §20/§22/§23)。
+        for (last_tool, expect_shape, expect_marquee, expect_fill) in [
+            (
+                ToolKind::Rect,
+                ToolKind::Rect,
+                ToolKind::Select,
+                ToolKind::Fill,
+            ),
+            (
+                ToolKind::Ellipse,
+                ToolKind::Ellipse,
+                ToolKind::Select,
+                ToolKind::Fill,
+            ),
+            (
+                ToolKind::EllipseSelect,
+                ToolKind::Line,
+                ToolKind::EllipseSelect,
+                ToolKind::Fill,
+            ),
+            (
+                ToolKind::Gradient,
+                ToolKind::Line,
+                ToolKind::Select,
+                ToolKind::Gradient,
+            ),
+        ] {
+            let settings = Settings {
+                last_tool,
+                ..Default::default()
+            };
+            let startup = StartupToolState::resolve(&settings);
+            assert_eq!(
+                startup.last_shape_tool, expect_shape,
+                "last_tool={last_tool:?}"
+            );
+            assert_eq!(
+                startup.last_marquee_tool, expect_marquee,
+                "last_tool={last_tool:?}"
+            );
+            assert_eq!(
+                startup.last_fill_tool, expect_fill,
+                "last_tool={last_tool:?}"
+            );
+        }
+
+        // last_tool がどの巡回グループにも属さない場合、各グループは
+        // SPEC の表の先頭(既定値)のままになる。
+        let settings = Settings {
+            last_tool: ToolKind::Pan,
+            ..Default::default()
+        };
+        let startup = StartupToolState::resolve(&settings);
+        assert_eq!(startup.last_shape_tool, ToolKind::Line);
+        assert_eq!(startup.last_marquee_tool, ToolKind::Select);
+        assert_eq!(startup.last_fill_tool, ToolKind::Fill);
+    }
+
     // -- v2 §16: スケールハンドル(ARCHITECTURE.md §14.6 受け入れ基準) -------
     //
     // `new_for_test` の `CanvasView::new()` は zoom=1.0/pan=0/ppp=1.0/
@@ -3946,8 +5436,8 @@ mod tests {
     fn dragging_a_handle_on_an_already_floating_piece_resizes_it() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.floating = Some(Floating::new(
-            vec![255, 0, 0, 255].repeat(100), // 10x10 の不透明赤
+        app.floating = Some(Floating::new_rect(
+            [255, 0, 0, 255].repeat(100), // 10x10 の不透明赤
             10,
             10,
             pos2(5.0, 5.0),
@@ -4003,14 +5493,12 @@ mod tests {
         // 同様にまず浮動化してから拡縮する」。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 5,
-                y0: 5,
-                x1: 15,
-                y1: 15,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
 
         app.handle_select_event(ToolEvent::Down {
             img: pos2(15.0, 15.0), // BottomRight ハンドル。
@@ -4045,8 +5533,8 @@ mod tests {
     fn shift_held_while_dragging_a_handle_locks_the_aspect_ratio() {
         let mut app = new_for_test(Document::new(100, 100, Background::White));
         app.tool = ToolKind::Select;
-        app.floating = Some(Floating::new(
-            vec![0, 0, 0, 255].repeat(200), // 10x20
+        app.floating = Some(Floating::new_rect(
+            [0, 0, 0, 255].repeat(200), // 10x20
             10,
             20,
             pos2(0.0, 0.0),
@@ -4085,14 +5573,12 @@ mod tests {
         // `hit_resize_handle`/`handle_cursor` を直接検証する。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 5,
-                y0: 5,
-                x1: 15,
-                y1: 15,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
         assert_eq!(
             app.hit_resize_handle(pos2(15.0, 15.0)),
             Some(select::Handle::BottomRight)
@@ -4146,14 +5632,12 @@ mod tests {
     fn move_tool_moves_only_the_existing_selection_rect() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Move;
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 5,
-                y0: 5,
-                x1: 15,
-                y1: 15,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
 
         app.handle_move_event(ToolEvent::Down {
             img: pos2(20.0, 20.0), // 選択の外だが、移動ツールはクリック位置を問わない。
@@ -4263,14 +5747,12 @@ mod tests {
         app.tool = ToolKind::Select;
         app.doc.set_pixel(7, 7, [10, 20, 30, 255]);
         let original = app.doc.active_pixels().to_vec();
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 2,
-                y0: 2,
-                x1: 12,
-                y1: 12,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 12,
+            y1: 12,
+        })));
 
         app.handle_select_event(ToolEvent::Down {
             img: pos2(5.0, 5.0),
@@ -4337,7 +5819,7 @@ mod tests {
         app.doc.modified = true; // 白紙ではない状態を再現する。
         let original = app.doc.active_pixels().to_vec();
 
-        app.begin_paste_floating(3, 3, vec![1, 2, 3, 255].repeat(9));
+        app.begin_paste_floating(3, 3, [1, 2, 3, 255].repeat(9));
         assert!(app.floating.is_some());
         assert_eq!(app.tool, ToolKind::Select);
 
@@ -4359,14 +5841,12 @@ mod tests {
     fn free_transform_floats_the_existing_selection_and_preserves_its_rect() {
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Pen; // 直前のツールが何であっても働くことを示す。
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 5,
-                y0: 5,
-                x1: 15,
-                y1: 15,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
 
         app.free_transform();
 
@@ -4388,14 +5868,12 @@ mod tests {
         // しまうバグになる(`free_transform` 実装時に発見・回避)。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
         app.tool = ToolKind::Select;
-        app.selection = Some(Selection {
-            rect: IRect {
-                x0: 5,
-                y0: 5,
-                x1: 15,
-                y1: 15,
-            },
-        });
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
 
         app.free_transform();
 
@@ -4405,6 +5883,66 @@ mod tests {
             (10, 10),
             "the plain selection must survive and be the transform target, not the whole 40x40 layer"
         );
+    }
+
+    // -- v4 §23/§24: 回帰テスト(commit_open_gesture が選択を残すこと) --------
+
+    #[test]
+    fn switching_tools_away_from_select_preserves_a_plain_selection() {
+        // 回帰テスト: `commit_open_gesture`(`set_tool` が呼ぶ)が無条件で
+        // `commit_selection`(常に `self.selection` をクリアする)を使うと、
+        // 「M で選択してから G/Shift+G でグラデーションに切り替える」という
+        // SPEC §21/§23 が前提とする使い方で、ツール切替の瞬間に選択が消えて
+        // しまいクリップ対象が無くなるバグになる(`free_transform` が Ctrl+T
+        // について既に回避していたのと同一クラス、上のテスト参照)。
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Select;
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
+
+        app.set_tool(ToolKind::Gradient);
+
+        assert!(
+            app.selection.is_some(),
+            "a plain (non-floating) selection must survive a plain tool switch"
+        );
+        assert!(app.floating.is_none());
+    }
+
+    #[test]
+    fn switching_tools_away_from_select_still_commits_an_in_progress_floating() {
+        // 浮動化済みの浮動片(=まさに動かしている最中)は、従来どおりツール
+        // 切替で確定合成されなければならない(`flush_floating_keep_selection`
+        // が `commit_selection` の浮動片確定ロジックをそのまま引き継いで
+        // いることの確認)。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Select;
+        app.begin_floating_from_selection(
+            select::rect_mask(IRect {
+                x0: 2,
+                y0: 2,
+                x1: 8,
+                y1: 8,
+            }),
+            pos2(2.0, 2.0),
+        );
+        assert!(app.floating.is_some());
+        // 実際に動かしていないと、切り出し元へそのまま同じ画素を貼り戻すだけ
+        // になり before==after 抑制(ARCHITECTURE.md §15.2)で undo 単位が
+        // 積まれない。「移動した」ことにするため位置をずらす。
+        app.floating.as_mut().unwrap().pos = pos2(5.0, 5.0);
+
+        app.set_tool(ToolKind::Pen);
+
+        assert!(
+            app.floating.is_none(),
+            "the floating piece must be committed"
+        );
+        assert!(app.history.can_undo());
     }
 
     #[test]
@@ -4857,6 +6395,697 @@ mod tests {
             matches!(app.modal, Some(ModalState::ConfirmUnsaved)),
             "a real committed edit must arm the unsaved-changes guard so closing the \
              window doesn't silently discard it"
+        );
+    }
+
+    // ===================================================================
+    // V4-M3(SPEC §22/§27): 楕円選択・なげなわ・自動選択
+    // ===================================================================
+
+    #[test]
+    fn ellipse_select_tool_creates_an_ellipse_shaped_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::EllipseSelect;
+
+        app.handle_select_event(ToolEvent::Down {
+            img: pos2(0.0, 0.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Drag {
+            img: pos2(10.0, 10.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Up {
+            img: pos2(10.0, 10.0),
+            button: PointerButton::Primary,
+        });
+
+        let selection = app.selection.expect("a real drag must create a selection");
+        let expected = select::ellipse_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 10,
+            y1: 10,
+        });
+        assert_eq!(selection.mask.bbox, expected.bbox);
+        assert_eq!(selection.mask.mask, expected.mask);
+        assert!(
+            !selection.mask.contains(0, 0),
+            "the bounding box corner must be outside the inscribed ellipse"
+        );
+    }
+
+    #[test]
+    fn shift_drag_constrains_marquee_selection_to_a_square() {
+        // SPEC §22: 「Shift ドラッグで正方形/正円」。矩形選択でも適用される。
+        let mut app = new_for_test(Document::new(30, 30, Background::White));
+        app.tool = ToolKind::Select;
+
+        app.handle_select_event(ToolEvent::Down {
+            img: pos2(0.0, 0.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Drag {
+            img: pos2(20.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::SHIFT,
+        });
+        app.handle_select_event(ToolEvent::Up {
+            img: pos2(20.0, 5.0),
+            button: PointerButton::Primary,
+        });
+
+        let selection = app.selection.expect("a real drag must create a selection");
+        let bbox = selection.mask.bbox;
+        assert_eq!(
+            bbox.width(),
+            bbox.height(),
+            "shift-drag must produce a square selection, got {bbox:?}"
+        );
+        assert_eq!(bbox.width(), 20);
+    }
+
+    #[test]
+    fn cycle_marquee_tool_toggles_select_and_ellipse_select() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::Select);
+
+        app.cycle_marquee_tool();
+        assert_eq!(app.tool, ToolKind::EllipseSelect);
+        app.cycle_marquee_tool();
+        assert_eq!(app.tool, ToolKind::Select);
+    }
+
+    #[test]
+    fn cycle_marquee_tool_from_a_non_marquee_tool_starts_from_last_marquee_tool() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::EllipseSelect);
+        app.set_tool(ToolKind::Pen); // EllipseSelect が「直前に使った形状」のまま。
+
+        app.cycle_marquee_tool();
+
+        assert_eq!(app.tool, ToolKind::Select);
+    }
+
+    #[test]
+    fn m_key_selects_last_used_marquee_tool_via_shortcuts() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::EllipseSelect);
+        app.set_tool(ToolKind::Pen);
+
+        let ctx = ctx_with_key_event(Key::M, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tool, ToolKind::EllipseSelect);
+    }
+
+    #[test]
+    fn shift_m_cycles_marquee_via_shortcuts() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::Select);
+
+        let ctx = ctx_with_key_event(Key::M, Modifiers::SHIFT);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tool, ToolKind::EllipseSelect);
+    }
+
+    #[test]
+    fn w_key_selects_magic_wand_via_shortcuts() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Pen;
+
+        let ctx = ctx_with_key_event(Key::W, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.tool, ToolKind::MagicWand);
+    }
+
+    // -- なげなわ(自由) ----------------------------------------------------
+
+    #[test]
+    fn lasso_freehand_drag_creates_a_selection_matching_the_trail() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        assert_eq!(app.lasso_mode, LassoMode::Freehand);
+
+        app.handle_lasso_event(ToolEvent::Down {
+            img: pos2(2.0, 2.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        for img in [pos2(10.0, 2.0), pos2(10.0, 10.0), pos2(2.0, 10.0)] {
+            app.handle_lasso_event(ToolEvent::Drag {
+                img,
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            });
+        }
+        app.handle_lasso_event(ToolEvent::Up {
+            img: pos2(2.0, 10.0),
+            button: PointerButton::Primary,
+        });
+
+        let selection = app
+            .selection
+            .expect("closing the free-hand trail must create a selection");
+        assert!(selection.mask.contains(5, 5));
+        assert!(
+            app.lasso_freehand_points.is_empty(),
+            "the in-progress trail must be cleared once committed"
+        );
+    }
+
+    #[test]
+    fn lasso_freehand_single_click_creates_no_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+
+        app.handle_lasso_event(ToolEvent::Down {
+            img: pos2(2.0, 2.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_lasso_event(ToolEvent::Up {
+            img: pos2(2.0, 2.0),
+            button: PointerButton::Primary,
+        });
+
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn switching_tool_away_from_lasso_mid_drag_discards_the_trail() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.handle_lasso_event(ToolEvent::Down {
+            img: pos2(2.0, 2.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_lasso_event(ToolEvent::Drag {
+            img: pos2(5.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        assert!(!app.lasso_freehand_points.is_empty());
+
+        app.set_tool(ToolKind::Pen);
+
+        assert!(app.lasso_freehand_points.is_empty());
+        assert!(app.selection.is_none());
+    }
+
+    // -- なげなわ(多角形) --------------------------------------------------
+
+    #[test]
+    fn lasso_polygon_click_adds_vertices_and_closes_near_the_start_point() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+
+        app.lasso_polygon_click(pos2(2.0, 2.0));
+        assert!(app.lasso_polygon.is_some());
+        app.lasso_polygon_click(pos2(16.0, 2.0));
+        app.lasso_polygon_click(pos2(16.0, 16.0));
+        app.lasso_polygon_click(pos2(2.0, 16.0));
+        assert_eq!(app.lasso_polygon.as_ref().unwrap().points.len(), 4);
+
+        // 始点付近をクリックして閉じる(SPEC §22:「始点クリックで閉じる」)。
+        app.lasso_polygon_click(pos2(2.4, 2.4));
+
+        assert!(app.lasso_polygon.is_none());
+        let selection = app
+            .selection
+            .expect("closing near the start point must create a selection");
+        assert!(selection.mask.contains(5, 5));
+    }
+
+    #[test]
+    fn lasso_polygon_double_click_closes_without_adding_a_duplicate_vertex() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+
+        app.lasso_polygon_click(pos2(2.0, 2.0));
+        app.lasso_polygon_click(pos2(10.0, 2.0));
+        app.lasso_polygon_click(pos2(10.0, 10.0));
+        // ダブルクリック(ほぼ同じ位置ですぐに 2 回クリック)。
+        app.lasso_polygon_click(pos2(6.0, 15.0));
+        app.lasso_polygon_click(pos2(6.0, 15.0));
+
+        assert!(
+            app.lasso_polygon.is_none(),
+            "a double click must close the polygon (SPEC §22)"
+        );
+        assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn lasso_polygon_enter_commits_the_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+        app.lasso_polygon_click(pos2(2.0, 2.0));
+        app.lasso_polygon_click(pos2(16.0, 2.0));
+        app.lasso_polygon_click(pos2(16.0, 16.0));
+        app.lasso_polygon_click(pos2(2.0, 16.0));
+        assert!(
+            app.lasso_polygon.is_some(),
+            "the polygon must still be open before Enter (vertices are far enough from the \
+             start point to not auto-close)"
+        );
+
+        let ctx = ctx_with_key_event(Key::Enter, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert!(app.lasso_polygon.is_none());
+        let selection = app
+            .selection
+            .expect("Enter must commit the in-progress polygon (SPEC §22)");
+        assert!(selection.mask.contains(5, 5));
+    }
+
+    #[test]
+    fn lasso_polygon_esc_cancels_without_creating_a_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+        app.lasso_polygon_click(pos2(2.0, 2.0));
+        app.lasso_polygon_click(pos2(10.0, 2.0));
+        app.lasso_polygon_click(pos2(10.0, 10.0));
+        assert!(app.lasso_polygon.is_some());
+
+        let ctx = ctx_with_key_event(Key::Escape, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert!(
+            app.lasso_polygon.is_none(),
+            "Esc must discard the in-progress polygon (SPEC §22)"
+        );
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn shift_l_toggles_lasso_mode_and_discards_an_in_progress_polygon() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+        app.lasso_polygon_click(pos2(2.0, 2.0));
+        assert!(app.lasso_polygon.is_some());
+
+        let ctx = ctx_with_key_event(Key::L, Modifiers::SHIFT);
+        app.handle_shortcuts(&ctx);
+
+        assert_eq!(app.lasso_mode, LassoMode::Freehand);
+        assert!(app.lasso_polygon.is_none());
+    }
+
+    // -- 自動選択(マジックワンド) --------------------------------------------
+
+    #[test]
+    fn magic_wand_select_picks_the_connected_region_only() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        for y in 0..10 {
+            for x in 5..10 {
+                app.doc.set_pixel(x, y, [0, 0, 0, 255]);
+            }
+        }
+        app.tool = ToolKind::MagicWand;
+        app.magic_wand_tolerance = 0;
+
+        app.magic_wand_select(pos2(1.0, 1.0));
+
+        let selection = app
+            .selection
+            .expect("magic wand must select the connected white region");
+        assert!(selection.mask.contains(0, 0));
+        assert!(
+            !selection.mask.contains(5, 0),
+            "must not cross into the black half"
+        );
+    }
+
+    #[test]
+    fn magic_wand_select_replaces_any_existing_selection() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::MagicWand;
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 3,
+        })));
+
+        app.magic_wand_select(pos2(5.0, 5.0));
+
+        let selection = app
+            .selection
+            .expect("magic wand always creates a fresh selection");
+        assert_eq!(
+            selection.mask.bbox,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 10,
+                y1: 10
+            },
+            "the whole document is one connected color so it must all be selected"
+        );
+    }
+
+    // -- v4 レビューで発見・修正したバグ: SPEC §18「Esc は選択を解除する」が
+    // 自動選択(MagicWand)には配線されていなかった -----------------------
+
+    #[test]
+    fn magic_wand_esc_deselects_a_plain_selection() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::MagicWand;
+        app.magic_wand_select(pos2(1.0, 1.0));
+        assert!(
+            app.selection.is_some(),
+            "W + click must have created a selection"
+        );
+
+        let ctx = ctx_with_key_event(Key::Escape, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert!(
+            app.selection.is_none(),
+            "SPEC §18: Esc must deselect regardless of the active tool"
+        );
+    }
+
+    #[test]
+    fn magic_wand_enter_also_clears_the_selection() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::MagicWand;
+        app.magic_wand_select(pos2(1.0, 1.0));
+        assert!(app.selection.is_some());
+
+        let ctx = ctx_with_key_event(Key::Enter, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+
+        assert!(app.selection.is_none());
+    }
+
+    // -- v4 レビューで発見・修正したバグ: 色調補正が進行中ストロークを
+    // 確定せず undo 履歴を破壊する ------------------------------------------
+
+    #[test]
+    fn apply_invert_mid_pen_drag_commits_the_open_stroke_as_its_own_undo_unit() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::BLACK;
+        let pristine = app.doc.active_pixels().to_vec();
+
+        // ドラッグ開始(まだ Up していない = 開いたストローク)。
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(5.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        app.dispatch_canvas_events(vec![ToolEvent::Drag {
+            img: pos2(8.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        assert!(
+            app.history.has_open_stroke(),
+            "the pen drag must still be open"
+        );
+        assert!(!app.history.can_undo(), "nothing committed yet");
+        let mid_stroke_pixels = app.doc.active_pixels().to_vec();
+        assert_ne!(
+            mid_stroke_pixels, pristine,
+            "the drag must have painted something already"
+        );
+
+        // ドラッグ中に Ctrl+I(階調の反転、即時適用)。
+        app.apply_invert();
+
+        // 反転は「ドラッグでこれまでに確定した画素」に対して行われるはず
+        // (ドキュメント全体に反転をかけているので、期待値は
+        // mid_stroke_pixels 全体の反転)。
+        let mut expected_inverted = mid_stroke_pixels.clone();
+        for px in expected_inverted.chunks_exact_mut(4) {
+            px[0] = 255 - px[0];
+            px[1] = 255 - px[1];
+            px[2] = 255 - px[2];
+        }
+        assert_eq!(app.doc.active_pixels(), expected_inverted.as_slice());
+        assert!(
+            !app.history.has_open_stroke(),
+            "Ctrl+I must fully commit the drag, not leave it dangling"
+        );
+
+        // ペンストロークと反転はそれぞれ独立した undo 単位でなければならない
+        // (バグ版では前者が `History::begin_stroke` の無警告置換で undo
+        // 履歴に一切残らず、1 回しか undo できない)。
+        assert!(app.history.undo(&mut app.doc), "undo #1: revert the invert");
+        assert_eq!(
+            app.doc.active_pixels(),
+            mid_stroke_pixels.as_slice(),
+            "undoing the invert must restore the pre-invert (mid-stroke) pixels exactly"
+        );
+        assert!(
+            app.history.undo(&mut app.doc),
+            "undo #2: the pen stroke drawn before Ctrl+I must be its own undo unit, \
+             not silently discarded"
+        );
+        assert_eq!(
+            app.doc.active_pixels(),
+            pristine.as_slice(),
+            "undoing everything must restore the pristine canvas byte-exactly"
+        );
+        assert!(!app.history.can_undo());
+    }
+
+    #[test]
+    fn open_hue_saturation_modal_mid_pen_drag_commits_the_open_stroke_first() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::BLACK;
+
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(5.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        app.dispatch_canvas_events(vec![ToolEvent::Drag {
+            img: pos2(8.0, 5.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        assert!(app.history.has_open_stroke());
+        assert!(!app.history.can_undo());
+
+        app.open_hue_saturation_modal();
+
+        assert!(
+            app.history.can_undo(),
+            "the pen drag must have been committed as its own undo unit before Ctrl+U's \
+             own live-preview snapshot stroke begins"
+        );
+        assert!(
+            app.history.has_open_stroke(),
+            "begin_tone_adjust_stroke itself opens a fresh snapshot stroke for the live preview"
+        );
+        assert!(app.modal.is_some());
+    }
+
+    // -- v4 レビューで発見・修正したバグ: モーダル表示中も進行中ドラッグが
+    // キャンバスに描画され続ける ---------------------------------------------
+
+    #[test]
+    fn dispatch_canvas_events_is_a_no_op_while_a_modal_is_open() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::BLACK;
+        let pristine = app.doc.active_pixels().to_vec();
+
+        app.modal = Some(ModalState::About);
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(2.0, 2.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Drag {
+                img: pos2(6.0, 2.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(6.0, 2.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+
+        assert_eq!(
+            app.doc.active_pixels(),
+            pristine.as_slice(),
+            "no pointer event may reach the canvas while a modal is open (ARCHITECTURE.md §10)"
+        );
+        assert!(!app.history.has_open_stroke());
+        assert!(!app.history.can_undo());
+    }
+
+    // -- v4 レビューで発見・修正したバグ: undo/redo が選択を新しい文書寸法へ
+    // クランプしない -----------------------------------------------------
+
+    #[test]
+    fn redo_of_a_shrinking_resize_drops_a_selection_that_no_longer_overlaps_the_document() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.confirm_canvas_resize(5, 5);
+        assert_eq!((app.doc.width, app.doc.height), (5, 5));
+
+        app.handle_menu_action(MenuAction::Undo);
+        assert_eq!(
+            (app.doc.width, app.doc.height),
+            (20, 20),
+            "undo must restore the original 20x20 canvas"
+        );
+
+        // 元の(20x20 の)キャンバスの右下領域を選択する。redo 後の 5x5 の
+        // 範囲には一切かからない。
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 10,
+            y0: 10,
+            x1: 18,
+            y1: 18,
+        })));
+
+        app.handle_menu_action(MenuAction::Redo);
+        assert_eq!(
+            (app.doc.width, app.doc.height),
+            (5, 5),
+            "redo must reapply the canvas resize to 5x5"
+        );
+
+        assert!(
+            app.selection.is_none(),
+            "a selection that no longer overlaps the resized document must be dropped, \
+             not left dangling with stale out-of-bounds coordinates"
+        );
+    }
+
+    #[test]
+    fn undo_of_a_shrinking_resize_keeps_a_still_overlapping_selection_clamped_and_paintable() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.confirm_canvas_resize(10, 10);
+        app.handle_menu_action(MenuAction::Undo);
+        assert_eq!((app.doc.width, app.doc.height), (20, 20));
+
+        // (5,5)-(15,15) は 10x10 に縮小すると右下半分がはみ出す。
+        app.selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
+
+        app.handle_menu_action(MenuAction::Redo);
+        assert_eq!((app.doc.width, app.doc.height), (10, 10));
+
+        let selection = app.selection.as_ref().expect(
+            "the selection still partially overlaps the new bounds, so it must be kept (clamped), \
+             not dropped",
+        );
+        assert_eq!(
+            selection.mask.bbox,
+            IRect {
+                x0: 5,
+                y0: 5,
+                x1: 10,
+                y1: 10
+            },
+            "the selection bbox must be clamped to the new, smaller document bounds"
+        );
+
+        // クランプ後の選択は実際にクリップとして機能し続けるはず: 選択内は
+        // 描け、選択外(文書内だが選択の外)は描けない(バグ版では選択の
+        // bbox が文書外を指したままになり、SelMask::contains が全画素
+        // false を返して 1 画素も描けなくなる)。
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::BLACK;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(7.0, 7.0), // 選択内
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(7.0, 7.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert_ne!(
+            app.doc.get_pixel(7, 7),
+            Some([255, 255, 255, 255]),
+            "painting inside the clamped selection must work"
+        );
+
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(1.0, 1.0), // 選択外(文書内)
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(1.0, 1.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert_eq!(
+            app.doc.get_pixel(1, 1),
+            Some([255, 255, 255, 255]),
+            "painting outside the selection must still be clipped"
+        );
+    }
+
+    // -- v4 レビューで発見・修正したバグ: キャンバス境界を跨ぐ楕円選択の
+    // ドラッグが「クランプ後の矩形に内接する縮んだ楕円」になってしまう ------
+
+    #[test]
+    fn ellipse_selection_dragged_past_the_canvas_edge_matches_the_unclamped_ellipse() {
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.tool = ToolKind::EllipseSelect;
+
+        // 外接矩形 (-50,-50)-(100,100) の楕円ドラッグ(キャンバス境界を
+        // 跨ぐ)。
+        app.select_down(pos2(-50.0, -50.0));
+        app.select_drag_move(pos2(100.0, 100.0), Modifiers::NONE);
+        app.select_up(pos2(100.0, 100.0));
+
+        let selection = app
+            .selection
+            .expect("a non-degenerate ellipse drag must produce a selection");
+
+        // 期待値: raster::fill_ellipse と同じ判定式(非クランプの外接矩形
+        // から楕円方程式を評価し、はみ出し分だけを画素単位で切り落とす)。
+        // バグ版は先に矩形を (0,0)-(100,100) にクランプしてから楕円を
+        // 内接させるため、半径 50 の正円(中心 (50,50))という別の図形に
+        // なってしまう。
+        let unclamped_rect = IRect {
+            x0: -50,
+            y0: -50,
+            x1: 100,
+            y1: 100,
+        };
+        let expected = select::ellipse_mask(unclamped_rect).clamp_to(100, 100);
+        assert_eq!(selection.mask.bbox, expected.bbox);
+        assert_eq!(selection.mask.mask, expected.mask);
+
+        // (25, 99) は正しい(非クランプ楕円: 中心(25,25), rx=ry=75)には
+        // 含まれるが、バグ版の縮んだ正円(中心(50,50), 半径50)には
+        // ((25-50)^2+(99-50)^2 = 3026 > 2500 なので)含まれない。
+        assert!(
+            selection.mask.contains(25, 99),
+            "the correct (build-then-clip) ellipse must include this pixel"
         );
     }
 }

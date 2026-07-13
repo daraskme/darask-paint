@@ -439,3 +439,103 @@ stamp_soft(mask, cx, cy, r, hardness): d≤r*h → 255、r*h<d≤r → smoothste
 6. Shift+U 巡回と Shift+[ ] は「Shift 付き単一キー」— egui の consume 順で素の U / [ ] より先に判定。
 7. 不透明度 <100 のストローク合成は毎フレーム「base からの再合成」— 直接レイヤーに blend を重ねると 1 ストローク内で濃度が累積してしまう(mask 方式を崩さない)。
 8. 移動ツールで浮動化した全レイヤーの Patch は全面矩形になる — 履歴メモリ会計(256MB)に正しく算入されること。
+
+---
+
+# v4 設計(マスク選択 / グラデーション / 色調補正 / 永続化 / 性能 / CI/CD)
+
+SPEC.md「v4 拡張仕様」(§21〜§29)に対応。実装順は **性能基盤 → 選択基盤 → その上の機能** とする(選択の一般化は全ツールに波及するため、先に性能の土台を固めてから 1 回だけ載せ替える)。
+
+## 16.1 履歴のタイル化と dirty のセグメント化(§28)
+
+- `HistoryOp::Patch { layer, rect, before, after }` を
+  `HistoryOp::Patch { layer, tiles: Vec<TilePatch> }`(`TilePatch { rect: IRect, before: Vec<u8>, after: Vec<u8> }`、rect は 256×256 タイル境界にアラインした実タイル矩形)に変更する。StrokeRecorder は既にタイル CoW なので、commit 時に bbox 合併へ潰していたのを**タイルのまま保持**するだけ。undo/redo・メモリ会計・before==after 抑制(タイル単位で判定)を全て追随。
+- `Document::dirty: Option<IRect>` を `dirty: DirtyRegion`(小さな `Vec<IRect>`、上限 32 個で溢れたら合併)に一般化。ストローク中はセグメント単位の矩形を積み、フレーム側は**各矩形ごとに** recomposite + テクスチャ部分更新する(高速ドラッグの対角 bbox 爆発を防ぐ)。
+- ホットループ: `recomposite` / `blend_over` 系 / flood fill の行処理を `chunks_exact(4)` ベースの行スライスに書き直し、`get_pixel/set_pixel`(毎回境界チェック+インデックス計算)をループ内から排除。release の時間計測テスト(緩い上限+回帰検知)を追加。
+- 浮動片ハンドルの再サンプルはフレームに 1 回(直近のポインタ位置だけ処理)。Esc キャンセルの復元はタイルごとに行スライスで一括コピー。
+
+## 16.2 起動フェーズ計測(§28)
+
+- `main()` 冒頭からのフェーズ時刻(設定読込完了 / フォント読込完了 / `App::new` 完了 / 初フレーム / 2 フレーム)を記録し、`DARASK_BENCH=1` のとき bench.txt を
+  `total_ms` の 1 行目(後方互換)+ `phase\tms` 行に拡張する。
+- 最適化は計測結果に従う。候補: 設定/フォント読込の直列化解消(フォント読込 ~10MB を `std::thread::spawn` で window 作成と並行にし `App::new` で join)、初期 composite の二重計算排除、`lto = "fat"` の実測比較(改善しなければ thin のまま)。**目標: 中央値 160ms、必須 300ms**。効果がない最適化は入れない(計測値を deviations で報告)。
+
+## 16.3 マスク選択(§21〜22)
+
+```rust
+pub struct SelMask { pub bbox: IRect, pub mask: Vec<u8> } // len = bbox.w*bbox.h、値は 0 か 255
+pub struct Selection { pub mask: SelMask }
+pub struct Floating {
+    pub pixels: Vec<u8>, pub w: u32, pub h: u32,
+    pub mask: Vec<u8>,            // pixels と同寸。非矩形浮動片の合成に使用
+    pub pos: Pos2, pub cut_from: Option<SelMask>, ...
+}
+```
+
+- 純関数群(全てテスト必須): `rect_mask` / `ellipse_mask`(スキャンライン)/ `polygon_mask`(偶奇規則スキャンライン、自由なげなわは軌跡+終点→始点で閉多角形)/ `flood_mask`(自動選択。既存 flood fill の visit を流用)/ `mask_boundary(SelMask) -> Vec<[Pos2;2]>`(選択枠描画用の境界線分。選択変更時のみ再計算しキャッシュ)/ `resample_mask_nearest`(ハンドル拡縮用。ピクセルは bilinear、マスクは nearest)。
+- **描画クリップ**: `ToolCtx` に `clip: Option<&SelMask>` を通し、ストローク合成(カバレッジ×clip)、図形・塗りつぶし・グラデーション・色調補正の書き込みで `mask==0` の画素をスキップ。塗りつぶしの連結探索は clip 外を壁として扱う。
+- 浮動化: mask の画素だけ複写し、元領域は mask の画素だけ透明化。確定合成も mask 経由。矩形選択は `rect_mask` を通すだけで既存挙動と一致させ、既存テストは同値性で担保。
+- なげなわ(多角形モード)は「クリックで頂点追加」のためドラッグではなくクリック列で状態を持つ(Esc=中止、Enter/ダブルクリック/始点近傍クリック=確定)。頂点列のプレビューは painter の線分。
+- 巡回系(Shift+M / Shift+L / Shift+G)は keymap.rs の Action に `CycleMarquee / CycleLasso / CycleFillTool` を追加し、ツールバーは「現在のバリアント」をアイコン表示(ツールチップに巡回キーを明記)。
+
+## 16.4 グラデーション(§23)
+
+- 純関数 `gradient_span(kind, p0, p1, p) -> t`(線形=射影クランプ、円形=距離/半径クランプ)+ 行スライスで `lerp(色0, 色1, t)` を書き込み。選択 clip・レイヤー clip 対応。ドラッグ中はライブプレビュー(不透明度スライダーと同じ「値が変わったフレームだけ」方式で、開始時スナップショット=StrokeRecorder の CoW タイルから再合成)。確定で 1 Patch。
+
+## 16.5 色調補正(§24)
+
+- 純関数 `adjust_brightness_contrast(&mut [u8], b, c)` / `adjust_hsl(&mut [u8], dh, ds, dl)` / `invert` / `grayscale`(Rec.709)。LUT(256 要素)を作ってから行スライス適用(HSL は画素ごと変換で可、4000×4000 < 150ms 目標)。
+- ライブプレビューモーダルの状態機械: 開始時に対象領域(選択 bbox∩レイヤー)のスナップショットを取り、スライダー値が変わったフレームだけ「スナップショット→補正→書き戻し→dirty」。OK で Patch 化、キャンセルでスナップショット書き戻し。モーダル中は他入力を遮断(既存モーダル基盤)。
+
+## 16.6 スムージング・ピクセルグリッド(§25)
+
+- `smoothed = prev + (raw - prev) * α`、α = 1.0 - strength*0.9(strength∈[0,1])。Up 時に残差を最終セグメントとして描き切る。純関数+テスト。
+- ピクセルグリッドは zoom ≥ 8.0 のとき、可視範囲の画像ピクセル境界に 1 物理 px の線(色は市松と区別できる薄グレー、アルファ 64)。可視範囲だけ描く(全画像分の線を作らない)。
+
+## 16.7 設定の永続化(§26)
+
+- 新規 `src/settings.rs`: `Settings` 構造体 + `parse(text) -> Settings`(不正行は無視)+ `serialize(&Settings) -> String` + 読み書き(`%APPDATA%\darask-paint\settings.txt`、`std::env::var_os("APPDATA")`)。形式は 1 行 1 項目の `キー\t値`。リスト(recent/palette)は `キー.0`〜 の連番キー。**パーサ・シリアライザは往復テスト必須**。
+- 読み込みは `main()` で 1 回(ウィンドウ初期寸法に必要)。保存は 終了時(close 確定後)+ recent 更新時。I/O 失敗は無視(トーストも不要、起動・終了を妨げない)。
+- ウィンドウ寸法の取得は終了時の `ctx.input(|i| i.viewport())` の inner_rect / maximized。
+
+## 16.8 CI/CD・アイコン・About(§29)
+
+- `.github/workflows/ci.yml`: `on: [push(main), pull_request]`、`runs-on: windows-latest`、`dtolnay/rust-toolchain@stable`(components: clippy, rustfmt)、`Swatinem/rust-cache@v2`、steps: fmt → clippy(`-D warnings`)→ build --release → test --release。別ジョブ `bench-smoke`(`continue-on-error: true`、DARASK_BENCH=1 で release exe 起動→bench.txt を表示)。
+- `.github/workflows/release.yml`: `on: push: tags: ['v*']`、ビルド → `Compress-Archive` で `darask-paint-v{ver}-windows-x64.zip` → `softprops/action-gh-release@v2` で Release 作成(`generate_release_notes: true`)。
+- **clippy 全解消**を CI 追加前に行う(`cargo clippy --all-targets -- -D warnings` をローカルでグリーンに。無意味な lint は根拠コメント付きで `#[allow]` 可、乱用禁止)。
+- アイコン: `examples/gen_icon.rs`(image crate の ico エンコーダ。Cargo.toml の image に `ico` feature 追加)で 16/24/32/48/64/128/256px を含む `assets/icon.ico` を生成しコミット。デザインは「角丸正方形+筆のストローク」程度のシンプルな図形(コードで描く)。`build.rs` + `[build-dependencies] winresource` で exe に埋め込み、eframe の `viewport.with_icon` にも同じ絵(生成関数を共有)を設定。
+- `Cargo.toml` version = "0.4.0"。ヘルプ > バージョン情報 モーダル(版数・リポジトリ URL 表示)。
+- CI の YAML はローカル検証できないため、**構文をシンプルに保ち**、push 後の初回実行結果で修正する前提(メインループ側=Fable が監視・修正指示)。
+
+## 16.9 v4 マイルストーン(各段階でビルド緑・警告 0・clippy 0(M6 以降)・テスト緑・ベンチ 300ms 以内)
+
+### V4-M1 — 性能基盤
+§16.1(タイル Patch・dirty セグメント化・ホットループ行スライス化・ハンドル再サンプル制限・Esc 復元一括化)+ §16.2(フェーズ計測と実測に基づく起動最適化)。受け入れ: 既存テスト全緑(API 追随)、§28 の表の各項目を実測して deviations で報告。
+
+### V4-M2 — マスク選択基盤
+§16.3 のデータ構造・純関数・矩形選択の載せ替え・浮動片のマスク対応・描画クリップ。UI 上の新ツールはまだ増やさない(矩形選択が従来どおり動くこと)。受け入れ: 既存の選択関連テストが同値で全緑+マスク純関数テスト。
+
+### V4-M3 — 選択ツール拡充
+楕円選択(Shift+M 巡回)・なげなわ自由/多角形(L / Shift+L)・自動選択(W、許容値)+ 各アイコン + keymap 追加(§27)。
+
+### V4-M4 — グラデーション・色調補正・スムージング・グリッド
+§16.4〜16.6 の全部 + Shift+G 巡回 + Ctrl+U / Ctrl+I / Ctrl+Shift+U + 画像メニュー拡張 + アイコン。
+
+### V4-M5 — 永続化・About
+§16.7 + 最近使ったファイル + ヘルプメニュー + ウィンドウ状態復元。受け入れ: 設定往復テスト、破損ファイルで既定値起動、ベンチ悪化なし(計測値報告)。
+
+### V4-M6 — CI/CD・アイコン・リリース準備
+§16.8 の全部(clippy 全解消 → CI/Release YAML → アイコン生成と埋め込み → version 0.4.0 → README に CI バッジとインストール節)。受け入れ: ローカルで fmt/clippy/build/test 全緑、YAML は自己レビュー、`git status` に生成物の取りこぼしがない(assets/icon.ico はコミット対象、bench.txt 等は除外のまま)。
+
+## 16.10 v4 の落とし穴
+
+1. マスク選択の載せ替えで**既存の矩形選択の挙動を 1 ビットも変えない**こと(既存テストを同値性の証拠として使う。テストの期待値を書き換える必要が出たら設計ミスを疑う)。
+2. 描画クリップは「選択が無いとき」のコストがゼロであること(Option が None なら従来コードパスと同一)。
+3. dirty のセグメント化で、同一フレーム内の重複矩形の recomposite 二重実行を許容する(重複排除の複雑化より単純さ優先。ただしタイル単位の部分テクスチャ更新が矩形ごとに走ることによる劣化がないか計測)。
+4. 色調補正のライブプレビューは**スナップショットから**毎回適用(スライダーを往復すると劣化する累積適用は禁止)。
+5. 設定読込・保存は絶対にパニックしない・ブロックしない(壊れた settings.txt、APPDATA 不在、書込禁止をテスト/防御)。
+6. clippy 解消で挙動を変えない(`too_many_arguments` 等の構造 lint は機械的リファクタのみ。判断に迷う lint は allow+根拠コメント)。
+7. winresource は Windows 以外では何もしないよう `build.rs` を組む(CI も windows のみなので実害はないが、コンパイルエラーの種を残さない)。
+8. GitHub Actions の windows ランナーはヘッドレスで GL ウィンドウ生成に失敗し得る — bench ジョブは必ず `continue-on-error`。CI 必須ジョブに GUI 起動を含めない。
+9. 楕円/多角形マスクの境界線分抽出は選択確定時のみ(毎フレーム再計算しない)。巨大選択(4000×4000 全選択)でも境界抽出 < 50ms。
+10. Shift+M/Shift+L/Shift+G の巡回はツールバーのアイコン・ツールチップ・オプションバーの整合(現在バリアントの表示)を忘れない。

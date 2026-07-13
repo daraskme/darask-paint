@@ -32,6 +32,7 @@ impl PenTool {
             opacity: ctx.opacity,
             pencil: ctx.pencil,
             erase: false,
+            smoothing: ctx.smoothing,
         }
     }
 
@@ -114,7 +115,9 @@ mod tests {
             hardness: 1.0,
             opacity: 1.0,
             pencil: false,
+            smoothing: 0.0,
             used_colors: used,
+            clip: None,
         }
     }
 

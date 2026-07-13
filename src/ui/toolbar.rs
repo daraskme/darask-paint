@@ -15,7 +15,7 @@
 use eframe::egui;
 
 use crate::keymap;
-use crate::tools::ToolKind;
+use crate::tools::{LassoMode, ToolKind};
 use crate::ui::icons;
 
 struct ToolButton {
@@ -53,6 +53,12 @@ const TOOLS: &[ToolButton] = &[
         name: "塗りつぶし",
         kind: ToolKind::Fill,
     },
+    // v4 §23: グラデーション(Shift+G で塗りつぶしと巡回する仲間なので、
+    // 塗りつぶしのすぐ後に置く)。
+    ToolButton {
+        name: "グラデーション",
+        kind: ToolKind::Gradient,
+    },
     ToolButton {
         name: "スポイト",
         kind: ToolKind::Picker,
@@ -65,8 +71,22 @@ const TOOLS: &[ToolButton] = &[
         kind: ToolKind::Text,
     },
     ToolButton {
-        name: "選択",
+        name: "矩形選択",
         kind: ToolKind::Select,
+    },
+    // v4 §22: 楕円選択・なげなわ・自動選択。矩形選択(Shift+M で巡回する
+    // 仲間)のすぐ後に置く。
+    ToolButton {
+        name: "楕円選択",
+        kind: ToolKind::EllipseSelect,
+    },
+    ToolButton {
+        name: "なげなわ",
+        kind: ToolKind::Lasso,
+    },
+    ToolButton {
+        name: "自動選択",
+        kind: ToolKind::MagicWand,
     },
     // v3 §18: 移動・ズーム。選択(浮動化の仲間)の直後、手のひら(表示操作の
     // 仲間)の後にそれぞれ加える。
@@ -90,8 +110,10 @@ const BUTTON_SIZE: f32 = 30.0;
 const ICON_MARGIN: f32 = 5.0;
 
 /// 現在のツール `current` を表示する。クリックされたツールがあれば返す
-/// (`ToolKind` はここでは書き換えない、上記コメント参照)。
-pub fn show(ui: &mut egui::Ui, current: ToolKind) -> Option<ToolKind> {
+/// (`ToolKind` はここでは書き換えない、上記コメント参照)。`lasso_mode` は
+/// なげなわのツールチップに現在のモード(自由/多角形)を出すためだけに使う
+/// (ARCHITECTURE.md §16.10-10: 「巡回系はツールバー…の整合を忘れない」)。
+pub fn show(ui: &mut egui::Ui, current: ToolKind, lasso_mode: LassoMode) -> Option<ToolKind> {
     let mut clicked = None;
     egui::Panel::left("tool_bar")
         .resizable(false)
@@ -101,8 +123,12 @@ pub fn show(ui: &mut egui::Ui, current: ToolKind) -> Option<ToolKind> {
                 for tool in TOOLS {
                     let selected = current == tool.kind;
                     let shortcut = keymap::tool_shortcut_label(tool.kind);
-                    let response = tool_button(ui, tool.kind, selected)
-                        .on_hover_text(format!("{} ({shortcut})", tool.name));
+                    let tooltip = if tool.kind == ToolKind::Lasso {
+                        format!("{}({}) ({shortcut})", tool.name, lasso_mode.label())
+                    } else {
+                        format!("{} ({shortcut})", tool.name)
+                    };
+                    let response = tool_button(ui, tool.kind, selected).on_hover_text(tooltip);
                     if response.clicked() {
                         clicked = Some(tool.kind);
                     }

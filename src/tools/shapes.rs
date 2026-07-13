@@ -105,7 +105,7 @@ impl ShapeTool {
                 ctx.history.begin_stroke(ctx.doc.active);
                 ctx.history.ensure_tiles_saved(ctx.doc, bounds);
                 let touched = {
-                    let mut surface = ctx.doc.active_surface_mut();
+                    let mut surface = ctx.doc.active_surface_mut(ctx.clip);
                     raster::stroke_segment(
                         &mut surface,
                         (drag.start.x, drag.start.y),
@@ -131,7 +131,7 @@ impl ShapeTool {
                 let (outline, fill) = shape_colors(ctx, drag.button, self.mode);
                 let mut touched: Option<IRect> = None;
                 {
-                    let mut surface = ctx.doc.active_surface_mut();
+                    let mut surface = ctx.doc.active_surface_mut(ctx.clip);
                     if let Some(fill_color) = fill {
                         let t = match self.kind {
                             ShapeKind::Rect => raster::fill_rect(&mut surface, rect, fill_color),
@@ -263,7 +263,9 @@ fn snap_angle_45(start: Pos2, current: Pos2) -> Pos2 {
     )
 }
 
-fn snap_square(start: Pos2, current: Pos2) -> Pos2 {
+/// v4 §22: 楕円選択・矩形選択(マリキー)の Shift ドラッグ拘束(正方形/正円)
+/// でも同じ計算を使うため `pub(crate)`(`app.rs::select_drag_move` 参照)。
+pub(crate) fn snap_square(start: Pos2, current: Pos2) -> Pos2 {
     let dx = current.x - start.x;
     let dy = current.y - start.y;
     let m = dx.abs().max(dy.abs());

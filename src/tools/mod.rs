@@ -31,12 +31,13 @@
 use eframe::egui::{self, Color32, Modifiers, PointerButton, Pos2};
 
 use crate::canvas_view::CanvasView;
-use crate::document::Document;
+use crate::document::{Document, SelMask};
 use crate::history::History;
 
 pub mod brush;
 pub mod eraser;
 pub mod fill;
+pub mod gradient;
 pub mod pen;
 pub mod picker;
 pub mod select;
@@ -70,6 +71,60 @@ pub enum ToolKind {
     /// 確定後は既存の `Floating` 機構(移動・ハンドル拡縮・Enter確定・
     /// Esc破棄)にそのまま乗る。
     Text,
+    /// v4 §22: 楕円選択(Shift+M で `Select`(矩形)と巡回)。`Tool` の実体は
+    /// 持たず、`Select` と全く同じ `Selection`/`Floating` 状態機械
+    /// (`app.rs::handle_select_event`)を共有する — 唯一の違いは新規選択の
+    /// ドラッグが確定する瞬間に矩形マスクではなく楕円マスクを作ること
+    /// (ARCHITECTURE.md §16.3)。SPEC §20 の `U`/`last_shape_tool` と同じ
+    /// 「巡回はするが挙動の大半を共有する」設計を、選択の「形」にも適用した
+    /// もの(`last_shape_tool`/`cycle_shape_tool` に対応する `last_marquee_
+    /// tool`/`cycle_marquee_tool` が `app.rs` にある)。
+    EllipseSelect,
+    /// v4 §22: なげなわ(L、Shift+L で自由↔多角形モード切替)。`Tool` の実体は
+    /// 持たず、モード(`app.rs::LassoMode`)に応じて軌跡(自由)またはクリック
+    /// で積んだ頂点列(多角形)から `tools::select::polygon_mask` で選択マスク
+    /// を作る。確定後は他の選択ツールと同じ `Selection` に合流する。
+    Lasso,
+    /// v4 §22: 自動選択(W)。クリック画素から許容値内の連結領域を
+    /// `raster::flood_mask` で選択する(塗りつぶしと同じ判定、アクティブ
+    /// レイヤー基準)。`Tool` の実体は持たない(ドラッグ状態を持たない
+    /// 1 ショットの操作、`tools/fill.rs` の塗りつぶしと同じ扱い)。
+    MagicWand,
+    /// v4 §23: グラデーション(G。Shift+G で `Fill` と巡回)。ドラッグで
+    /// 始点→終点、離して確定(1 undo 単位)。`tools/gradient.rs::GradientTool`
+    /// が実体を持つ(直線・矩形・楕円と同じ「独立したツール状態」の設計)。
+    Gradient,
+}
+
+/// v4 §22: なげなわの自由/多角形モード(Shift+L で切替)。`ToolKind::Lasso`
+/// 自体は 1 種類だが、動作モードは 2 つある(SPEC §22: 「自由: ドラッグの
+/// 軌跡を閉じてマスク化。多角形: クリックで頂点追加」)。`ToolKind` の並びの
+/// 隣に置くことで、キーマップ・ツールバー・オプションバーのどこからでも
+/// `crate::tools::LassoMode` として参照できるようにする(1 箇所だけに状態の
+/// 意味を持たせる、ARCHITECTURE.md §16.10-10 の「巡回系はツールバー/
+/// ツールチップ/オプションバーの整合を忘れない」ため)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LassoMode {
+    Freehand,
+    Polygon,
+}
+
+impl LassoMode {
+    /// Shift+L で切り替えた後の値(自由↔多角形)。
+    pub fn toggled(self) -> Self {
+        match self {
+            LassoMode::Freehand => LassoMode::Polygon,
+            LassoMode::Polygon => LassoMode::Freehand,
+        }
+    }
+
+    /// ツールチップ・オプションバー表示用の日本語ラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            LassoMode::Freehand => "自由",
+            LassoMode::Polygon => "多角形",
+        }
+    }
 }
 
 /// キャンバス上のポインタ入力(画像ピクセル座標系、ARCHITECTURE.md §4)。
@@ -119,6 +174,10 @@ pub struct ToolCtx<'a> {
     /// なしの2値スタンプになり、硬さは無視される。`tools/brush.rs` のみが
     /// 参照する。
     pub pencil: bool,
+    /// SPEC §25: ブラシ/消しゴム/鉛筆共通のスムージング(手ブレ補正)。
+    /// 0.0–1.0(UI は 0–100%、0=補正なし)。`tools/brush.rs` のみが参照する
+    /// (Shift+クリック直線連結には適用しない、SPEC §25)。
+    pub smoothing: f32,
     /// この呼び出しで実際に描画確定に使われた色(SPEC §5:
     /// 「描画確定時に使用色を先頭に追加」)。ツール側は確定時にここへ push する
     /// だけでよく、「最近使った色」リストへの反映(重複の先頭移動・上限8件)は
@@ -126,6 +185,14 @@ pub struct ToolCtx<'a> {
     /// 確定で 2 色使うツールは複数 push してよい(最後に push した色が
     /// 最終的にリストの先頭に来る)。
     pub used_colors: &'a mut Vec<Color32>,
+    /// v4 §16.3/§21: 描画クリップ。選択があるときだけ `Some`(app.rs が
+    /// `self.selection.as_ref().map(|s| &s.mask)` を渡す)。ツール側は
+    /// `ctx.doc.active_surface_mut(ctx.clip)` へそのまま渡すだけでよい —
+    /// `Surface::set_pixel`(raster.rs)が実際のクリップを行う単一の集約点
+    /// なので、選択が無いとき(`None`)のコストは追加の分岐 1 つだけ
+    /// (ARCHITECTURE.md §16.10-2)。塗りつぶしの連結探索(`raster::
+    /// flood_fill`)も同じ `Surface::clip` を「壁」として扱う。
+    pub clip: Option<&'a SelMask>,
 }
 
 pub trait Tool {

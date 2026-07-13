@@ -34,12 +34,39 @@ pub struct BrushParams {
     /// `true` なら消しゴム(カバレッジ×強さぶんアルファを減らす)、
     /// `false` ならブラシ(カバレッジ×不透明度で色を合成)。
     pub erase: bool,
+    /// SPEC §25: スムージング(手ブレ補正)。0.0–1.0(UI は 0–100%、
+    /// 0=補正なし)。Shift+クリック直線連結には適用しない
+    /// (`handle` の `Down` 分岐参照)。
+    pub smoothing: f32,
+}
+
+/// SPEC §25: スムージングの指数移動平均に使う重み `α`
+/// (ARCHITECTURE.md §16.6: 「α = 1.0 - strength*0.9」)。`strength` は
+/// 0.0–1.0(0=補正なし→α=1.0 で `raw` に即座に一致、1=最も強い補正→
+/// α=0.1)。純関数なのでテスト可能。
+pub fn smoothing_alpha(strength: f32) -> f32 {
+    1.0 - strength.clamp(0.0, 1.0) * 0.9
+}
+
+/// 1 フレームぶんのスムージング(指数移動平均、ARCHITECTURE.md §16.6)。
+/// `prev` は直前の平滑化済み位置、`raw` は今回受け取った生の入力位置。
+pub fn smooth_towards(prev: (f32, f32), raw: (f32, f32), strength: f32) -> (f32, f32) {
+    let alpha = smoothing_alpha(strength);
+    (
+        prev.0 + (raw.0 - prev.0) * alpha,
+        prev.1 + (raw.1 - prev.1) * alpha,
+    )
 }
 
 /// 進行中のストロークの状態。
 struct ActiveStroke {
     button: PointerButton,
+    /// 直近に受け取った生の入力位置(SPEC §25: Up 時の「最終点まで追いつく」
+    /// 処理や、確定後の Shift+クリック連結の起点に使う)。
     last: (f32, f32),
+    /// SPEC §25: スムージング後、実際にスタンプした最新位置。`smoothing`
+    /// が 0 なら常に `last` と一致する。
+    smoothed: (f32, f32),
     color: [u8; 4],
     /// これまでにこのストロークで触れた領域の外接矩形(ストローク終了時に
     /// マスクをクリアする範囲として使う)。
@@ -142,8 +169,15 @@ impl BrushEngine {
         // `ctx.doc`(Surface 経由でアクティブレイヤーのバッファを借用)と
         // `ctx.history`(タイル退避の読み取り)は ToolCtx の別フィールドなので
         // 同時に借用してよい(v2 の AA ペン実装と同じ分割借用のイディオム)。
-        let history = &*ctx.history;
-        let mut surface = ctx.doc.active_surface_mut();
+        //
+        // v4-M2 性能改善(ARCHITECTURE.md §16.1): 1 スタンプの画素ループ
+        // 全体で `OriginalPixelCursor` を 1 個だけ作って使い回す(画素ごとに
+        // `original_pixel` を呼ぶと `stroke.tiles` の `HashMap` を毎回
+        // 引き直すことになり、64px ブラシの高速ドラッグでホットパスの
+        // 支配的コストになっていた。`OriginalPixelCursor` のドキュメント
+        // 参照)。
+        let mut original_cursor = ctx.history.original_pixel_cursor();
+        let mut surface = ctx.doc.active_surface_mut(ctx.clip);
         for y in bounds.y0..bounds.y1 {
             for x in bounds.x0..bounds.x1 {
                 let coverage_here = if params.pencil {
@@ -159,8 +193,8 @@ impl BrushEngine {
                     *slot = coverage_here;
                 }
                 let coverage = *slot;
-                let original = history
-                    .original_pixel(x, y)
+                let original = original_cursor
+                    .get(x, y)
                     .or_else(|| surface.get_pixel(x, y))
                     .unwrap_or([0, 0, 0, 0]);
                 if params.erase {
@@ -182,7 +216,6 @@ impl BrushEngine {
                 }
             }
         }
-        drop(surface);
         ctx.doc.mark_dirty(bounds);
         *touched = Some(match touched {
             Some(t) => t.union(&bounds),
@@ -236,7 +269,9 @@ impl BrushEngine {
                 // SPEC §17: 「直前のストローク終点から Shift+クリック地点
                 // まで直線をブラシで引く」。直前の終点が無ければ(この
                 // ツールで初回のストローク)通常のスタンプにフォールバック
-                // する。
+                // する。SPEC §25: 「Shift+クリック直線連結には適用しない」
+                // ため、この経路はスムージングを一切経由しない(生の座標を
+                // そのまま使う)。
                 if mods.shift {
                     if let Some(prev) = self.last_end {
                         self.apply_segment(ctx, prev, (img.x, img.y), &params, color, &mut touched);
@@ -249,42 +284,68 @@ impl BrushEngine {
                 self.stroke = Some(ActiveStroke {
                     button,
                     last: (img.x, img.y),
+                    // SPEC §25: ストローク開始点は補正なし(即座にその位置
+                    // から描き始める。遅延はストローク進行中にのみ生じる)。
+                    smoothed: (img.x, img.y),
                     color,
                     touched,
                 });
                 None
             }
             ToolEvent::Drag { img, button, .. } => {
-                let Some(state) = self.stroke.as_ref() else {
-                    return None;
-                };
+                let state = self.stroke.as_ref()?;
                 if state.button != button {
                     return None;
                 }
-                let from = state.last;
+                let prev_smoothed = state.smoothed;
+                let raw = (img.x, img.y);
+                let new_smoothed = smooth_towards(prev_smoothed, raw, params.smoothing);
                 let color = state.color;
                 let mut touched = state.touched;
-                self.apply_segment(ctx, from, (img.x, img.y), &params, color, &mut touched);
+                self.apply_segment(
+                    ctx,
+                    prev_smoothed,
+                    new_smoothed,
+                    &params,
+                    color,
+                    &mut touched,
+                );
                 if let Some(state) = self.stroke.as_mut() {
-                    state.last = (img.x, img.y);
+                    state.last = raw;
+                    state.smoothed = new_smoothed;
                     state.touched = touched;
                 }
                 None
             }
             ToolEvent::Up { img, button } => {
-                let Some(state) = self.stroke.take() else {
-                    return None;
-                };
+                let state = self.stroke.take()?;
                 if state.button != button {
                     // 別ボタンの Up(通常は起きないが安全側に倒す): 状態を戻す。
                     self.stroke = Some(state);
                     return None;
                 }
+                // SPEC §25: 「ストローク終端で最終点まで追いつかせる」。
+                // スムージングで遅れていた平滑化済み位置から、実際の最終
+                // ポインタ位置まで最後のセグメントを描き切る(スムージング
+                // 無し(`smoothed == final_point`)なら無害な 0 長セグメント
+                // になるだけで、既存の挙動と完全に一致する)。
+                let final_point = (img.x, img.y);
+                let mut touched = state.touched;
+                if final_point != state.smoothed {
+                    self.apply_segment(
+                        ctx,
+                        state.smoothed,
+                        final_point,
+                        &params,
+                        state.color,
+                        &mut touched,
+                    );
+                }
                 ctx.history.commit_stroke(ctx.doc);
-                if let Some(bbox) = state.touched {
+                if let Some(bbox) = touched {
                     self.clear_mask_region(bbox);
                 }
-                self.last_end = Some((img.x, img.y));
+                self.last_end = Some(final_point);
                 Some(button)
             }
             ToolEvent::Hover { .. } => None,
@@ -295,9 +356,7 @@ impl BrushEngine {
     /// 確定する(ARCHITECTURE.md §6「1 ストローク = 1 undo 単位」を、
     /// ツール切替という中断経路でも守るため)。
     pub fn cancel(&mut self, ctx: &mut ToolCtx) -> Option<PointerButton> {
-        let Some(state) = self.stroke.take() else {
-            return None;
-        };
+        let state = self.stroke.take()?;
         ctx.history.commit_stroke(ctx.doc);
         if let Some(bbox) = state.touched {
             self.clear_mask_region(bbox);
@@ -328,7 +387,9 @@ mod tests {
             hardness: 1.0,
             opacity: 1.0,
             pencil: false,
+            smoothing: 0.0,
             used_colors: used,
+            clip: None,
         }
     }
 
@@ -339,7 +400,200 @@ mod tests {
             opacity,
             pencil,
             erase: false,
+            smoothing: 0.0,
         }
+    }
+
+    fn brush_params_with_smoothing(radius: f32, smoothing: f32) -> BrushParams {
+        BrushParams {
+            radius,
+            hardness: 1.0,
+            opacity: 1.0,
+            pencil: false,
+            erase: false,
+            smoothing,
+        }
+    }
+
+    // -- v4 §16.1/SPEC §28: ブラシ追従(4000×4000・64px ブラシの高速ドラッグ) --
+
+    #[test]
+    fn fast_drag_segment_on_a_large_document_terminates_quickly() {
+        // SPEC §28: 「ブラシ追従: 4000×4000・ブラシ64px の高速ドラッグで
+        // フレーム 16ms 以下(ドラッグを横断する巨大 dirty 矩形を作らない —
+        // セグメント単位の dirty 処理)」。V4-M1 で実装したのは括弧内の
+        // 「セグメント単位の dirty 処理」(`DirtyRegion`、このファイルでは
+        // `BrushEngine` が呼ぶ `Document::mark_dirty` がスタンプごとに
+        // セグメントを積むだけになった)であり、これにより 1 フレームの
+        // ドラッグ距離に関係なく recomposite/テクスチャ部分更新のコストは
+        // 実際に触れた面積に比例するようになった(以前は触れた領域の外接
+        // 矩形 1 個ぶんの再合成が走っていた)。
+        //
+        // v4-M1 の時点では、このテストが計測する `apply_stamp` 自体の画素
+        // ループ(カバレッジ計算 + `History::original_pixel` の CoW タイル
+        // 参照)が画素ごとに `stroke.tiles` の `HashMap` を引き直しており、
+        // リリースビルド実測で 1 フレームに画像座標で約 1400px 移動する
+        // 極端に速いドラッグ(64px ブラシ)が約 34ms、約 5400px(キャンバス
+        // 対角線相当)では約 123ms かかっていた(16ms 目標を超過)。
+        // v4-M2(ARCHITECTURE.md §16.1)で `History::original_pixel_cursor`
+        // (`OriginalPixelCursor`、1 スタンプの画素ループ全体で使い回すタイル
+        // 探索キャッシュ)を導入し、同じタイル内では `HashMap` を再探索
+        // しないようにした結果、リリースビルド実測で 1400px ドラッグは
+        // 約 24ms(-29%)、5400px 対角線ドラッグは約 95ms(-23%)まで改善
+        // した。ただし `HashMap` 探索自体を完全に取り除いても(検証用に
+        // 一時的に History 参照そのものを外して計測)1400px ドラッグは
+        // 約 23ms までしか縮まらなかったため、残るコストの大半は
+        // `stamp_soft_coverage` の距離計算や `blend_over` の除算といった
+        // 画素ごとの浮動小数点演算であり、`HashMap` 探索は当初の見立てほど
+        // 支配的ではなかった(この画素演算自体の最適化は本タスクの
+        // 診断・スコープ外のため今回は行わない、詳細は
+        // `history.rs::OriginalPixelCursor` のドキュメント参照)。
+        //
+        // `cargo test` はデバッグビルドのため、実際の 16ms 目標そのものでは
+        // なく緩い上限で回帰検知(無限ループ/O(n^2) 的な劣化がないこと)だけを
+        // 行う(raster.rs の flood_fill 4000x4000 テストと同じ方針)。
+        let mut doc = Document::new(4000, 4000, Background::White);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params(32.0, 0.8, 1.0, false);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(100.0, 100.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        let start = std::time::Instant::now();
+        engine.handle(
+            ToolEvent::Drag {
+                img: Pos2::new(1100.0, 1100.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        let elapsed = start.elapsed();
+        engine.handle(
+            ToolEvent::Up {
+                img: Pos2::new(1100.0, 1100.0),
+                button: PointerButton::Primary,
+            },
+            &mut c,
+            params,
+        );
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "a single fast-drag segment took suspiciously long (possible regression): {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn fast_drag_segment_across_the_canvas_diagonal_terminates_quickly() {
+        // 上のテストの「1400px」に加え、SPEC §28/deviations が言及する
+        // もう一つの実測シナリオ(4000×4000 キャンバス対角線相当、約5657px)
+        // の回帰テスト。release ビルド実測ではこちらが約 95ms
+        // (v4-M2 の `OriginalPixelCursor` 導入前は約 123ms)で、上の
+        // 1400px ケースより負荷が大きいぶん先に regression が見えやすい。
+        // `cargo test` はデバッグビルドのため、ここも緩い上限で回帰検知
+        // (無限ループ/O(n^2) 的な劣化がないこと)だけを行う。
+        let mut doc = Document::new(4000, 4000, Background::White);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params(32.0, 0.8, 1.0, false);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(0.0, 0.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        let start = std::time::Instant::now();
+        engine.handle(
+            ToolEvent::Drag {
+                img: Pos2::new(3999.0, 3999.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        let elapsed = start.elapsed();
+        engine.handle(
+            ToolEvent::Up {
+                img: Pos2::new(3999.0, 3999.0),
+                button: PointerButton::Primary,
+            },
+            &mut c,
+            params,
+        );
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "a single fast-drag segment across the canvas diagonal took suspiciously long \
+             (possible regression): {elapsed:?}"
+        );
+    }
+
+    // -- v4-M2: `apply_stamp` のタイル境界回帰テスト(ARCHITECTURE.md §16.1) --
+
+    #[test]
+    fn stamp_spanning_a_tile_boundary_blends_each_side_from_its_own_original_pixel() {
+        // `History::OriginalPixelCursor`(タイル探索キャッシュ)の回帰
+        // テスト: タイル境界(x=256)の両側で下地色が異なるドキュメントに、
+        // 境界をまたぐ 1 スタンプを置く。キャッシュがタイル座標を取り違えると
+        // 片側がもう片方のタイルの退避値から誤って合成されてしまう。
+        let mut doc = Document::new(300, 60, Background::Transparent);
+        for x in 0..300i32 {
+            let base = if x < 256 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            for y in 0..60i32 {
+                doc.set_pixel(x, y, base);
+            }
+        }
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        // 半径 40・硬さ100%: 中心から26px離れた場所でもカバレッジは
+        // まだ内側(255)なので、期待値を厳密に計算できる。
+        let params = brush_params(40.0, 1.0, 0.5, false);
+        let green = [0, 255, 0, 255];
+        let mut touched = None;
+
+        history.begin_stroke(doc.active);
+        {
+            let mut c = ctx(&mut doc, &mut history, &mut used);
+            engine.apply_stamp(&mut c, 256.0, 30.0, &params, green, &mut touched);
+        }
+
+        let left = doc.get_pixel(230, 30).unwrap();
+        let right = doc.get_pixel(282, 30).unwrap();
+        let expected_left = raster::blend_over([255, 0, 0, 255], [0, 255, 0, 128]);
+        let expected_right = raster::blend_over([0, 0, 255, 255], [0, 255, 0, 128]);
+        assert_eq!(
+            left, expected_left,
+            "left of the tile boundary must blend from the red base, \
+             not the other tile's cached snapshot"
+        );
+        assert_eq!(
+            right, expected_right,
+            "right of the tile boundary must blend from the blue base, \
+             not the other tile's cached snapshot"
+        );
     }
 
     #[test]
@@ -562,6 +816,7 @@ mod tests {
             opacity: 0.5, // 「強さ」50%。
             pencil: false,
             erase: true,
+            smoothing: 0.0,
         };
 
         let mut c = ctx(&mut doc, &mut history, &mut used);
@@ -618,6 +873,7 @@ mod tests {
             opacity: 1.0,
             pencil: false,
             erase: true,
+            smoothing: 0.0,
         };
 
         let mut c = ctx(&mut doc, &mut history, &mut used);
@@ -812,6 +1068,64 @@ mod tests {
         assert_ne!(doc.get_pixel(10, 10).unwrap()[3], 0);
     }
 
+    // -- v4 §16.3/§21: 描画クリップ(選択範囲内にのみ効く) ---------------------
+
+    #[test]
+    fn stroke_is_clipped_to_the_selection_mask() {
+        use crate::document::SelMask;
+
+        let mut doc = Document::new(20, 20, Background::White);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params(6.0, 1.0, 1.0, false);
+
+        // 左半分だけ選択されたクリップマスク。
+        let clip = SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 10,
+                y1: 20,
+            },
+            mask: vec![255u8; 10 * 20],
+        };
+
+        {
+            let mut c = ctx(&mut doc, &mut history, &mut used);
+            c.clip = Some(&clip);
+            // ストローク中心をクリップ境界(x=10)にまたがせる。
+            engine.handle(
+                ToolEvent::Down {
+                    img: Pos2::new(10.0, 10.0),
+                    button: PointerButton::Primary,
+                    mods: Modifiers::NONE,
+                },
+                &mut c,
+                params,
+            );
+            engine.handle(
+                ToolEvent::Up {
+                    img: Pos2::new(10.0, 10.0),
+                    button: PointerButton::Primary,
+                },
+                &mut c,
+                params,
+            );
+        }
+
+        assert_ne!(
+            doc.get_pixel(6, 10),
+            Some([255, 255, 255, 255]),
+            "inside the clip must be painted"
+        );
+        assert_eq!(
+            doc.get_pixel(14, 10),
+            Some([255, 255, 255, 255]),
+            "outside the clip must remain untouched even though it's within the brush radius"
+        );
+    }
+
     #[test]
     fn cancel_commits_open_stroke_and_records_last_end() {
         let mut doc = Document::new(20, 20, Background::White);
@@ -836,5 +1150,197 @@ mod tests {
         assert!(!c.history.has_open_stroke());
         assert!(c.history.can_undo());
         assert_eq!(engine.last_end, Some((5.0, 5.0)));
+    }
+
+    // -- SPEC §25: スムージング(手ブレ補正) -----------------------------------
+
+    #[test]
+    fn smoothing_alpha_is_one_at_zero_strength_and_point_one_at_full_strength() {
+        assert_eq!(smoothing_alpha(0.0), 1.0);
+        assert!((smoothing_alpha(1.0) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smoothing_alpha_clamps_out_of_range_strength() {
+        assert_eq!(smoothing_alpha(-5.0), smoothing_alpha(0.0));
+        assert_eq!(smoothing_alpha(5.0), smoothing_alpha(1.0));
+    }
+
+    #[test]
+    fn smooth_towards_zero_strength_jumps_directly_to_raw() {
+        let out = smooth_towards((0.0, 0.0), (10.0, 20.0), 0.0);
+        assert_eq!(out, (10.0, 20.0));
+    }
+
+    #[test]
+    fn smooth_towards_full_strength_moves_only_a_tenth_of_the_way() {
+        let out = smooth_towards((0.0, 0.0), (10.0, 0.0), 1.0);
+        assert!((out.0 - 1.0).abs() < 1e-5, "expected ~1.0, got {}", out.0);
+    }
+
+    #[test]
+    fn dragging_with_smoothing_lags_behind_the_raw_pointer_position() {
+        // スムージング有りだと、平滑化済み位置は生の入力より手前で止まる
+        // (ARCHITECTURE.md §16.6 の EMA の性質どおり)。
+        let mut doc = Document::new(60, 20, Background::Transparent);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params_with_smoothing(3.0, 0.9);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(0.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Drag {
+                img: Pos2::new(50.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+
+        // 大きな強さ(0.9)の EMA は 1 フレームで生の移動量のごく一部にしか
+        // 追いつかないため、遠く離れた終点(x=50 付近)はまだ塗られていない
+        // はず(手前で止まっている)。
+        assert_eq!(doc.get_pixel(48, 10).unwrap()[3], 0);
+    }
+
+    #[test]
+    fn releasing_catches_up_to_the_final_pointer_position_even_with_smoothing() {
+        // SPEC §25: 「ストローク終端で最終点まで追いつかせる」。
+        let mut doc = Document::new(60, 20, Background::Transparent);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params_with_smoothing(3.0, 0.9);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(0.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Drag {
+                img: Pos2::new(50.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Up {
+                img: Pos2::new(50.0, 10.0),
+                button: PointerButton::Primary,
+            },
+            &mut c,
+            params,
+        );
+
+        assert_ne!(
+            doc.get_pixel(49, 10).unwrap()[3],
+            0,
+            "Up must paint through to the final raw pointer position despite smoothing lag"
+        );
+    }
+
+    #[test]
+    fn shift_click_line_connect_ignores_smoothing() {
+        // SPEC §25: 「Shift+クリック直線連結には適用しない」。強いスムージング
+        // 設定下でも、Shift+クリックは即座に直線で終点まで届くはず。
+        let mut doc = Document::new(60, 10, Background::Transparent);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params_with_smoothing(3.0, 1.0);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(5.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Up {
+                img: Pos2::new(5.0, 5.0),
+                button: PointerButton::Primary,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(55.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::SHIFT,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Up {
+                img: Pos2::new(55.0, 5.0),
+                button: PointerButton::Primary,
+            },
+            &mut c,
+            params,
+        );
+
+        assert_ne!(
+            doc.get_pixel(30, 5).unwrap()[3],
+            0,
+            "shift+click must connect a full straight line even with strong smoothing"
+        );
+    }
+
+    #[test]
+    fn zero_smoothing_behaves_exactly_like_before_the_feature_existed() {
+        // strength=0 は α=1.0 なので、平滑化済み位置は常に生の入力に一致する
+        // (回帰なし)。
+        let mut doc = Document::new(60, 20, Background::Transparent);
+        let mut history = History::new();
+        let mut used = Vec::new();
+        let mut engine = BrushEngine::new();
+        let params = brush_params(3.0, 1.0, 1.0, false);
+
+        let mut c = ctx(&mut doc, &mut history, &mut used);
+        engine.handle(
+            ToolEvent::Down {
+                img: Pos2::new(0.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+        engine.handle(
+            ToolEvent::Drag {
+                img: Pos2::new(50.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            &mut c,
+            params,
+        );
+
+        assert_ne!(doc.get_pixel(49, 10).unwrap()[3], 0);
     }
 }

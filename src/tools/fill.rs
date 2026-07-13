@@ -63,7 +63,7 @@ impl Tool for FillTool {
         let height = ctx.doc.height;
         let history = &mut *ctx.history;
         let touched = {
-            let mut surf = ctx.doc.active_surface_mut();
+            let mut surf = ctx.doc.active_surface_mut(ctx.clip);
             raster::flood_fill(&mut surf, x, y, color, self.tolerance, |s, rect| {
                 history.ensure_tiles_saved_buf(width, height, s.as_slice(), rect);
             })
@@ -71,12 +71,18 @@ impl Tool for FillTool {
         ctx.doc.mark_dirty(touched);
         ctx.history.commit_stroke(ctx.doc);
 
-        let used = if button == PointerButton::Secondary {
-            ctx.secondary
-        } else {
-            ctx.primary
-        };
-        ctx.used_colors.push(used);
+        // v4 §16.3: 選択(clip)の外をクリックした場合、塗りつぶしの連結探索が
+        // 開始点自身で止まり `touched` が空になる(raster::flood_fill 参照)。
+        // 何も塗っていないのに「最近使った色」へ登録してしまわないよう、
+        // 実際に触れたときだけ push する。
+        if !touched.is_empty() {
+            let used = if button == PointerButton::Secondary {
+                ctx.secondary
+            } else {
+                ctx.primary
+            };
+            ctx.used_colors.push(used);
+        }
     }
 
     fn draw_preview(

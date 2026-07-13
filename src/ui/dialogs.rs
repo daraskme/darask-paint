@@ -157,6 +157,80 @@ pub fn show_jpeg_quality(ctx: &egui::Context, quality: &mut u8) -> DialogOutcome
     outcome
 }
 
+/// SPEC §24: 「明るさ・コントラスト…」(各 -100〜+100、ライブプレビュー)。
+/// 戻り値の `bool` は「このフレームでスライダーの値が変わったか」
+/// (ARCHITECTURE.md §14.9-8 と同じ「値が変わったフレームだけ再適用」方式。
+/// 呼び出し側はこれが `true` のときだけ `app.rs::reapply_tone_preview` を呼ぶ)。
+pub fn show_brightness_contrast(
+    ctx: &egui::Context,
+    brightness: &mut i32,
+    contrast: &mut i32,
+) -> (DialogOutcome, bool) {
+    let mut outcome = DialogOutcome::Pending;
+    let mut changed = false;
+    let modal =
+        egui::Modal::new(egui::Id::new("darask_dialog_brightness_contrast")).show(ctx, |ui| {
+            ui.heading("明るさ・コントラスト");
+            ui.horizontal(|ui| {
+                ui.label("明るさ:");
+                if ui.add(egui::Slider::new(brightness, -100..=100)).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("コントラスト:");
+                if ui.add(egui::Slider::new(contrast, -100..=100)).changed() {
+                    changed = true;
+                }
+            });
+            ui.separator();
+            confirm_buttons(ui, &mut outcome);
+        });
+    if modal.should_close() && outcome == DialogOutcome::Pending {
+        outcome = DialogOutcome::Cancelled;
+    }
+    (outcome, changed)
+}
+
+/// SPEC §24: 「色相・彩度・明度…」(色相 -180〜+180、彩度/明度 -100〜+100、
+/// ライブプレビュー)。戻り値は `show_brightness_contrast` と同じ規則。
+pub fn show_hue_saturation(
+    ctx: &egui::Context,
+    hue: &mut i32,
+    saturation: &mut i32,
+    lightness: &mut i32,
+) -> (DialogOutcome, bool) {
+    let mut outcome = DialogOutcome::Pending;
+    let mut changed = false;
+    let modal = egui::Modal::new(egui::Id::new("darask_dialog_hue_saturation")).show(ctx, |ui| {
+        ui.heading("色相・彩度・明度");
+        ui.horizontal(|ui| {
+            ui.label("色相:");
+            if ui.add(egui::Slider::new(hue, -180..=180)).changed() {
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("彩度:");
+            if ui.add(egui::Slider::new(saturation, -100..=100)).changed() {
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("明度:");
+            if ui.add(egui::Slider::new(lightness, -100..=100)).changed() {
+                changed = true;
+            }
+        });
+        ui.separator();
+        confirm_buttons(ui, &mut outcome);
+    });
+    if modal.should_close() && outcome == DialogOutcome::Pending {
+        outcome = DialogOutcome::Cancelled;
+    }
+    (outcome, changed)
+}
+
 /// 未保存変更ガード(SPEC §8: 「保存しますか?」保存/破棄/キャンセル)。
 /// `doc_label` はタイトルバーと同じ「ファイル名」表記(無題なら「無題」)。
 pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutcome {
@@ -179,6 +253,28 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
     });
     if modal.should_close() && outcome == ConfirmOutcome::Pending {
         outcome = ConfirmOutcome::Cancel;
+    }
+    outcome
+}
+
+/// v4 §26: 「ヘルプ > バージョン情報」。版数・リポジトリ URL を表示するだけの
+/// 小モーダル(閉じるだけなので `DialogOutcome::Cancelled` は使わず、
+/// `Confirmed` 1 本で「閉じた」を表す)。
+pub fn show_about(ctx: &egui::Context, version: &str, repository: &str) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Pending;
+    let modal = egui::Modal::new(egui::Id::new("darask_dialog_about")).show(ctx, |ui| {
+        ui.heading("Darask Paint");
+        ui.label(format!("バージョン: {version}"));
+        ui.hyperlink_to(repository, repository);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("閉じる").clicked() {
+                outcome = DialogOutcome::Confirmed;
+            }
+        });
+    });
+    if modal.should_close() && outcome == DialogOutcome::Pending {
+        outcome = DialogOutcome::Confirmed;
     }
     outcome
 }

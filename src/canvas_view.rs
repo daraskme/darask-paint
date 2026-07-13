@@ -29,6 +29,9 @@ const LINE_SCROLL_SPEED: f32 = 40.0;
 /// 市松模様の 1 マスの論理ポイントサイズ。
 const CHECKER_CELL: f32 = 16.0;
 
+/// SPEC §25: 「ズーム 800% 以上のとき画像ピクセル境界に薄いグリッド線」。
+const PIXEL_GRID_MIN_ZOOM: f32 = 8.0;
+
 // ---------------------------------------------------------------------------
 // 座標変換(ARCHITECTURE.md §2、egui::Context 非依存の純関数・テスト対象)
 // ---------------------------------------------------------------------------
@@ -284,12 +287,56 @@ impl CanvasView {
     }
 
     /// 選択枠(点線、ARCHITECTURE.md §7: アニメーションさせない)を画像座標の
-    /// 矩形から描く。
+    /// 矩形から描く(ドラッグ中の新規選択プレビュー・浮動片の外周専用。
+    /// 確定済みの選択自体は `draw_selection_mask_outline` を使う、SPEC §21)。
     pub fn draw_selection_outline(&self, painter: &egui::Painter, rect_img: IRect) {
         if rect_img.is_empty() {
             return;
         }
         draw_dashed_rect(painter, self.img_rect_to_screen(rect_img));
+    }
+
+    /// 選択枠(v4 §16.3/SPEC §21: マスク境界線)を画像座標の線分群から描く。
+    /// `segments` は `select::mask_boundary` が選択確定時に 1 回だけ計算した
+    /// もの(`app.rs::Selection::boundary`)を渡す想定 — ここでは画像座標→
+    /// スクリーン座標への変換と破線描画だけを毎フレーム行う(矩形選択なら
+    /// ちょうど 4 本になり、従来の `draw_dashed_rect` と見た目が一致する)。
+    pub fn draw_selection_mask_outline(&self, painter: &egui::Painter, segments: &[[Pos2; 2]]) {
+        for [a, b] in segments {
+            let a = self.img_to_screen_pos(*a);
+            let b = self.img_to_screen_pos(*b);
+            draw_dashed_segment(
+                painter,
+                a,
+                b,
+                SELECTION_DASH,
+                SELECTION_GAP,
+                SELECTION_COLOR,
+            );
+        }
+    }
+
+    /// v4 §22: なげなわの進行中の軌跡/頂点列を描く(自由: ドラッグ中の
+    /// 軌跡、多角形: クリックで積んだ頂点列)。閉じていない点列をそのまま
+    /// 線分で結ぶだけで、選択枠と同じ破線・色を使う(確定後の見た目
+    /// (`draw_selection_mask_outline`)と地続きにするため)。点が 2 未満なら
+    /// 何も描かない。
+    pub fn draw_lasso_preview(&self, painter: &egui::Painter, points_img: &[Pos2]) {
+        if points_img.len() < 2 {
+            return;
+        }
+        for w in points_img.windows(2) {
+            let a = self.img_to_screen_pos(w[0]);
+            let b = self.img_to_screen_pos(w[1]);
+            draw_dashed_segment(
+                painter,
+                a,
+                b,
+                SELECTION_DASH,
+                SELECTION_GAP,
+                SELECTION_COLOR,
+            );
+        }
     }
 
     /// 選択矩形・浮動片の外周に 8 個のスケールハンドルを描く(SPEC §16、
@@ -308,6 +355,52 @@ impl CanvasView {
                 egui::Stroke::new(1.0, Color32::from_rgb(30, 30, 30)),
                 egui::StrokeKind::Inside,
             );
+        }
+    }
+
+    /// SPEC §25: 「ピクセルグリッド…ズーム 800% 以上のとき画像ピクセル境界に
+    /// 薄いグリッド線を描く」。可視範囲の画像ピクセル境界だけを描く
+    /// (ARCHITECTURE.md §16.6: 「可視範囲だけを描く(全画像分の線を作らない)」)。
+    /// `app.rs` が `self.show_pixel_grid` を見てからこれを呼ぶ。
+    pub fn draw_pixel_grid(&self, painter: &egui::Painter, doc: &Document) {
+        if self.zoom < PIXEL_GRID_MIN_ZOOM || doc.width == 0 || doc.height == 0 {
+            return;
+        }
+        let Some(image_rect) = self.image_screen_rect(doc, self.last_ppp) else {
+            return;
+        };
+        let visible = image_rect.intersect(self.viewport);
+        if visible.width() <= 0.0 || visible.height() <= 0.0 {
+            return;
+        }
+
+        let top_left_img = screen_to_img(
+            visible.min,
+            self.viewport.min,
+            self.pan,
+            self.zoom,
+            self.last_ppp,
+        );
+        let bottom_right_img = screen_to_img(
+            visible.max,
+            self.viewport.min,
+            self.pan,
+            self.zoom,
+            self.last_ppp,
+        );
+        let x0 = (top_left_img.x.floor() as i32).max(0);
+        let y0 = (top_left_img.y.floor() as i32).max(0);
+        let x1 = (bottom_right_img.x.ceil() as i32).min(doc.width as i32);
+        let y1 = (bottom_right_img.y.ceil() as i32).min(doc.height as i32);
+
+        let stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 64));
+        for x in x0..=x1 {
+            let sx = self.img_to_screen_pos(pos2(x as f32, 0.0)).x;
+            painter.line_segment([pos2(sx, visible.min.y), pos2(sx, visible.max.y)], stroke);
+        }
+        for y in y0..=y1 {
+            let sy = self.img_to_screen_pos(pos2(0.0, y as f32)).y;
+            painter.line_segment([pos2(visible.min.x, sy), pos2(visible.max.x, sy)], stroke);
         }
     }
 
@@ -421,16 +514,27 @@ impl CanvasView {
         if doc.width == 0 || doc.height == 0 {
             self.texture = None;
             self.texture_size = (doc.width, doc.height);
-            doc.dirty = None;
+            doc.dirty.clear();
             return;
         }
 
         let size = (doc.width, doc.height);
         if self.texture.is_none() || self.texture_size != size {
-            // v2 §14.1: 全面再アップロードは新規/開く/サイズ変更時のみ。この
-            // 分岐でだけ合成を全面再計算する(`composite` が正しいサイズ・
-            // 内容であることをここで保証する)。
-            doc.recomposite_full();
+            // v2 §14.1: 全面再アップロードは新規/開く/サイズ変更時のみ。
+            //
+            // v4 §16.2(起動フェーズ最適化の候補「初期 composite の二重計算
+            // 排除」): `doc.dirty` が空なら `composite` は既に最新
+            // (`Document::new`/`from_layers` が構築時に全面合成済み、または
+            // 直前の編集がここへ来る前に `dirty` を消費し切っている)ので、
+            // ここでの全面再合成は不要。サイズ変更・レイヤー構造変更の直後は
+            // 必ず `mark_all_dirty` 済み(`dirty` が非空)なので、その場合は
+            // 従来どおり全面合成してから使う(`composite` バッファ自体は
+            // 変更操作の時点でサイズだけ作り直され、中身はまだ古い/ゼロの
+            // ままであるため)。
+            if !doc.dirty.is_empty() {
+                doc.recomposite_full();
+            }
+            doc.dirty.clear();
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [doc.width as usize, doc.height as usize],
                 &doc.composite,
@@ -442,22 +546,25 @@ impl CanvasView {
                 }
             }
             self.texture_size = size;
-            doc.dirty = None;
             return;
         }
 
-        if let Some(dirty) = doc.dirty.take() {
-            let rect = dirty.clamp_to(doc.width, doc.height);
-            if !rect.is_empty() {
-                // v2 §14.1: 「毎フレーム: dirty があれば recomposite(rect) →
-                // その rect をテクスチャ部分更新」。ストローク中に何度も
-                // raster 関数を呼んでも、合成はフレームごとに 1 回だけ
-                // (蓄積された dirty 矩形ぶん)で済む。
-                doc.recomposite(rect);
-                let sub = extract_sub_image(doc, rect);
-                if let Some(tex) = &mut self.texture {
-                    tex.set_partial([rect.x0 as usize, rect.y0 as usize], sub, texture_options());
-                }
+        // v4 §16.1: 「毎フレーム: dirty があれば各セグメントごとに
+        // recomposite → テクスチャ部分更新」。高速ドラッグでフレーム内に
+        // 複数箇所へスタンプしても、セグメントごとに実際に触れた面積だけを
+        // 処理する(セグメント間の触れていない領域を巻き込む巨大矩形を
+        // 作らない、SPEC §28)。同一フレーム内で重複する矩形があっても
+        // 二重に recomposite することは許容する(ARCHITECTURE.md §16.10-3:
+        // 「重複排除の複雑化より単純さ優先」)。
+        for rect in doc.dirty.take() {
+            let rect = rect.clamp_to(doc.width, doc.height);
+            if rect.is_empty() {
+                continue;
+            }
+            doc.recomposite(rect);
+            let sub = extract_sub_image(doc, rect);
+            if let Some(tex) = &mut self.texture {
+                tex.set_partial([rect.x0 as usize, rect.y0 as usize], sub, texture_options());
             }
         }
     }
@@ -733,12 +840,16 @@ fn draw_checkerboard(painter: &egui::Painter, rect: Rect) {
     }
 }
 
+/// 選択枠の点線の見た目(`draw_dashed_rect`/`draw_selection_mask_outline`
+/// 共通)。v4 §16.3 でマスク境界線描画に切り出したときに、矩形選択の見た目を
+/// 変えないようそのまま流用する。
+const SELECTION_DASH: f32 = 6.0;
+const SELECTION_GAP: f32 = 4.0;
+const SELECTION_COLOR: Color32 = Color32::from_rgb(30, 30, 30);
+
 /// 選択枠の点線(ARCHITECTURE.md §7:「点線はアニメーションさせない」ため、
 /// 位相は常にエッジの始点からの固定オフセットで、時刻に依存しない)。
 fn draw_dashed_rect(painter: &egui::Painter, rect: Rect) {
-    const DASH: f32 = 6.0;
-    const GAP: f32 = 4.0;
-    const COLOR: Color32 = Color32::from_rgb(30, 30, 30);
     let corners = [
         rect.left_top(),
         rect.right_top(),
@@ -747,7 +858,14 @@ fn draw_dashed_rect(painter: &egui::Painter, rect: Rect) {
         rect.left_top(),
     ];
     for w in corners.windows(2) {
-        draw_dashed_segment(painter, w[0], w[1], DASH, GAP, COLOR);
+        draw_dashed_segment(
+            painter,
+            w[0],
+            w[1],
+            SELECTION_DASH,
+            SELECTION_GAP,
+            SELECTION_COLOR,
+        );
     }
 }
 

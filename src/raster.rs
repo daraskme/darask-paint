@@ -17,7 +17,7 @@
 //! ピクセルアクセスは常に `Surface::get_pixel`/`set_pixel` 経由で行い、
 //! 境界外書き込みでパニックしないという方針(CLAUDE.md 鉄則)を守る。
 
-use crate::document::IRect;
+use crate::document::{IRect, SelMask};
 
 /// v2 §14.1: raster.rs が操作する対象。呼び出し側(tools/*)がアクティブ
 /// レイヤーのピクセルバッファをこれに包んで渡す。`Document`/`Layer` を
@@ -26,10 +26,19 @@ pub struct Surface<'a> {
     pub width: u32,
     pub height: u32,
     pub pixels: &'a mut [u8],
+    /// v4 §16.3/§21(ARCHITECTURE.md): 描画クリップ。選択があるときだけ
+    /// `Some` になる。`set_pixel` だけがこれを見るので、`stamp_round` /
+    /// `stroke_segment` / `fill_rect` / `fill_ellipse` / 枠線描画など
+    /// `set_pixel` 経由で書くすべての関数が、この 1 箇所を変えるだけで
+    /// 自動的にクリップに従う。`None` なら従来どおり(ARCHITECTURE.md
+    /// §16.10-2: 「選択が無いときのコストがゼロであること」)。
+    pub clip: Option<&'a SelMask>,
 }
 
 impl<'a> Surface<'a> {
     /// `(x, y)` のピクセル値を読む。範囲外なら `None`(パニックしない)。
+    /// クリップは見ない(ブラシの「元ピクセル」参照など、書き込みを伴わない
+    /// 読み取りは常にクリップの影響を受けない)。
     pub fn get_pixel(&self, x: i32, y: i32) -> Option<[u8; 4]> {
         if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
             return None;
@@ -40,10 +49,16 @@ impl<'a> Surface<'a> {
             .map(|s| [s[0], s[1], s[2], s[3]])
     }
 
-    /// `(x, y)` にピクセル値を書く。範囲外なら何もしない(パニックしない)。
+    /// `(x, y)` にピクセル値を書く。範囲外、または `clip` があってその画素が
+    /// 選択されていなければ何もしない(パニックしない)。
     pub fn set_pixel(&mut self, x: i32, y: i32, color: [u8; 4]) {
         if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
             return;
+        }
+        if let Some(clip) = self.clip {
+            if !clip.contains(x, y) {
+                return;
+            }
         }
         let idx = (y as usize * self.width as usize + x as usize) * 4;
         if let Some(slice) = self.pixels.get_mut(idx..idx + 4) {
@@ -471,19 +486,26 @@ pub fn flood_fill(
 
     let mut visited = vec![false; w as usize * h as usize];
     let idx = |x: i32, y: i32| y as usize * w as usize + x as usize;
+    // v4 §16.3/§21(ARCHITECTURE.md): 「塗りつぶしの連結探索は clip 外を
+    // 壁として扱う」。クリップ外の画素は `is_open` が常に偽を返すことで、
+    // 探索自体がそこを越えて広がらない(結果として書き込みも自然に
+    // クリップされる。開始点自身がクリップ外なら、下の `bounds` 初期化を
+    // `Option` にしてあるおかげで何も塗らず touched も空になる)。
     let is_open = |surface: &Surface, visited: &[bool], x: i32, y: i32| {
         !visited[idx(x, y)]
+            && surface.clip.is_none_or(|clip| clip.contains(x, y))
             && surface
                 .get_pixel(x, y)
                 .is_some_and(|p| color_within_tolerance(p, target, tolerance))
     };
 
-    let mut bounds = IRect {
-        x0: x,
-        y0: y,
-        x1: x + 1,
-        y1: y + 1,
-    };
+    // v4 §16.3: 開始点自身がクリップで塞がれている(=一度も `is_open` が
+    // 真にならない)場合に touched が非空(1x1)を返してしまわないよう、
+    // 実際に何か塗った時点で初めて値が入る `Option` にした(以前は
+    // `(x, y, x+1, y+1)` で事前に種を蒔いてから union していたが、
+    // クリップが無ければ最初のスパンに必ず開始点自身が含まれるため、
+    // この変更は既存の(クリップ無し)挙動には影響しない)。
+    let mut bounds: Option<IRect> = None;
     let mut stack = vec![(x, y)];
 
     while let Some((sx, sy)) = stack.pop() {
@@ -493,7 +515,7 @@ pub fn flood_fill(
             continue;
         }
         let mut xl = sx;
-        while xl - 1 >= 0 && is_open(surface, &visited, xl - 1, sy) {
+        while xl > 0 && is_open(surface, &visited, xl - 1, sy) {
             xl -= 1;
         }
         let mut xr = sx;
@@ -508,14 +530,27 @@ pub fn flood_fill(
             y1: sy + 1,
         };
         before_write(surface, span_rect);
-        for x in xl..=xr {
-            visited[idx(x, sy)] = true;
-            surface.set_pixel(x, sy, color);
+        // v4 §16.1: スパン全体を 1 回の行スライスで書く(以前は `xl..=xr` を
+        // 画素ごとに `set_pixel` していた — 呼ぶたびに境界チェック +
+        // `y*w+x` のインデックス計算をしていた)。スパンは `is_open` の
+        // 判定で既に `[0, w)` 内であることが保証されているので、
+        // `visited`/`surface.pixels` それぞれ 1 回の範囲アクセスで済む。
+        let span_start = sy as usize * w as usize + xl as usize;
+        let span_len = (xr - xl + 1) as usize;
+        if let Some(v) = visited.get_mut(span_start..span_start + span_len) {
+            v.fill(true);
         }
-        bounds.x0 = bounds.x0.min(xl);
-        bounds.x1 = bounds.x1.max(xr + 1);
-        bounds.y0 = bounds.y0.min(sy);
-        bounds.y1 = bounds.y1.max(sy + 1);
+        let byte_start = span_start * 4;
+        let byte_len = span_len * 4;
+        if let Some(row) = surface.pixels.get_mut(byte_start..byte_start + byte_len) {
+            for px in row.chunks_exact_mut(4) {
+                px.copy_from_slice(&color);
+            }
+        }
+        bounds = Some(match bounds {
+            Some(b) => b.union(&span_rect),
+            None => span_rect,
+        });
 
         for ny in [sy - 1, sy + 1] {
             if ny < 0 || ny >= h {
@@ -536,7 +571,282 @@ pub fn flood_fill(
             }
         }
     }
-    bounds
+    bounds.unwrap_or(empty)
+}
+
+// ---------------------------------------------------------------------------
+// v4 §16.3/§22: 自動選択(マジックワンド)。`flood_fill` と全く同じ連結判定
+// (`color_within_tolerance`、4-way スキャンライン、スタック使用)を使うが、
+// ピクセルへ書き込む代わりに「訪問済み=選択済み」の判定結果をそのまま
+// `SelMask` として返す(ARCHITECTURE.md §16.3: 「flood_mask(自動選択。既存
+// flood fill の visit を流用)」)。`flood_fill` のように `Surface` を書き
+// 換える必要が無いため `&Surface`(不変借用)だけで完結でき、`flood_fill`
+// のような読み取り/書き込みの入れ替わりに伴う借用の取り回しが不要になる分、
+// 独立した実装にした方が単純になる。
+// ---------------------------------------------------------------------------
+
+/// クリックした画素から許容値内の連結領域を選択マスクにする(SPEC §22:
+/// 「自動選択…flood fill と同じ判定」)。開始点が範囲外、またはドキュメント
+/// が 0×0 なら空マスク(パニックしない)。`surface.clip` があれば(v4 §16.3:
+/// 「塗りつぶしの連結探索は clip 外を壁として扱う」と同様)クリップ外へは
+/// 広がらない。
+pub fn flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
+    let Some(target) = surface.get_pixel(x, y) else {
+        return SelMask::empty();
+    };
+    let w = surface.width as i32;
+    let h = surface.height as i32;
+    if w <= 0 || h <= 0 {
+        return SelMask::empty();
+    }
+
+    let mut visited = vec![false; w as usize * h as usize];
+    let idx = |x: i32, y: i32| y as usize * w as usize + x as usize;
+    let is_open = |visited: &[bool], x: i32, y: i32| {
+        !visited[idx(x, y)]
+            && surface.clip.is_none_or(|clip| clip.contains(x, y))
+            && surface
+                .get_pixel(x, y)
+                .is_some_and(|p| color_within_tolerance(p, target, tolerance))
+    };
+
+    let mut bounds: Option<IRect> = None;
+    let mut stack = vec![(x, y)];
+    while let Some((sx, sy)) = stack.pop() {
+        if !is_open(&visited, sx, sy) {
+            continue;
+        }
+        let mut xl = sx;
+        while xl > 0 && is_open(&visited, xl - 1, sy) {
+            xl -= 1;
+        }
+        let mut xr = sx;
+        while xr + 1 < w && is_open(&visited, xr + 1, sy) {
+            xr += 1;
+        }
+
+        let span_rect = IRect {
+            x0: xl,
+            y0: sy,
+            x1: xr + 1,
+            y1: sy + 1,
+        };
+        let span_start = sy as usize * w as usize + xl as usize;
+        let span_len = (xr - xl + 1) as usize;
+        if let Some(v) = visited.get_mut(span_start..span_start + span_len) {
+            v.fill(true);
+        }
+        bounds = Some(match bounds {
+            Some(b) => b.union(&span_rect),
+            None => span_rect,
+        });
+
+        for ny in [sy - 1, sy + 1] {
+            if ny < 0 || ny >= h {
+                continue;
+            }
+            let mut in_run = false;
+            for xx in xl..=xr {
+                if is_open(&visited, xx, ny) {
+                    if !in_run {
+                        stack.push((xx, ny));
+                        in_run = true;
+                    }
+                } else {
+                    in_run = false;
+                }
+            }
+        }
+    }
+
+    let Some(bbox) = bounds else {
+        return SelMask::empty();
+    };
+    let bw = bbox.width() as usize;
+    let bh = bbox.height() as usize;
+    let mut mask = vec![0u8; bw * bh];
+    for yy in 0..bh {
+        let src_row = (bbox.y0 as usize + yy) * w as usize + bbox.x0 as usize;
+        let dst_row = yy * bw;
+        for xx in 0..bw {
+            mask[dst_row + xx] = if visited[src_row + xx] { 255 } else { 0 };
+        }
+    }
+    SelMask { bbox, mask }
+}
+
+// ---------------------------------------------------------------------------
+// v4 §16.4/§23: グラデーション(tools/gradient.rs が使う)。
+// ---------------------------------------------------------------------------
+
+/// SPEC §23: 「種類: 線形 / 円形」。`gradient_span` の補間形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientKind {
+    Linear,
+    Radial,
+}
+
+/// 始点 `p0` → 終点 `p1` に対する画像座標 `p` の補間係数 `t`(0.0–1.0、
+/// クランプ済み。SPEC §23: 「始点前/終点後はクランプ(端色で埋める)」)。
+///
+/// - 線形: `p0→p1` の直線への正射影(内積 / 距離二乗)。
+/// - 円形: `p0` からの距離 / `|p0-p1|`(半径)。
+///
+/// `p0 == p1`(ドラッグ距離 0)の退化ケースは、線形・円形どちらも `t = 0.0`
+/// (始点色一色)を返す(0 除算を避けつつ、無意味な巨大値より見た目が安定する)。
+pub fn gradient_span(kind: GradientKind, p0: (f32, f32), p1: (f32, f32), p: (f32, f32)) -> f32 {
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        return 0.0;
+    }
+    match kind {
+        GradientKind::Linear => {
+            let vx = p.0 - p0.0;
+            let vy = p.1 - p0.1;
+            ((vx * dx + vy * dy) / len2).clamp(0.0, 1.0)
+        }
+        GradientKind::Radial => {
+            let radius = len2.sqrt();
+            let dist = ((p.0 - p0.0).powi(2) + (p.1 - p0.1).powi(2)).sqrt();
+            (dist / radius).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// `c0` から `c1` へ straight-alpha RGBA8 のまま線形補間する(`gradient_span`
+/// が返す `t` をそのまま渡す)。
+pub fn lerp_color(c0: [u8; 4], c1: [u8; 4], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        let a = c0[i] as f32;
+        let b = c1[i] as f32;
+        out[i] = (a + (b - a) * t).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v4 §16.5/§24: 色調補正(app.rs が History 経由のスナップショット/即時
+// 適用ループと組み合わせて使う純関数群)。RGB のみを変更し、アルファは
+// 常に不変(SPEC §24)。
+// ---------------------------------------------------------------------------
+
+/// SPEC §24: 「階調の反転…RGB反転、アルファ不変」。
+pub fn invert_pixel(px: [u8; 4]) -> [u8; 4] {
+    [255 - px[0], 255 - px[1], 255 - px[2], px[3]]
+}
+
+/// SPEC §24: 「グレースケール化…Rec.709 輝度」。係数は ITU-R BT.709 の
+/// 輝度式(0.2126 R + 0.7152 G + 0.0722 B)。
+pub fn grayscale_pixel(px: [u8; 4]) -> [u8; 4] {
+    let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    [l, l, l, px[3]]
+}
+
+/// SPEC §24: 「明るさ・コントラスト…各 −100〜+100」用の 256 要素 LUT
+/// (ARCHITECTURE.md §16.5: 「LUT を作ってから行スライスで適用」)。
+/// `brightness`/`contrast` は -100..=100 を期待する(範囲外はクランプ)。
+///
+/// コントラストは古典的な「傾き」補正式(`factor = 259*(c+255) /
+/// (255*(259-c))`、c は -255..255)を使う。`contrast` (-100..100) を
+/// `c = contrast * 2.55` で -255..255 に写像してから適用する: `contrast=0` で
+/// `factor=1.0`(無補正)、`contrast=100` で急峻な傾き(ほぼ二値化)、
+/// `contrast=-100` で `factor≈0`(128 の単色フラットに近づく)になる。
+/// 明るさは 128 を中心にした傾き補正の**後**に単純な加算オフセットとして効く。
+pub fn brightness_contrast_lut(brightness: i32, contrast: i32) -> [u8; 256] {
+    let brightness = brightness.clamp(-100, 100) as f32;
+    let contrast = contrast.clamp(-100, 100) as f32;
+    let c255 = contrast * 2.55;
+    let factor = (259.0 * (c255 + 255.0)) / (255.0 * (259.0 - c255)).max(1e-3);
+    let offset = brightness * 2.55;
+    let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let v = factor * (i as f32 - 128.0) + 128.0 + offset;
+        *slot = v.round().clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
+/// `brightness_contrast_lut` で作った LUT を 1 画素へ適用する(アルファ不変)。
+pub fn apply_lut_pixel(px: [u8; 4], lut: &[u8; 256]) -> [u8; 4] {
+    [
+        lut[px[0] as usize],
+        lut[px[1] as usize],
+        lut[px[2] as usize],
+        px[3],
+    ]
+}
+
+/// RGB(0..255) → HSL(h: 0..360, s/l: 0..1)。
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = if l <= 0.5 {
+        delta / (max + min)
+    } else {
+        delta / (2.0 - max - min)
+    };
+    let h = if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    (h.rem_euclid(360.0), s, l)
+}
+
+/// HSL → RGB(0..255)。`rgb_to_hsl` の逆変換。
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    if s <= f32::EPSILON {
+        let v = (l * 255.0).round().clamp(0.0, 255.0) as u8;
+        return (v, v, v);
+    }
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (h_prime.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = if h_prime < 1.0 {
+        (c, x, 0.0)
+    } else if h_prime < 2.0 {
+        (x, c, 0.0)
+    } else if h_prime < 3.0 {
+        (0.0, c, x)
+    } else if h_prime < 4.0 {
+        (0.0, x, c)
+    } else if h_prime < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = l - c / 2.0;
+    let to_u8 = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to_u8(r1), to_u8(g1), to_u8(b1))
+}
+
+/// SPEC §24: 「色相・彩度・明度…色相 −180〜+180、彩度/明度 −100〜+100」。
+/// `dh` は度数のオフセット(360 で周回)、`ds`/`dl` は -100..100 を
+/// 彩度・明度それぞれの -1.0..1.0 オフセットとして加算しクランプする。
+/// アルファは不変。
+pub fn adjust_hsl_pixel(px: [u8; 4], dh: i32, ds: i32, dl: i32) -> [u8; 4] {
+    let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
+    let h = (h + dh as f32).rem_euclid(360.0);
+    let s = (s + ds as f32 / 100.0).clamp(0.0, 1.0);
+    let l = (l + dl as f32 / 100.0).clamp(0.0, 1.0);
+    let (r, g, b) = hsl_to_rgb(h, s, l);
+    [r, g, b, px[3]]
 }
 
 #[cfg(test)]
@@ -567,6 +877,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         stamp_round(&mut s, 10.0, 10.0, 3.0, [255, 0, 0, 255], false);
         assert_eq!(s.get_pixel(10, 10), Some([255, 0, 0, 255]));
@@ -579,6 +890,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         let (cx, cy, r) = (20.0, 20.0, 5.0);
         stamp_round(&mut s, cx, cy, r, [255, 0, 0, 255], false);
@@ -596,6 +908,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         stamp_round(&mut s, 5.0, 5.0, 2.0, [0, 0, 0, 0], true);
         assert_eq!(s.get_pixel(5, 5), Some([0, 0, 0, 0]));
@@ -608,6 +921,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         // 画像外の中心・画像の四隅すべてで OOB 書き込みが起きないこと。
         stamp_round(&mut s, -5.0, -5.0, 4.0, [1, 2, 3, 4], false);
@@ -624,6 +938,7 @@ mod tests {
             width: 0,
             height: 0,
             pixels: &mut buf,
+            clip: None,
         };
         stamp_round(&mut s, 0.0, 0.0, 3.0, [1, 2, 3, 4], false);
         assert_eq!(buf.len(), 0);
@@ -636,6 +951,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         let touched = stamp_round(&mut s, 10.0, 10.0, 3.0, [255, 0, 0, 255], false);
         assert!(!touched.is_empty());
@@ -655,6 +971,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
         let neighbors = [(9, 9), (10, 9), (9, 10), (10, 10)];
@@ -675,6 +992,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
         assert_eq!(s.get_pixel(13, 10), Some([0, 0, 0, 0]));
@@ -700,6 +1018,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         stroke_segment(&mut s, (5.0, 5.0), (30.0, 30.0), 2.0, [1, 2, 3, 4], false);
         assert_eq!(s.get_pixel(5, 5), Some([1, 2, 3, 4]));
@@ -713,6 +1032,7 @@ mod tests {
             width: 60,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         stroke_segment(&mut s, (0.0, 5.0), (59.0, 5.0), 3.0, [1, 2, 3, 4], false);
         for x in 0..60 {
@@ -727,6 +1047,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         stroke_segment(&mut s, (5.0, 5.0), (5.0, 5.0), 2.0, [9, 9, 9, 9], false);
         assert_eq!(s.get_pixel(5, 5), Some([9, 9, 9, 9]));
@@ -739,6 +1060,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         stroke_segment(
             &mut s,
@@ -758,6 +1080,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         let touched = stroke_segment(&mut s, (5.0, 5.0), (30.0, 20.0), 2.0, [1, 2, 3, 4], false);
         let expected = segment_bounds((5.0, 5.0), (30.0, 20.0), 2.0).clamp_to(40, 40);
@@ -883,6 +1206,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         draw_rect_outline(&mut s, (5.0, 5.0, 30.0, 20.0), 2.0, [255, 0, 0, 255]);
         // 4 辺の中点付近が塗られていること。
@@ -901,6 +1225,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         fill_rect(&mut s, (5.0, 5.0, 10.0, 10.0), [1, 2, 3, 4]);
         assert_eq!(s.get_pixel(7, 7), Some([1, 2, 3, 4]));
@@ -915,6 +1240,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         fill_rect(&mut s, (10.0, 10.0, 5.0, 5.0), [1, 2, 3, 4]);
         assert_eq!(s.get_pixel(7, 7), Some([1, 2, 3, 4]));
@@ -927,6 +1253,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         draw_rect_outline(&mut s, (-20.0, -20.0, 50.0, 50.0), 4.0, [1, 2, 3, 4]);
         fill_rect(&mut s, (-20.0, -20.0, 50.0, 50.0), [1, 2, 3, 4]);
@@ -942,6 +1269,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         fill_ellipse(&mut s, (5.0, 5.0, 35.0, 35.0), [9, 9, 9, 255]);
         assert_eq!(s.get_pixel(20, 20), Some([9, 9, 9, 255]));
@@ -956,6 +1284,7 @@ mod tests {
             width: 40,
             height: 40,
             pixels: &mut buf,
+            clip: None,
         };
         draw_ellipse_outline(&mut s, (5.0, 5.0, 35.0, 35.0), 2.0, [9, 9, 9, 255]);
         // 中心付近は塗られていない(枠線のみ)。
@@ -971,6 +1300,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: &mut buf,
+            clip: None,
         };
         draw_ellipse_outline(&mut s, (2.0, 10.0, 18.0, 10.0), 2.0, [1, 2, 3, 4]);
         assert_eq!(buf.len(), 20 * 20 * 4);
@@ -986,6 +1316,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         for y in 0..10 {
             s.set_pixel(5, y, [0, 0, 0, 255]);
@@ -1007,6 +1338,7 @@ mod tests {
             width: 4,
             height: 1,
             pixels: &mut buf,
+            clip: None,
         };
         s.set_pixel(2, 0, [240, 240, 240, 255]); // 白との差 15
         s.set_pixel(3, 0, [200, 200, 200, 255]); // 白との差 55
@@ -1026,6 +1358,7 @@ mod tests {
             width: 4,
             height: 4,
             pixels: &mut buf,
+            clip: None,
         };
         let touched = flood_fill(&mut s, 0, 0, [255, 255, 255, 255], 0, |_, _| {});
         assert_eq!(buf, before);
@@ -1039,6 +1372,7 @@ mod tests {
             width: 4,
             height: 4,
             pixels: &mut buf,
+            clip: None,
         };
         flood_fill(&mut s, -1, -1, [1, 2, 3, 4], 0, |_, _| {});
         flood_fill(&mut s, 100, 100, [1, 2, 3, 4], 0, |_, _| {});
@@ -1052,6 +1386,7 @@ mod tests {
             width: 0,
             height: 0,
             pixels: &mut buf,
+            clip: None,
         };
         flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
         assert_eq!(buf.len(), 0);
@@ -1064,6 +1399,7 @@ mod tests {
             width: 10,
             height: 10,
             pixels: &mut buf,
+            clip: None,
         };
         let touched = flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
         assert_eq!(
@@ -1085,6 +1421,7 @@ mod tests {
             width: 6,
             height: 1,
             pixels: &mut buf,
+            clip: None,
         };
         let mut snapshots: Vec<Vec<[u8; 4]>> = Vec::new();
         flood_fill(&mut s, 0, 0, [1, 2, 3, 255], 0, |surf, rect| {
@@ -1113,6 +1450,7 @@ mod tests {
             width: 4000,
             height: 4000,
             pixels: &mut buf,
+            clip: None,
         };
         let start = std::time::Instant::now();
         flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
@@ -1124,5 +1462,537 @@ mod tests {
             elapsed.as_secs() < 10,
             "flood_fill took suspiciously long (possible infinite loop / O(n^2)): {elapsed:?}"
         );
+    }
+
+    // -- v4 §16.3/§21: 描画クリップ(`Surface::clip`) ---------------------------
+
+    #[test]
+    fn set_pixel_outside_clip_is_a_no_op() {
+        // ARCHITECTURE.md §16.3: 「図形・塗りつぶし…の書き込みで mask==0 の
+        // 画素をスキップ」。`stamp_round`/`fill_rect`/`stroke_segment` 等は
+        // すべて `set_pixel` 経由で書くため、ここ 1 箇所を確認すれば全部が
+        // クリップに従うことを保証できる。
+        let mut buf = make_buffer(10, 10, [0, 0, 0, 0]);
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 10,
+            },
+            mask: vec![255u8; 5 * 10],
+        };
+        let mut s = Surface {
+            width: 10,
+            height: 10,
+            pixels: &mut buf,
+            clip: Some(&clip),
+        };
+        s.set_pixel(2, 2, [1, 2, 3, 255]); // クリップ内。
+        s.set_pixel(7, 2, [9, 9, 9, 255]); // クリップ外。
+        assert_eq!(s.get_pixel(2, 2), Some([1, 2, 3, 255]));
+        assert_eq!(
+            s.get_pixel(7, 2),
+            Some([0, 0, 0, 0]),
+            "set_pixel outside the clip mask must be a no-op"
+        );
+    }
+
+    #[test]
+    fn set_pixel_with_no_clip_behaves_exactly_as_before() {
+        // ARCHITECTURE.md §16.10-2: 「選択が無いときのコストがゼロ」。
+        // `clip: None` は従来どおり全域に書ける。
+        let mut buf = make_buffer(4, 4, [0, 0, 0, 0]);
+        let mut s = Surface {
+            width: 4,
+            height: 4,
+            pixels: &mut buf,
+            clip: None,
+        };
+        s.set_pixel(3, 3, [7, 7, 7, 255]);
+        assert_eq!(s.get_pixel(3, 3), Some([7, 7, 7, 255]));
+    }
+
+    #[test]
+    fn stamp_round_does_not_paint_outside_the_clip() {
+        // 個別の raster 関数を直接確認(`set_pixel` を経由することの傍証)。
+        let mut buf = make_buffer(20, 20, [0, 0, 0, 0]);
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 10,
+                y1: 20,
+            },
+            mask: vec![255u8; 10 * 20],
+        };
+        let mut s = Surface {
+            width: 20,
+            height: 20,
+            pixels: &mut buf,
+            clip: Some(&clip),
+        };
+        // 中心をクリップ境界(x=10)にまたがせて描く。
+        stamp_round(&mut s, 10.0, 10.0, 5.0, [255, 0, 0, 255], false);
+        assert_ne!(
+            s.get_pixel(6, 10),
+            Some([0, 0, 0, 0]),
+            "inside the clip should be painted"
+        );
+        assert_eq!(
+            s.get_pixel(13, 10),
+            Some([0, 0, 0, 0]),
+            "outside the clip must not be painted even though it's within the stamp radius"
+        );
+    }
+
+    #[test]
+    fn flood_fill_does_not_cross_the_clip_boundary() {
+        // ARCHITECTURE.md §16.3: 「塗りつぶしの連結探索は clip 外を壁として
+        // 扱う」。壁になる色の境界が無くても、クリップ境界自体が壁になる。
+        let mut buf = make_buffer(10, 10, [255, 255, 255, 255]);
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 10,
+            },
+            mask: vec![255u8; 5 * 10],
+        };
+        let mut s = Surface {
+            width: 10,
+            height: 10,
+            pixels: &mut buf,
+            clip: Some(&clip),
+        };
+        let touched = flood_fill(&mut s, 0, 0, [1, 2, 3, 255], 0, |_, _| {});
+        assert_eq!(s.get_pixel(0, 0), Some([1, 2, 3, 255]));
+        assert_eq!(s.get_pixel(4, 9), Some([1, 2, 3, 255]));
+        assert_eq!(
+            s.get_pixel(5, 0),
+            Some([255, 255, 255, 255]),
+            "the clip boundary must stop the flood fill even though the color matches"
+        );
+        assert!(touched.x1 <= 5, "touched bounds must not cross the clip");
+    }
+
+    #[test]
+    fn flood_fill_seed_outside_clip_paints_nothing() {
+        // v4 §16.3: クリック位置(種)自体がクリップ外なら、何も塗らず
+        // touched も空になる(1x1 の偽陽性を返さない、raster.rs の実装
+        // コメント参照)。
+        let mut buf = make_buffer(10, 10, [255, 255, 255, 255]);
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 10,
+            },
+            mask: vec![255u8; 5 * 10],
+        };
+        let mut s = Surface {
+            width: 10,
+            height: 10,
+            pixels: &mut buf,
+            clip: Some(&clip),
+        };
+        // (7, 0) はクリップ外。
+        let touched = flood_fill(&mut s, 7, 0, [1, 2, 3, 255], 0, |_, _| {});
+        assert!(
+            touched.is_empty(),
+            "a seed point outside the clip must yield an empty touched rect, got {touched:?}"
+        );
+        assert_eq!(s.get_pixel(7, 0), Some([255, 255, 255, 255]));
+    }
+
+    // -- V4-M3/SPEC §22: 自動選択(flood_mask) ------------------------------
+
+    #[test]
+    fn flood_mask_selects_connected_region_only() {
+        // 左半分が赤、右半分が青の 10x10。左上をクリックすると左半分だけが
+        // 選択されるはず(`flood_fill_fills_connected_region_only` と同じ
+        // 配置)。
+        let mut buf = vec![0u8; 10 * 10 * 4];
+        for y in 0..10 {
+            for x in 0..10 {
+                let idx = (y * 10 + x) * 4;
+                let color = if x < 5 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                buf[idx..idx + 4].copy_from_slice(&color);
+            }
+        }
+        let s = Surface {
+            width: 10,
+            height: 10,
+            pixels: &mut buf,
+            clip: None,
+        };
+        let mask = flood_mask(&s, 0, 0, 0);
+        assert_eq!(
+            mask.bbox,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 10
+            }
+        );
+        assert!(mask.contains(0, 0));
+        assert!(mask.contains(4, 9));
+        assert!(!mask.contains(5, 0), "must not cross into the blue half");
+    }
+
+    #[test]
+    fn flood_mask_respects_tolerance_threshold() {
+        let mut buf = make_buffer(4, 1, [0, 0, 0, 255]);
+        // (2,0) はわずかに離れた色。
+        buf[2 * 4..2 * 4 + 4].copy_from_slice(&[20, 20, 20, 255]);
+        buf[3 * 4..3 * 4 + 4].copy_from_slice(&[0, 0, 0, 255]);
+        let s = Surface {
+            width: 4,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+        };
+        // tolerance 10: (2,0) の差 20 は許容値を超えるので選択は途切れる。
+        let strict = flood_mask(&s, 0, 0, 10);
+        assert!(strict.contains(0, 0));
+        assert!(strict.contains(1, 0));
+        assert!(!strict.contains(2, 0));
+        assert!(!strict.contains(3, 0));
+
+        // tolerance 30: 全域が許容範囲内なので繋がる。
+        let loose = flood_mask(&s, 0, 0, 30);
+        assert!(loose.contains(3, 0));
+    }
+
+    #[test]
+    fn flood_mask_out_of_bounds_seed_does_not_panic() {
+        let mut buf = make_buffer(4, 4, [1, 2, 3, 4]);
+        let s = Surface {
+            width: 4,
+            height: 4,
+            pixels: &mut buf,
+            clip: None,
+        };
+        assert!(flood_mask(&s, -1, -1, 0).is_empty());
+        assert!(flood_mask(&s, 100, 100, 0).is_empty());
+    }
+
+    #[test]
+    fn flood_mask_on_zero_size_surface_does_not_panic() {
+        let mut buf: Vec<u8> = Vec::new();
+        let s = Surface {
+            width: 0,
+            height: 0,
+            pixels: &mut buf,
+            clip: None,
+        };
+        assert!(flood_mask(&s, 0, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn flood_mask_does_not_cross_the_clip_boundary() {
+        let mut buf = make_buffer(10, 10, [255, 255, 255, 255]);
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 10,
+            },
+            mask: vec![255u8; 5 * 10],
+        };
+        let s = Surface {
+            width: 10,
+            height: 10,
+            pixels: &mut buf,
+            clip: Some(&clip),
+        };
+        let mask = flood_mask(&s, 0, 0, 0);
+        assert!(mask.contains(4, 9));
+        assert!(
+            !mask.contains(5, 0),
+            "the clip boundary must stop the selection even though the color matches"
+        );
+    }
+
+    #[test]
+    fn flood_mask_does_not_mutate_the_surface() {
+        // flood_mask は選択マスクを返すだけで、flood_fill と違いピクセルは
+        // 一切書き換えない。
+        let mut buf = make_buffer(6, 6, [7, 8, 9, 255]);
+        let original = buf.clone();
+        let s = Surface {
+            width: 6,
+            height: 6,
+            pixels: &mut buf,
+            clip: None,
+        };
+        let _ = flood_mask(&s, 0, 0, 0);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn flood_mask_4000x4000_is_correct_and_terminates() {
+        // flood_fill_4000x4000_is_correct_and_terminates と同じ回帰検知
+        // (デバッグビルドでの緩い上限)。
+        let w = 4000usize;
+        let h = 4000usize;
+        let mut buf = vec![0u8; w * h * 4];
+        for chunk in buf.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&[10, 20, 30, 255]);
+        }
+        let s = Surface {
+            width: w as u32,
+            height: h as u32,
+            pixels: &mut buf,
+            clip: None,
+        };
+        let start = std::time::Instant::now();
+        let mask = flood_mask(&s, 0, 0, 0);
+        let elapsed = start.elapsed();
+        assert_eq!(
+            mask.bbox,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: w as i32,
+                y1: h as i32
+            }
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "flood_mask took suspiciously long (possible regression): {elapsed:?}"
+        );
+    }
+
+    // -- v4 §16.4/§23: グラデーション -----------------------------------------
+
+    #[test]
+    fn gradient_span_linear_is_zero_at_start_and_one_at_end() {
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 0.0);
+        assert_eq!(gradient_span(GradientKind::Linear, p0, p1, p0), 0.0);
+        assert_eq!(gradient_span(GradientKind::Linear, p0, p1, p1), 1.0);
+        assert!((gradient_span(GradientKind::Linear, p0, p1, (5.0, 0.0)) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gradient_span_linear_clamps_before_start_and_after_end() {
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 0.0);
+        assert_eq!(
+            gradient_span(GradientKind::Linear, p0, p1, (-5.0, 0.0)),
+            0.0
+        );
+        assert_eq!(
+            gradient_span(GradientKind::Linear, p0, p1, (15.0, 0.0)),
+            1.0
+        );
+    }
+
+    #[test]
+    fn gradient_span_linear_ignores_perpendicular_offset() {
+        // 線形は始点→終点の直線への正射影なので、直線に垂直な方向にどれだけ
+        // 離れていても t は変わらない(SPEC §23 の「線形」の定義)。
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 0.0);
+        let on_axis = gradient_span(GradientKind::Linear, p0, p1, (5.0, 0.0));
+        let off_axis = gradient_span(GradientKind::Linear, p0, p1, (5.0, 100.0));
+        assert!((on_axis - off_axis).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gradient_span_radial_is_zero_at_center_and_one_at_radius() {
+        let p0 = (10.0, 10.0);
+        let p1 = (20.0, 10.0); // 半径 10。
+        assert_eq!(gradient_span(GradientKind::Radial, p0, p1, p0), 0.0);
+        assert!((gradient_span(GradientKind::Radial, p0, p1, p1) - 1.0).abs() < 1e-5);
+        // 半径の半分の距離(方向は自由)は t=0.5。
+        assert!((gradient_span(GradientKind::Radial, p0, p1, (10.0, 15.0)) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn gradient_span_radial_clamps_beyond_radius() {
+        let p0 = (0.0, 0.0);
+        let p1 = (5.0, 0.0);
+        assert_eq!(
+            gradient_span(GradientKind::Radial, p0, p1, (100.0, 0.0)),
+            1.0
+        );
+    }
+
+    #[test]
+    fn gradient_span_degenerate_zero_length_drag_returns_zero() {
+        let p0 = (3.0, 4.0);
+        assert_eq!(gradient_span(GradientKind::Linear, p0, p0, (9.0, 9.0)), 0.0);
+        assert_eq!(gradient_span(GradientKind::Radial, p0, p0, (9.0, 9.0)), 0.0);
+    }
+
+    #[test]
+    fn lerp_color_endpoints_and_midpoint() {
+        let c0 = [0, 0, 0, 255];
+        let c1 = [255, 255, 255, 255];
+        assert_eq!(lerp_color(c0, c1, 0.0), c0);
+        assert_eq!(lerp_color(c0, c1, 1.0), c1);
+        assert_eq!(lerp_color(c0, c1, 0.5), [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn lerp_color_clamps_out_of_range_t() {
+        let c0 = [10, 20, 30, 40];
+        let c1 = [200, 150, 100, 250];
+        assert_eq!(lerp_color(c0, c1, -1.0), c0);
+        assert_eq!(lerp_color(c0, c1, 2.0), c1);
+    }
+
+    // -- v4 §16.5/§24: 色調補正 ------------------------------------------------
+
+    #[test]
+    fn invert_pixel_flips_rgb_and_keeps_alpha() {
+        assert_eq!(invert_pixel([0, 128, 255, 200]), [255, 127, 0, 200]);
+    }
+
+    #[test]
+    fn grayscale_pixel_uses_rec709_luma_and_keeps_alpha() {
+        let px = grayscale_pixel([0, 255, 0, 123]);
+        // 緑単色の Rec.709 輝度は 0.7152*255 ≈ 182。
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+        assert!((175..=190).contains(&(px[0] as i32)));
+        assert_eq!(px[3], 123);
+    }
+
+    #[test]
+    fn grayscale_pixel_of_gray_is_unchanged() {
+        assert_eq!(grayscale_pixel([128, 128, 128, 255]), [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn brightness_contrast_lut_is_identity_at_zero_zero() {
+        let lut = brightness_contrast_lut(0, 0);
+        for i in [0usize, 1, 64, 128, 200, 255] {
+            assert_eq!(lut[i], i as u8, "identity mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn brightness_contrast_lut_max_brightness_pushes_toward_white() {
+        let lut = brightness_contrast_lut(100, 0);
+        assert_eq!(lut[0], 255);
+        assert_eq!(lut[255], 255);
+    }
+
+    #[test]
+    fn brightness_contrast_lut_min_brightness_pushes_toward_black() {
+        let lut = brightness_contrast_lut(-100, 0);
+        assert_eq!(lut[255], 0);
+        assert_eq!(lut[0], 0);
+    }
+
+    #[test]
+    fn brightness_contrast_lut_min_contrast_flattens_toward_mid_gray() {
+        let lut = brightness_contrast_lut(0, -100);
+        // コントラスト -100 は傾きがほぼ 0 になり、全画素が中間グレー付近に
+        // 潰れる(SPEC §24 の「コントラスト」の直感どおり)。
+        assert!((lut[0] as i32 - 128).abs() <= 2);
+        assert!((lut[255] as i32 - 128).abs() <= 2);
+    }
+
+    #[test]
+    fn brightness_contrast_lut_max_contrast_pushes_toward_extremes() {
+        let lut = brightness_contrast_lut(0, 100);
+        assert!(lut[200] > 200);
+        assert!(lut[50] < 50);
+    }
+
+    #[test]
+    fn brightness_contrast_lut_clamps_out_of_range_inputs() {
+        let clamped = brightness_contrast_lut(500, -500);
+        let exact = brightness_contrast_lut(100, -100);
+        assert_eq!(clamped, exact);
+    }
+
+    #[test]
+    fn apply_lut_pixel_preserves_alpha() {
+        let lut = brightness_contrast_lut(0, 0);
+        assert_eq!(apply_lut_pixel([10, 20, 30, 77], &lut), [10, 20, 30, 77]);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_zero_delta_is_a_no_op_within_rounding() {
+        let px = [12, 200, 90, 255];
+        let out = adjust_hsl_pixel(px, 0, 0, 0);
+        for i in 0..3 {
+            assert!(
+                (out[i] as i32 - px[i] as i32).abs() <= 1,
+                "channel {i}: {} vs {}",
+                out[i],
+                px[i]
+            );
+        }
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_grayscale_input_is_immune_to_hue_shift() {
+        // 彩度 0(グレー)は色相を変えても変化しない(HSL の定義どおり)。
+        let px = [128, 128, 128, 255];
+        let out = adjust_hsl_pixel(px, 90, 0, 0);
+        assert_eq!(out, px);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_lightness_100_is_white() {
+        let px = [50, 60, 70, 255];
+        let out = adjust_hsl_pixel(px, 0, 0, 100);
+        assert_eq!(out, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_lightness_minus_100_is_black() {
+        let px = [50, 60, 70, 255];
+        let out = adjust_hsl_pixel(px, 0, 0, -100);
+        assert_eq!(out, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_saturation_minus_100_desaturates() {
+        let px = [220, 40, 40, 255]; // 彩度の高い赤。
+        let out = adjust_hsl_pixel(px, 0, -100, 0);
+        assert_eq!(out[0], out[1]);
+        assert_eq!(out[1], out[2]);
+    }
+
+    #[test]
+    fn adjust_hsl_pixel_preserves_alpha() {
+        let out = adjust_hsl_pixel([10, 20, 30, 44], 45, 10, -10);
+        assert_eq!(out[3], 44);
+    }
+
+    #[test]
+    fn rgb_hsl_roundtrip_is_approximately_stable() {
+        let samples = [
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (123, 45, 200),
+            (10, 200, 150),
+        ];
+        for (r, g, b) in samples {
+            let (h, s, l) = rgb_to_hsl(r, g, b);
+            let (r2, g2, b2) = hsl_to_rgb(h, s, l);
+            assert!((r as i32 - r2 as i32).abs() <= 1, "r: {r} vs {r2}");
+            assert!((g as i32 - g2 as i32).abs() <= 1, "g: {g} vs {g2}");
+            assert!((b as i32 - b2 as i32).abs() <= 1, "b: {b} vs {b2}");
+        }
     }
 }

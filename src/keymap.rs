@@ -112,6 +112,20 @@ pub enum Action {
     SelectLastShapeTool,
     /// `Shift+U`: 直線→矩形→楕円 を巡回。
     CycleShapeTool,
+    /// v4 §22: `M`: 選択(直前に使ったマリキー形状。`ToolKind::Select`/
+    /// `EllipseSelect` のいずれか)。`SelectLastShapeTool` の選択版。
+    SelectLastMarqueeTool,
+    /// v4 §22 §27: `Shift+M`: 矩形選択↔楕円選択を巡回。
+    CycleMarquee,
+    /// v4 §22 §27: `Shift+L`: なげなわの自由↔多角形モードを切替(`ToolKind`
+    /// は変えない、`app.rs::LassoMode` を切り替えるだけ)。
+    CycleLassoMode,
+    /// v4 §23: `G`: 塗りつぶし系(直前に使った `ToolKind::Fill`/`Gradient`
+    /// のいずれか)。`SelectLastShapeTool`/`SelectLastMarqueeTool` と同じ
+    /// 「巡回はするが大半の挙動を共有する」設計(`app.rs::last_fill_tool`)。
+    SelectLastFillTool,
+    /// v4 §23 §27: `Shift+G`: 塗りつぶし↔グラデーションを巡回。
+    CycleFillTool,
 
     // -- 色(SPEC §20「色」) -----------------------------------------------
     SwapColors,
@@ -139,6 +153,12 @@ pub enum Action {
     CommitFloating,
     /// Esc: 浮動片のキャンセル(選択/移動ツール使用中のみ有効、SPEC §18)。
     CancelFloating,
+    /// v4 §24 §27: `Ctrl+U`: 色相・彩度・明度…モーダルを開く。
+    HueSaturation,
+    /// v4 §24 §27: `Ctrl+I`: 階調の反転(即時)。
+    Invert,
+    /// v4 §24 §27: `Ctrl+Shift+U`: グレースケール化(即時)。
+    Grayscale,
 
     // -- レイヤー(SPEC §20「レイヤー」) -------------------------------------
     LayerAdd,
@@ -182,18 +202,21 @@ const fn e(modifiers: Modifiers, key: Key, action: Action) -> Entry {
 pub const KEYMAP: &[Entry] = &[
     // -- ツール ------------------------------------------------------------
     e(Modifiers::NONE, Key::V, Action::SelectTool(ToolKind::Move)),
-    e(
-        Modifiers::NONE,
-        Key::M,
-        Action::SelectTool(ToolKind::Select),
-    ),
+    // v4 §22: `M` は「直前に使ったマリキー形状」(矩形/楕円)を選ぶ
+    // (`SelectLastShapeTool`/`U` と同じ設計)。`Shift+M` で 2 つを巡回する。
+    e(Modifiers::NONE, Key::M, Action::SelectLastMarqueeTool),
+    e(Modifiers::SHIFT, Key::M, Action::CycleMarquee),
     e(Modifiers::NONE, Key::B, Action::SelectTool(ToolKind::Pen)),
     e(
         Modifiers::NONE,
         Key::E,
         Action::SelectTool(ToolKind::Eraser),
     ),
-    e(Modifiers::NONE, Key::G, Action::SelectTool(ToolKind::Fill)),
+    // v4 §23: `G` は「直前に使った塗りつぶし系ツール」(塗りつぶし/
+    // グラデーション)。`Shift+G` で 2 つを巡回する(M/Shift+M・U/Shift+U と
+    // 同じ設計)。
+    e(Modifiers::NONE, Key::G, Action::SelectLastFillTool),
+    e(Modifiers::SHIFT, Key::G, Action::CycleFillTool),
     e(
         Modifiers::NONE,
         Key::I,
@@ -204,6 +227,14 @@ pub const KEYMAP: &[Entry] = &[
     e(Modifiers::SHIFT, Key::U, Action::CycleShapeTool),
     e(Modifiers::NONE, Key::H, Action::SelectTool(ToolKind::Pan)),
     e(Modifiers::NONE, Key::Z, Action::SelectTool(ToolKind::Zoom)),
+    // v4 §22 §27: なげなわ(`L`)・自動選択(`W`)。
+    e(Modifiers::NONE, Key::L, Action::SelectTool(ToolKind::Lasso)),
+    e(Modifiers::SHIFT, Key::L, Action::CycleLassoMode),
+    e(
+        Modifiers::NONE,
+        Key::W,
+        Action::SelectTool(ToolKind::MagicWand),
+    ),
     // -- 色 ------------------------------------------------------------
     e(Modifiers::NONE, Key::X, Action::SwapColors),
     e(Modifiers::NONE, Key::D, Action::DefaultColors),
@@ -239,6 +270,16 @@ pub const KEYMAP: &[Entry] = &[
     e(Modifiers::CTRL, Key::T, Action::FreeTransform),
     e(Modifiers::NONE, Key::Enter, Action::CommitFloating),
     e(Modifiers::NONE, Key::Escape, Action::CancelFloating),
+    // v4 §24 §27: 色調補正。Ctrl+Shift+U は Ctrl+U より先に消費する必要が
+    // ある(ARCHITECTURE.md §15.4 ②、Ctrl+Shift+Z が Ctrl+Z より先なのと同じ
+    // 理由)。`poll` が修飾キー数の降順で並べ替えるので、登場順はどちらでもよい。
+    e(Modifiers::CTRL, Key::U, Action::HueSaturation),
+    e(Modifiers::CTRL, Key::I, Action::Invert),
+    e(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::U,
+        Action::Grayscale,
+    ),
     // -- レイヤー ------------------------------------------------------------
     e(
         Modifiers::CTRL.plus(Modifiers::SHIFT),
@@ -348,10 +389,14 @@ pub fn menu_label(text: &str, action: Action) -> String {
 /// ツールバーのツールチップに使うショートカット表記。SPEC §20 の
 /// Photoshop 準拠キーマップでは直線/矩形/楕円は「U」1 本にまとめられて
 /// いる(Shift+U で巡回)ため、この 3 ツールは `SelectLastShapeTool`
-/// (= `U`)のバインドを表示する。
+/// (= `U`)のバインドを表示する。v4 §22: 矩形選択/楕円選択も同様に「M」
+/// (`SelectLastMarqueeTool`)1 本にまとめる。
 pub fn tool_shortcut_label(kind: ToolKind) -> String {
     let action = match kind {
         ToolKind::Line | ToolKind::Rect | ToolKind::Ellipse => Action::SelectLastShapeTool,
+        ToolKind::Select | ToolKind::EllipseSelect => Action::SelectLastMarqueeTool,
+        // v4 §23: 塗りつぶし/グラデーションも「G」1 本にまとまる。
+        ToolKind::Fill | ToolKind::Gradient => Action::SelectLastFillTool,
         other => Action::SelectTool(other),
     };
     label_for(action)
@@ -366,12 +411,15 @@ mod tests {
     /// 件数と主要キーの静的テスト)」。
     #[test]
     fn keymap_covers_every_tool_key_in_spec_20() {
+        // v4 §22: `M` は `SelectTool(Select)` ではなく `SelectLastMarqueeTool`
+        // になった(`m_and_shift_m_select_and_cycle_marquee` 参照)ので、この
+        // ループからは外す。v4 §23: `G` も同様に `SelectLastFillTool` になった
+        // (`g_and_shift_g_select_and_cycle_fill_tool` が別途検証する)ので
+        // ここでは対象外にする。
         let tools = [
             (Key::V, ToolKind::Move),
-            (Key::M, ToolKind::Select),
             (Key::B, ToolKind::Pen),
             (Key::E, ToolKind::Eraser),
-            (Key::G, ToolKind::Fill),
             (Key::I, ToolKind::Picker),
             (Key::T, ToolKind::Text),
             (Key::H, ToolKind::Pan),
@@ -387,9 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn old_l_r_c_f_keys_are_gone() {
+    fn old_r_c_f_keys_are_gone() {
         // SPEC §20: 「旧 L/R/C は廃止」。塗りつぶしも F→G に変更された。
-        for key in [Key::L, Key::R, Key::C, Key::F] {
+        // v4 §22 で `L` はなげなわとして復活したので、ここでは対象外にする
+        // (`l_and_shift_l_select_lasso_and_cycle_mode` が別途検証する)。
+        for key in [Key::R, Key::C, Key::F] {
             assert!(
                 !KEYMAP
                     .iter()
@@ -398,6 +448,97 @@ mod tests {
                 "{key:?} が単一キーのバインドとして残っている"
             );
         }
+    }
+
+    // -- v4 §22/§27: マリキー(M/Shift+M)・なげなわ(L/Shift+L)・
+    // 自動選択(W) ------------------------------------------------------
+
+    #[test]
+    fn m_and_shift_m_select_and_cycle_marquee() {
+        assert_eq!(
+            binding_for(Action::SelectLastMarqueeTool),
+            Some(Binding::new(Modifiers::NONE, Key::M))
+        );
+        assert_eq!(
+            binding_for(Action::CycleMarquee),
+            Some(Binding::new(Modifiers::SHIFT, Key::M))
+        );
+    }
+
+    #[test]
+    fn l_and_shift_l_select_lasso_and_cycle_mode() {
+        assert_eq!(
+            binding_for(Action::SelectTool(ToolKind::Lasso)),
+            Some(Binding::new(Modifiers::NONE, Key::L))
+        );
+        assert_eq!(
+            binding_for(Action::CycleLassoMode),
+            Some(Binding::new(Modifiers::SHIFT, Key::L))
+        );
+    }
+
+    #[test]
+    fn w_selects_magic_wand() {
+        assert_eq!(
+            binding_for(Action::SelectTool(ToolKind::MagicWand)),
+            Some(Binding::new(Modifiers::NONE, Key::W))
+        );
+    }
+
+    // -- v4 §23/§27: 塗りつぶし↔グラデーション(G/Shift+G) ---------------------
+
+    #[test]
+    fn g_and_shift_g_select_and_cycle_fill_tool() {
+        assert_eq!(
+            binding_for(Action::SelectLastFillTool),
+            Some(Binding::new(Modifiers::NONE, Key::G))
+        );
+        assert_eq!(
+            binding_for(Action::CycleFillTool),
+            Some(Binding::new(Modifiers::SHIFT, Key::G))
+        );
+    }
+
+    #[test]
+    fn tool_shortcut_label_groups_fill_tools_under_g() {
+        assert_eq!(tool_shortcut_label(ToolKind::Fill), "G");
+        assert_eq!(tool_shortcut_label(ToolKind::Gradient), "G");
+    }
+
+    // -- v4 §24/§27: 色調補正(Ctrl+U / Ctrl+I / Ctrl+Shift+U) -----------------
+
+    #[test]
+    fn tone_adjustment_keys_match_spec_24_27() {
+        assert_eq!(
+            binding_for(Action::HueSaturation),
+            Some(Binding::new(Modifiers::CTRL, Key::U))
+        );
+        assert_eq!(
+            binding_for(Action::Invert),
+            Some(Binding::new(Modifiers::CTRL, Key::I))
+        );
+        assert_eq!(
+            binding_for(Action::Grayscale),
+            Some(Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::U))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_u_takes_priority_over_ctrl_u() {
+        // ARCHITECTURE.md §15.4 ②(Ctrl+Shift+Z が Ctrl+Z より先なのと同じ
+        // 理由): Ctrl+Shift+U の specificity が Ctrl+U より高いこと。
+        let ctrl_u = Binding::new(Modifiers::CTRL, Key::U).specificity();
+        let ctrl_shift_u =
+            Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::U).specificity();
+        assert!(ctrl_shift_u > ctrl_u);
+    }
+
+    #[test]
+    fn tool_shortcut_label_groups_marquee_tools_under_m() {
+        assert_eq!(tool_shortcut_label(ToolKind::Select), "M");
+        assert_eq!(tool_shortcut_label(ToolKind::EllipseSelect), "M");
+        assert_eq!(tool_shortcut_label(ToolKind::Lasso), "L");
+        assert_eq!(tool_shortcut_label(ToolKind::MagicWand), "W");
     }
 
     #[test]
@@ -580,8 +721,14 @@ mod tests {
         // 数字10 + ブラシ4([,],Shift+[,Shift+]) + 編集11(Undo,Redo×2,
         // Cut,Copy,Paste,Delete,SelectAll,Deselect,FreeTransform,
         // CommitFloating,CancelFloating) + レイヤー4 + ファイル4 + 表示4
-        // = 11 + 2 + 10 + 4 + 12 + 4 + 4 + 4 = 51
-        assert_eq!(KEYMAP.len(), 51);
+        // = 11 + 2 + 10 + 4 + 12 + 4 + 4 + 4 = 51 (v1〜v3)
+        // v4 §22/§27 で 4 件追加: Shift+M(CycleMarquee) + L(Lasso) +
+        // Shift+L(CycleLassoMode) + W(MagicWand) = 51 + 4 = 55。
+        // v4 §23〜§24/§27 でさらに 4 件追加: Shift+G(CycleFillTool、G 自体は
+        // `SelectTool(Fill)` → `SelectLastFillTool` に置き換わっただけで
+        // バインド数は変わらない) + Ctrl+U(HueSaturation) +
+        // Ctrl+I(Invert) + Ctrl+Shift+U(Grayscale) = 55 + 4 = 59。
+        assert_eq!(KEYMAP.len(), 59);
     }
 
     #[test]

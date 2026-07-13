@@ -244,6 +244,59 @@ impl StrokeRecorder {
     }
 }
 
+/// `History::original_pixel_cursor` が返す、ホットループ向けのタイル探索
+/// キャッシュ(v4-M2 性能改善、ARCHITECTURE.md §16.1)。
+///
+/// 背景: `tools/brush.rs::apply_stamp`(ブラシ/消しゴムの 1 スタンプの画素
+/// ループ)や `tools/gradient.rs`・`app.rs::reapply_tone_preview`(色調補正の
+/// ライブプレビュー)は、影響を受ける各画素ごとに「ストローク開始前の値」を
+/// 求める必要があるが、そのたびに素朴な `original_pixel(x, y)` を呼ぶと
+/// `stroke.tiles`(タイル 256×256 ごとの `HashMap`)を毎画素で引き直すことに
+/// なる。1 スタンプの範囲は通常わずか数タイルしか跨がないため、実測
+/// (release ビルド、4000×4000・64px ブラシの高速ドラッグ)でこの
+/// `HashMap` 探索がホットパスの支配的コストになっていた(1400px 移動の
+/// ドラッグで約 34ms、キャンバス対角線相当で約 123ms、SPEC §28 の
+/// 「フレーム 16ms 以下」を大きく超えていた)。
+///
+/// このカーソルは「直前に解決したタイル座標 → そのタイルの
+/// `TileSnapshot` への参照」を保持し、次のアクセスが同じタイル内であれば
+/// `HashMap::get` を再度呼ばない(呼び出し側は 1 スタンプ/1 行の処理開始時に
+/// 一度だけ `original_pixel_cursor()` を呼び、その画素ループ全体で使い回す)。
+/// `History::original_pixel(x, y)`(旧 API、意味論はここに引き継いだ)と
+/// 完全に同じ値を返す単なる呼び出し側キャッシュであり、ストローク非記録中や
+/// まだ退避されていないタイルでは `None` を返す。
+pub struct OriginalPixelCursor<'a> {
+    stroke: Option<&'a StrokeRecorder>,
+    cached: Option<((i32, i32), &'a TileSnapshot)>,
+}
+
+impl<'a> OriginalPixelCursor<'a> {
+    /// `(x, y)` の「ストローク開始前」のピクセル値。直前の呼び出しと同じ
+    /// タイル(256×256)内であれば `HashMap` を再探索しない。
+    pub fn get(&mut self, x: i32, y: i32) -> Option<[u8; 4]> {
+        let stroke = self.stroke?;
+        let tx = x.div_euclid(TILE_SIZE);
+        let ty = y.div_euclid(TILE_SIZE);
+        let snap = match self.cached {
+            Some((key, snap)) if key == (tx, ty) => snap,
+            _ => {
+                let snap = stroke.tiles.get(&(tx, ty))?;
+                self.cached = Some(((tx, ty), snap));
+                snap
+            }
+        };
+        let rect = snap.rect;
+        if x < rect.x0 || x >= rect.x1 || y < rect.y0 || y >= rect.y1 {
+            return None;
+        }
+        let w = rect.width() as usize;
+        let idx = ((y - rect.y0) as usize * w + (x - rect.x0) as usize) * 4;
+        snap.pixels
+            .get(idx..idx + 4)
+            .map(|s| [s[0], s[1], s[2], s[3]])
+    }
+}
+
 fn copy_region(pixels: &[u8], width: u32, rect: IRect) -> Vec<u8> {
     let w = rect.width() as usize;
     let h = rect.height() as usize;
@@ -328,25 +381,16 @@ impl History {
         }
     }
 
-    /// 進行中のストロークにおける `(x, y)` の「ストローク開始前」のピクセル値を、
-    /// 退避済みの CoW タイル(§6)から返す。まだそのタイルが退避されていない
-    /// (= 一度も書き込まれていない = 現在値がそのまま元の値)場合や、
-    /// ストローク記録中でない場合は `None`(ARCHITECTURE.md §5 のペン AA モードが、
-    /// 毎スタンプ「元画像」から合成し直すために使う)。
-    pub fn original_pixel(&self, x: i32, y: i32) -> Option<[u8; 4]> {
-        let stroke = self.stroke.as_ref()?;
-        let tx = x.div_euclid(TILE_SIZE);
-        let ty = y.div_euclid(TILE_SIZE);
-        let snap = stroke.tiles.get(&(tx, ty))?;
-        let rect = snap.rect;
-        if x < rect.x0 || x >= rect.x1 || y < rect.y0 || y >= rect.y1 {
-            return None;
+    /// ホットループ(1 スタンプ/1 行の画素ループ)向けの `original_pixel`
+    /// アクセサを作る(`OriginalPixelCursor` のドキュメント参照、v4-M2、
+    /// ARCHITECTURE.md §16.1)。意味論は素朴な「毎回 `(x, y)` を渡して
+    /// `Option<[u8; 4]>` を得る」ままだが、同じタイル内の連続アクセスでは
+    /// `HashMap` を再探索しない。
+    pub fn original_pixel_cursor(&self) -> OriginalPixelCursor<'_> {
+        OriginalPixelCursor {
+            stroke: self.stroke.as_ref(),
+            cached: None,
         }
-        let w = rect.width() as usize;
-        let idx = ((y - rect.y0) as usize * w + (x - rect.x0) as usize) * 4;
-        snap.pixels
-            .get(idx..idx + 4)
-            .map(|s| [s[0], s[1], s[2], s[3]])
     }
 
     /// SPEC §18: Esc キャンセル(`app.rs::cancel_floating`)専用。進行中の
@@ -357,18 +401,47 @@ impl History {
     /// SPEC §18)。ストローク自体もここでは消費しない(呼び出し側が続けて
     /// `cancel_stroke()` で破棄すること)。ストローク記録中でなければ
     /// 何もしない。
+    ///
+    /// v4 §16.1(SPEC §28: 「Esc キャンセル: 全レイヤー浮動化のキャンセル
+    /// 復元をタイル一括コピーで 50ms 以下(4000×4000)」): 以前は `rect` 内の
+    /// 各画素について `original_pixel(x, y)`(タイルの `HashMap` 探索 +
+    /// 境界チェック)を呼んでから `doc.set_pixel` していた。移動ツールで
+    /// アクティブレイヤー全体を浮動化してキャンセルすると `rect` が全面
+    /// (4000×4000 なら 1600 万画素)になり得るため、退避済みのタイル
+    /// (`self.stroke.tiles`)ごとに `rect` との交差を求め、交差した行を
+    /// `copy_from_slice` の行スライスで一括コピーする形に書き直した。
     pub fn restore_stroke_region(&self, doc: &mut Document, rect: IRect) {
-        if self.stroke.is_none() {
+        let Some(stroke) = &self.stroke else {
             return;
-        }
+        };
         let rect = rect.clamp_to(doc.width, doc.height);
         if rect.is_empty() {
             return;
         }
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                if let Some(px) = self.original_pixel(x, y) {
-                    doc.set_pixel(x, y, px);
+        let width = doc.width as usize;
+        let Some(layer) = doc.layers.get_mut(stroke.layer) else {
+            return;
+        };
+        for snap in stroke.tiles.values() {
+            let tile_rect = snap.rect;
+            let ix0 = tile_rect.x0.max(rect.x0);
+            let iy0 = tile_rect.y0.max(rect.y0);
+            let ix1 = tile_rect.x1.min(rect.x1);
+            let iy1 = tile_rect.y1.min(rect.y1);
+            if ix0 >= ix1 || iy0 >= iy1 {
+                continue;
+            }
+            let tile_w = tile_rect.width() as usize;
+            let row_len = (ix1 - ix0) as usize * 4;
+            for y in iy0..iy1 {
+                let tile_row_start =
+                    ((y - tile_rect.y0) as usize * tile_w + (ix0 - tile_rect.x0) as usize) * 4;
+                let doc_row_start = (y as usize * width + ix0 as usize) * 4;
+                if let (Some(src), Some(dst)) = (
+                    snap.pixels.get(tile_row_start..tile_row_start + row_len),
+                    layer.pixels.get_mut(doc_row_start..doc_row_start + row_len),
+                ) {
+                    dst.copy_from_slice(src);
                 }
             }
         }
@@ -624,10 +697,10 @@ mod tests {
     use crate::document::Background;
     use crate::raster::{self, Surface};
 
-    /// テストから `ctx.doc.active_surface_mut()` 相当を作るヘルパー
+    /// テストから `ctx.doc.active_surface_mut(None)` 相当を作るヘルパー
     /// (raster 関数はいずれも `Surface` を要求するため)。
     fn surface(doc: &mut Document) -> Surface<'_> {
-        doc.active_surface_mut()
+        doc.active_surface_mut(None)
     }
 
     /// テスト用: 単一領域だけの `Patch`(`HistoryOp::Patch` のリファクタ
@@ -842,10 +915,13 @@ mod tests {
         history.begin_stroke(doc.active);
         let bounds = raster::stamp_bounds(10.0, 10.0, 4.0);
         history.ensure_tiles_saved(&doc, bounds);
-        // タイル退避後にドキュメントを書き換えても、original_pixel は
+        // タイル退避後にドキュメントを書き換えても、original_pixel_cursor は
         // 退避時点(書き換え前)の値を返し続ける。
         raster::stamp_round(&mut surface(&mut doc), 10.0, 10.0, 4.0, [1, 2, 3, 4], false);
-        assert_eq!(history.original_pixel(10, 10), Some([255, 255, 255, 255]));
+        assert_eq!(
+            history.original_pixel_cursor().get(10, 10),
+            Some([255, 255, 255, 255])
+        );
         assert_eq!(doc.get_pixel(10, 10), Some([1, 2, 3, 4]));
     }
 
@@ -853,11 +929,68 @@ mod tests {
     fn original_pixel_is_none_before_tile_saved_or_outside_stroke() {
         let mut history = History::new();
         // ストローク記録中でなければ None。
-        assert_eq!(history.original_pixel(5, 5), None);
+        assert_eq!(history.original_pixel_cursor().get(5, 5), None);
 
         history.begin_stroke(0);
         // まだそのタイルを退避していなければ None。
-        assert_eq!(history.original_pixel(5, 5), None);
+        assert_eq!(history.original_pixel_cursor().get(5, 5), None);
+    }
+
+    // -- v4-M2: `OriginalPixelCursor`(タイル探索キャッシュ)の回帰テスト
+    // (ARCHITECTURE.md §16.1)。1 スタンプの画素ループ全体で同じカーソルを
+    // 使い回すため、タイル境界をまたいで行き来しても値を取り違えない
+    // ことが特に重要(キャッシュした tile 座標の比較が壊れていた場合の
+    // 回帰検知)。-------------------------------------------------------
+
+    #[test]
+    fn original_pixel_cursor_does_not_return_stale_tile_after_crossing_boundary() {
+        // タイル(0,0)側の行を赤、タイル(1,0)側(x>=256)の行を青にしておき、
+        // これを「ストローク開始前」の値として退避する。
+        let mut doc = Document::new(300, 30, Background::Transparent);
+        for x in 250..256 {
+            doc.set_pixel(x, 15, [255, 0, 0, 255]);
+        }
+        for x in 256..262 {
+            doc.set_pixel(x, 15, [0, 0, 255, 255]);
+        }
+
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+        let rect = IRect {
+            x0: 250,
+            y0: 10,
+            x1: 262,
+            y1: 20,
+        };
+        history.ensure_tiles_saved(&doc, rect);
+        // 退避後に全画素を緑へ書き換える(退避値と現在値を区別できるように
+        // しておく)。
+        for x in 250..262 {
+            doc.set_pixel(x, 15, [0, 255, 0, 255]);
+        }
+
+        let mut cursor = history.original_pixel_cursor();
+        // タイル(0,0)側 → タイル(1,0)側 → タイル(0,0)側、と行き来する。
+        assert_eq!(
+            cursor.get(253, 15),
+            Some([255, 0, 0, 255]),
+            "tile(0,0) before crossing the boundary"
+        );
+        assert_eq!(
+            cursor.get(258, 15),
+            Some([0, 0, 255, 255]),
+            "tile(1,0) after crossing the boundary"
+        );
+        assert_eq!(
+            cursor.get(252, 15),
+            Some([255, 0, 0, 255]),
+            "back to tile(0,0) must not return the cached tile(1,0) snapshot"
+        );
+        assert_eq!(
+            cursor.get(259, 15),
+            Some([0, 0, 255, 255]),
+            "back to tile(1,0) must not return the cached tile(0,0) snapshot"
+        );
     }
 
     // -- v3 §18: Esc キャンセル(`restore_stroke_region`) ------------------
@@ -1326,5 +1459,56 @@ mod tests {
             doc.layers[0].pixels, merged_pixels,
             "redo must recompute the exact same merged pixels from the stored source layers"
         );
+    }
+
+    // -- v4 §16.1/SPEC §28: Esc キャンセルのタイル一括コピー -------------------
+
+    #[test]
+    fn restore_stroke_region_whole_layer_4000x4000_is_correct_and_terminates_quickly() {
+        // ARCHITECTURE.md §16.1・SPEC §28: 「Esc キャンセル: 全レイヤー浮動化
+        // のキャンセル復元をタイル一括コピーで 50ms 以下(4000×4000)」。
+        // 移動ツールでアクティブレイヤー全体を浮動化してから Esc でキャンセル
+        // する経路(`app.rs::cancel_floating` → `restore_stroke_region`)を
+        // 模した回帰テスト。`cargo test` はデバッグビルドのため実際の 50ms
+        // 目標そのものではなく、緩い上限で O(n^2) 的な劣化がないことだけを
+        // 保証する(実測のリリースビルド計測は別途行う、raster.rs の
+        // flood_fill 4000x4000 テストと同じ方針)。
+        let mut doc = Document::new(4000, 4000, Background::White);
+        let original = doc.active_pixels().to_vec();
+
+        let full_rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4000,
+            y1: 4000,
+        };
+
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+        // 移動ツールの浮動化は「全画素を退避してから透明化する」ので、
+        // ここでも全面を退避してから全面を書き換える(タイル退避の範囲を
+        // 現実のシナリオに揃えるため)。
+        history.ensure_tiles_saved(&doc, full_rect);
+        {
+            let surface = doc.active_surface_mut(None);
+            surface.pixels.fill(0);
+        }
+        assert_ne!(doc.active_pixels(), original.as_slice());
+
+        let start = std::time::Instant::now();
+        history.restore_stroke_region(&mut doc, full_rect);
+        let elapsed = start.elapsed();
+        history.cancel_stroke();
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "restore_stroke_region took suspiciously long (possible regression): {elapsed:?}"
+        );
+        assert_eq!(
+            doc.active_pixels(),
+            original.as_slice(),
+            "restore must byte-exactly revert the whole layer"
+        );
+        assert!(!history.can_undo(), "cancel must not push any undo entry");
     }
 }

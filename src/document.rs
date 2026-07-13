@@ -77,6 +77,154 @@ impl IRect {
     }
 }
 
+/// v4 §16.1(ARCHITECTURE.md): `Document::dirty` を単一矩形の union から、
+/// 上限付きのセグメント列へ一般化したもの。
+///
+/// v1〜v3 は `Option<IRect>` で「マージされた 1 個の外接矩形」を持っていたが、
+/// 高速ドラッグで 1 フレームに複数箇所へスタンプすると(ブラシが対角線を
+/// 横切るように動いた場合など)外接矩形がその間の触れていない領域まで
+/// 覆ってしまい、`recomposite`/テクスチャ部分更新のコストが実際の変更量に
+/// 対して不釣り合いに大きくなっていた(SPEC §28: 「ドラッグを横断する
+/// 巨大 dirty 矩形を作らない」)。`push` されたセグメントをそのまま
+/// (union せずに)保持し、`canvas_view` が各セグメントごとに個別に
+/// recomposite + テクスチャ部分更新することで、実際に触れた面積にコストを
+/// 比例させる。
+///
+/// 上限 `MAX_SEGMENTS` を超えて積もうとした場合だけ、末尾のセグメントへ
+/// union してまとめる(ARCHITECTURE.md §16.10-3: 「重複排除の複雑化より
+/// 単純さ優先」。1 フレームに 32 回を大きく超えてスタンプするような異常系
+/// でもメモリ・ループ回数が無制限には増えないことだけを保証する設計)。
+#[derive(Default, Clone)]
+pub struct DirtyRegion {
+    rects: Vec<IRect>,
+}
+
+/// セグメントの上限(ARCHITECTURE.md §16.1: 「小さな `Vec<IRect>`、上限 32
+/// 個で溢れたら合併」)。
+const MAX_DIRTY_SEGMENTS: usize = 32;
+
+impl DirtyRegion {
+    pub fn new() -> Self {
+        Self { rects: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    /// `rect` を新しいセグメントとして積む。空矩形は無視する
+    /// (呼び出し側の `Document::mark_dirty` が既に画像境界へクランプ済み
+    /// であること前提)。上限に達していれば、末尾のセグメントへ union して
+    /// セグメント数を増やさない。
+    pub fn push(&mut self, rect: IRect) {
+        if rect.is_empty() {
+            return;
+        }
+        if self.rects.len() >= MAX_DIRTY_SEGMENTS {
+            if let Some(last) = self.rects.last_mut() {
+                *last = last.union(&rect);
+            }
+            return;
+        }
+        self.rects.push(rect);
+    }
+
+    /// 現在のセグメント一覧(テスト・`recompose_if_dirty` 用)。
+    pub fn rects(&self) -> &[IRect] {
+        &self.rects
+    }
+
+    /// 蓄積したセグメントを取り出して空にする(`canvas_view` が毎フレーム、
+    /// テクスチャ部分更新のために消費する)。
+    pub fn take(&mut self) -> Vec<IRect> {
+        std::mem::take(&mut self.rects)
+    }
+
+    /// 中身を空にするだけ(取り出した内容が不要なとき、ARCHITECTURE.md
+    /// §16.1)。
+    pub fn clear(&mut self) {
+        self.rects.clear();
+    }
+}
+
+/// v4 §16.3/§21(ARCHITECTURE.md): 矩形限定だった選択を一般化した
+/// ビットマスク選択。`bbox`(半開区間)の内側だけを覆う `mask`(値は 0 か
+/// 255、フェザーは非目標)を持つ。`mask.len() == bbox.width() as usize *
+/// bbox.height() as usize` という不変条件を常に守る。
+///
+/// `IRect` と同じくここ(document.rs)に置くのは、`raster.rs` の `Surface`
+/// (描画クリップ、ARCHITECTURE.md §16.3)がこの型を直接参照する必要が
+/// あるため(`tools/select.rs` はこの型の上に `Selection`/`Floating` という
+/// 高レベルな概念と、`rect_mask`/`mask_boundary`/`resample_mask_nearest` と
+/// いった純関数を積む)。`document.rs`⇄`raster.rs` の相互参照は
+/// `IRect`(raster.rs が使う)/`Surface`(document.rs が使う)で既に存在して
+/// おり、同一クレート内の `mod` 間では問題にならない。
+#[derive(Debug, Clone)]
+pub struct SelMask {
+    pub bbox: IRect,
+    pub mask: Vec<u8>,
+}
+
+impl SelMask {
+    /// 空(何も選択されていない)マスク。
+    pub fn empty() -> Self {
+        Self {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+            },
+            mask: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bbox.is_empty()
+    }
+
+    /// `(x, y)`(画像座標)のマスク値。`bbox` の外は常に 0(パニックしない)。
+    pub fn get(&self, x: i32, y: i32) -> u8 {
+        if x < self.bbox.x0 || x >= self.bbox.x1 || y < self.bbox.y0 || y >= self.bbox.y1 {
+            return 0;
+        }
+        let w = self.bbox.width() as usize;
+        let idx = (y - self.bbox.y0) as usize * w + (x - self.bbox.x0) as usize;
+        self.mask.get(idx).copied().unwrap_or(0)
+    }
+
+    /// `(x, y)` が選択されているか(`get` が非 0 を返すか)。
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        self.get(x, y) != 0
+    }
+
+    /// `width`×`height` の範囲へクランプする(`bbox` を切り詰め、マスクを
+    /// 再インデックスして詰め直す)。選択は通常ドキュメントサイズが変わる
+    /// 操作の前に必ずコミット済み(commit_selection)になるため実運用では
+    /// 滅多に起きないが、防御的に用意しておく安全弁。
+    pub fn clamp_to(&self, width: u32, height: u32) -> SelMask {
+        let new_bbox = self.bbox.clamp_to(width, height);
+        if new_bbox.is_empty() {
+            return SelMask::empty();
+        }
+        if new_bbox == self.bbox {
+            return self.clone();
+        }
+        let w = new_bbox.width() as usize;
+        let h = new_bbox.height() as usize;
+        let mut mask = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                mask[y * w + x] = self.get(new_bbox.x0 + x as i32, new_bbox.y0 + y as i32);
+            }
+        }
+        SelMask {
+            bbox: new_bbox,
+            mask,
+        }
+    }
+}
+
 /// 新規ドキュメント作成時の背景(SPEC §7 の「新規」ダイアログの選択肢)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Background {
@@ -144,8 +292,9 @@ pub struct Document {
     pub composite: Vec<u8>,
     pub path: Option<PathBuf>,
     pub modified: bool,
-    /// 前フレーム以降に変更された領域(合成の再計算・テクスチャ部分更新用)。
-    pub dirty: Option<IRect>,
+    /// 前フレーム以降に変更された領域群(合成の再計算・テクスチャ部分更新用、
+    /// v4 §16.1: セグメント単位、`DirtyRegion` 参照)。
+    pub dirty: DirtyRegion,
 }
 
 impl Document {
@@ -185,7 +334,7 @@ impl Document {
             composite: Vec::new(),
             path,
             modified: false,
-            dirty: None,
+            dirty: DirtyRegion::new(),
         };
         doc.recomposite_full();
         doc
@@ -216,12 +365,16 @@ impl Document {
     }
 
     /// `raster.rs` の関数へ渡すための、アクティブレイヤーのバッファビュー。
-    pub fn active_surface_mut(&mut self) -> Surface<'_> {
+    /// `clip`(v4 §16.3: 選択があるときの描画クリップ)は `Surface::set_pixel`
+    /// が内部で見る。選択が無ければ `None` を渡すこと(コストがゼロになる、
+    /// ARCHITECTURE.md §16.10-2)。
+    pub fn active_surface_mut<'a>(&'a mut self, clip: Option<&'a SelMask>) -> Surface<'a> {
         let (width, height) = (self.width, self.height);
         Surface {
             width,
             height,
             pixels: &mut self.active_layer_mut().pixels,
+            clip,
         }
     }
 
@@ -256,24 +409,21 @@ impl Document {
     // dirty 管理・合成(ARCHITECTURE.md §14.1, §14.9-2)
     // -----------------------------------------------------------------
 
-    /// `rect` を `dirty` にマージする。空矩形はマージしない。
+    /// `rect` を `dirty` に新しいセグメントとして積む(v4 §16.1: もはや 1 個の
+    /// 外接矩形へ union しない、`DirtyRegion` 参照)。空矩形は無視する。
     pub fn mark_dirty(&mut self, rect: IRect) {
         let rect = rect.clamp_to(self.width, self.height);
-        if rect.is_empty() {
-            return;
-        }
-        self.dirty = Some(match self.dirty {
-            Some(existing) => existing.union(&rect),
-            None => rect,
-        });
+        self.dirty.push(rect);
     }
 
     /// 画像全体を `dirty` にする(レイヤー構造の変更・サイズ変更・反転など、
     /// 局所矩形では表せない/全画素が変わりうる操作向け、
     /// ARCHITECTURE.md §14.9-2: 「合成キャッシュの整合: レイヤー構造変更は
-    /// 必ず全面 dirty」)。
+    /// 必ず全面 dirty」)。全面矩形は他のどんなセグメントも覆うので、既存の
+    /// セグメントは先にクリアしてから積む(無駄なセグメントを残さない)。
     pub fn mark_all_dirty(&mut self) {
-        self.dirty = Some(IRect {
+        self.dirty.clear();
+        self.dirty.push(IRect {
             x0: 0,
             y0: 0,
             x1: self.width as i32,
@@ -308,12 +458,19 @@ impl Document {
         });
     }
 
-    /// `dirty`(未反映の編集領域)があれば、その範囲だけ `composite` を
-    /// 最新化する。`dirty` 自体はクリアしない(テクスチャ部分更新
+    /// `dirty`(未反映の編集領域)があれば、そのセグメントごとに `composite`
+    /// を最新化する。`dirty` 自体はクリアしない(テクスチャ部分更新
     /// (`canvas_view`)が別途消費するため)。スポイト(SPEC §13)など、
     /// フレームの描画を待たずに合成結果を読みたい箇所から呼ぶ。
     pub fn recompose_if_dirty(&mut self) {
-        if let Some(rect) = self.dirty {
+        if self.dirty.is_empty() {
+            return;
+        }
+        // `self.dirty.rects()` は `&self` を借用するため、`self.recomposite`
+        // (`&mut self`)と同時には持てない。セグメント数は高々
+        // `MAX_DIRTY_SEGMENTS` 個なので複製のコストは無視できる。
+        let rects = self.dirty.rects().to_vec();
+        for rect in rects {
             self.recomposite(rect);
         }
     }
@@ -618,27 +775,46 @@ pub(crate) fn composite_two(lower: &Layer, upper: &Layer, width: u32, height: u3
 /// (いずれも全面)が共有する(ARCHITECTURE.md §14.1 の合成規則を 1 箇所に
 /// まとめ、実装がずれないようにするため)。`out` は `width*height*4` バイト
 /// (`Document::composite` と同じレイアウト)であること。
+///
+/// v4 §16.1: 画素ごとに `y*w+x` のインデックス計算と境界チェック付き
+/// `get`/`get_mut` を呼んでいたホットループを、行(`rect` の 1 行ぶん)単位の
+/// スライスに書き直した。行の開始オフセットは 1 行につき 1 回だけ計算し、
+/// 行の内側は `chunks_exact(4)` の `zip` で画素を回すため、画素単位の
+/// 境界チェック呼び出しがなくなる(`recomposite` は起動時・レイヤー変更・
+/// 描画のたびに `dirty` セグメントぶん呼ばれるため、4000×4000 全面合成
+/// (画像の統合・保存前など)のコストに直結する)。
 fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) {
     let w = width as usize;
+    if rect.is_empty() {
+        return;
+    }
+    let x0 = rect.x0 as usize;
+    let x1 = rect.x1 as usize;
+    let row_bytes = (x1 - x0) * 4;
+
     for y in rect.y0..rect.y1 {
-        for x in rect.x0..rect.x1 {
-            let idx = (y as usize * w + x as usize) * 4;
-            let mut acc = [0u8, 0, 0, 0];
-            for layer in layers {
-                if !layer.visible || layer.opacity == 0 {
-                    continue;
-                }
-                let Some(px) = layer.pixels.get(idx..idx + 4) else {
-                    continue;
-                };
-                let mut src = [px[0], px[1], px[2], px[3]];
-                if layer.opacity != 255 {
-                    src[3] = ((src[3] as u32 * layer.opacity as u32) / 255) as u8;
-                }
-                acc = raster::blend_over(acc, src);
+        let row_start = (y as usize * w + x0) * 4;
+        let row_end = row_start + row_bytes;
+        let Some(out_row) = out.get_mut(row_start..row_end) else {
+            continue;
+        };
+        // 各画素は透明(acc=[0,0,0,0])から積み上げる(v1 の意味論どおり)。
+        out_row.fill(0);
+        for layer in layers {
+            if !layer.visible || layer.opacity == 0 {
+                continue;
             }
-            if let Some(slot) = out.get_mut(idx..idx + 4) {
-                slot.copy_from_slice(&acc);
+            let Some(layer_row) = layer.pixels.get(row_start..row_end) else {
+                continue;
+            };
+            let opacity = layer.opacity;
+            for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
+                let mut s = [src[0], src[1], src[2], src[3]];
+                if opacity != 255 {
+                    s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
+                }
+                let d = [dst[0], dst[1], dst[2], dst[3]];
+                dst.copy_from_slice(&raster::blend_over(d, s));
             }
         }
     }
@@ -880,7 +1056,7 @@ mod tests {
             .all(|p| p == [255, 255, 255, 255]));
         assert!(!doc.modified);
         assert!(doc.path.is_none());
-        assert!(doc.dirty.is_none());
+        assert!(doc.dirty.is_empty());
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.layers[0].name, "背景");
         assert_eq!(doc.active, 0);
@@ -1039,7 +1215,11 @@ mod tests {
     }
 
     #[test]
-    fn mark_dirty_merges_regions() {
+    fn mark_dirty_keeps_segments_separate_instead_of_bbox_union() {
+        // v4 §16.1: 離れた矩形を 1 個の外接矩形へ union してしまうと、その間の
+        // 触れていない領域まで recomposite/テクスチャ部分更新の対象になり、
+        // 高速ドラッグで「ドラッグを横断する巨大 dirty 矩形」(SPEC §28)が
+        // できてしまう。新しい実装は各セグメントを個別に保持する。
         let mut doc = Document::new(10, 10, Background::White);
         doc.mark_dirty(IRect {
             x0: 0,
@@ -1053,8 +1233,24 @@ mod tests {
             x1: 7,
             y1: 7,
         });
-        let dirty = doc.dirty.expect("dirty should be set");
-        assert_eq!((dirty.x0, dirty.y0, dirty.x1, dirty.y1), (0, 0, 7, 7));
+        let rects = doc.dirty.rects();
+        assert_eq!(
+            rects.len(),
+            2,
+            "expected two separate dirty segments, got {rects:?}"
+        );
+        assert!(rects.contains(&IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2
+        }));
+        assert!(rects.contains(&IRect {
+            x0: 5,
+            y0: 5,
+            x1: 7,
+            y1: 7
+        }));
     }
 
     #[test]
@@ -1066,8 +1262,17 @@ mod tests {
             x1: 100,
             y1: 100,
         });
-        let dirty = doc.dirty.expect("dirty should be set");
-        assert_eq!((dirty.x0, dirty.y0, dirty.x1, dirty.y1), (0, 0, 4, 4));
+        let rects = doc.dirty.rects();
+        assert_eq!(rects.len(), 1);
+        assert_eq!(
+            rects[0],
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 4,
+                y1: 4
+            }
+        );
     }
 
     #[test]
@@ -1075,13 +1280,48 @@ mod tests {
         let mut doc = Document::new(6, 5, Background::White);
         doc.mark_all_dirty();
         assert_eq!(
-            doc.dirty,
-            Some(IRect {
+            doc.dirty.rects(),
+            &[IRect {
                 x0: 0,
                 y0: 0,
                 x1: 6,
                 y1: 5
-            })
+            }]
+        );
+    }
+
+    #[test]
+    fn mark_all_dirty_clears_previously_queued_segments() {
+        let mut doc = Document::new(6, 5, Background::White);
+        doc.mark_dirty(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        });
+        doc.mark_all_dirty();
+        // 全面 dirty は他のどのセグメントも覆うので、古いセグメントを残さない。
+        assert_eq!(doc.dirty.rects().len(), 1);
+    }
+
+    #[test]
+    fn dirty_region_caps_segment_count_by_merging_into_the_last_one() {
+        // v4 §16.1: 上限(32)を超えて積もうとしたら末尾のセグメントへ union
+        // する(セグメント数を無制限に増やさない)。
+        let mut doc = Document::new(2000, 10, Background::White);
+        for i in 0..40 {
+            let x = i * 10;
+            doc.mark_dirty(IRect {
+                x0: x,
+                y0: 0,
+                x1: x + 2,
+                y1: 2,
+            });
+        }
+        assert!(
+            doc.dirty.rects().len() <= 32,
+            "expected the segment count to stay capped, got {}",
+            doc.dirty.rects().len()
         );
     }
 
@@ -1130,7 +1370,7 @@ mod tests {
         doc.layers[0] = Layer::filled("背景", 4, 4, [10, 20, 30, 255]);
         doc.recomposite_full();
         // 合成後にレイヤーを直接いじり、rect 外は古いままであることを確認する。
-        doc.layers[0].pixels = vec![99, 99, 99, 255].repeat(16);
+        doc.layers[0].pixels = [99, 99, 99, 255].repeat(16);
         doc.recomposite(IRect {
             x0: 0,
             y0: 0,
@@ -1144,7 +1384,7 @@ mod tests {
     #[test]
     fn recompose_if_dirty_is_noop_when_not_dirty() {
         let mut doc = Document::new(2, 2, Background::White);
-        doc.dirty = None;
+        doc.dirty.clear();
         doc.composite[0] = 7; // 手動で汚しても recompose_if_dirty は触らない。
         doc.recompose_if_dirty();
         assert_eq!(doc.composite[0], 7);
@@ -1548,5 +1788,38 @@ mod tests {
         let mut doc = Document::new(1, 1, Background::White);
         doc.active = 99;
         assert_eq!(doc.active_index(), 0);
+    }
+
+    // -- v4 §16.1: recomposite の行スライス化(回帰検知用の緩い時間上限) ------
+
+    #[test]
+    fn recomposite_full_multi_layer_4000x4000_is_correct_and_terminates_quickly() {
+        // ARCHITECTURE.md §16.1: 「recomposite … の行処理を chunks_exact(4)
+        // ベースの行スライスに書き直し」「release の時間計測テスト(緩い上限
+        // +回帰検知)を追加」。`cargo test` は最適化なしのデバッグビルドで
+        // 走る(境界チェック付きピクセルアクセスの定数倍がリリースの数十倍
+        // になりうる、raster.rs の flood_fill 4000x4000 テストと同じ注記)
+        // ため、ここでは実際の性能目標(SPEC §28)そのものではなく、
+        // O(n^2) 的な劣化や無限ループが無いことだけを緩い上限で保証する。
+        // 実測のリリースビルド計測は別途行う。
+        let mut doc = Document::new(4000, 4000, Background::Transparent);
+        doc.layers[0] = Layer::filled("下", 4000, 4000, [255, 0, 0, 255]);
+        doc.layers
+            .push(Layer::filled("上", 4000, 4000, [0, 255, 0, 128]));
+        doc.layers
+            .push(Layer::filled("最上", 4000, 4000, [0, 0, 255, 64]));
+
+        let start = std::time::Instant::now();
+        doc.recomposite_full();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "recomposite_full took suspiciously long (possible regression): {elapsed:?}"
+        );
+        // 3 層(不透明赤 → 半透明緑 → 薄い青)を合成した結果が透明ではない
+        // ことだけ、正しさの簡易確認として見ておく。
+        let px = doc.composite_pixel(0, 0).unwrap();
+        assert_eq!(px[3], 255);
     }
 }

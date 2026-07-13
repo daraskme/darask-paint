@@ -1,0 +1,70 @@
+name: CI
+
+# ARCHITECTURE.md §16.8: main への push と PR で fmt → clippy(-D warnings)→
+# release ビルド → release テストを回す。ベンチ(GUI 起動)は必須ジョブに
+# 含めない別ジョブとし、ランナーがヘッドレスで失敗しても CI 全体は失敗
+# させない(§16.10-8)。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (警告 0)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test --release
+        run: cargo test --release
+
+  bench-smoke:
+    # SPEC §28/ARCHITECTURE.md §16.10-8: windows ランナーはヘッドレスで
+    # GL コンテキスト作成に失敗しうるため、このジョブの失敗は CI 全体の
+    # 成否に影響させない。
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: 起動ベンチ(DARASK_BENCH=1)を実行して bench.txt を表示
+        # v4 レビューで発見・修正したバグ: darask-paint.exe は main.rs の
+        # `#![windows_subsystem = "windows"]` により GUI サブシステムの exe
+        # であり、`& .\target\release\darask-paint.exe`(素の呼び出し。標準
+        # 出力へのパイプ有無を問わず)は子プロセスの終了を待たずに即座に
+        # 次行へ進む。直後の `Get-Content bench.txt` の時点ではファイルが
+        # まだ書き出されておらず(実機再現: 呼び出し復帰直後は bench.txt
+        # 不存在、約 200〜300ms 後に生成される)、GL コンテキストが作れる
+        # ランナー上でも毎回「ファイルが見つからない」で失敗していた
+        # (`continue-on-error: true` によりジョブ自体は緑のまま隠れて
+        # 壊れ続けていた)。`Start-Process -Wait` でプロセス終了を確実に
+        # 待ってから読む。ハング防止に `timeout-minutes` も設定する。
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $env:DARASK_BENCH = '1'
+          Start-Process -FilePath .\target\release\darask-paint.exe -Wait -NoNewWindow
+          Get-Content bench.txt

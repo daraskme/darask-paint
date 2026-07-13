@@ -327,9 +327,7 @@ fn resolve_drag_mode(
     if !primary_down {
         return None;
     }
-    let Some(pos) = pos else {
-        return None;
-    };
+    let pos = pos?;
     if let Some(existing) = current {
         return Some(existing);
     }

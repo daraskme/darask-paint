@@ -98,12 +98,16 @@ pub fn paint_tool_icon(kind: ToolKind, painter: &Painter, rect: Rect, color: Col
         ToolKind::Rect => rect_icon(painter, rect, color),
         ToolKind::Ellipse => ellipse_icon(painter, rect, color),
         ToolKind::Fill => fill_icon(painter, rect, color),
+        ToolKind::Gradient => gradient_icon(painter, rect, color),
         ToolKind::Picker => picker_icon(painter, rect, color),
         ToolKind::Select => select_icon(painter, rect, color),
         ToolKind::Pan => pan_icon(painter, rect, color),
         ToolKind::Move => move_icon(painter, rect, color),
         ToolKind::Zoom => zoom_icon(painter, rect, color),
         ToolKind::Text => text_icon(painter, rect, color),
+        ToolKind::EllipseSelect => ellipse_select_icon(painter, rect, color),
+        ToolKind::Lasso => lasso_icon(painter, rect, color),
+        ToolKind::MagicWand => magic_wand_icon(painter, rect, color),
     }
 }
 
@@ -201,6 +205,42 @@ fn fill_icon(painter: &Painter, rect: Rect, color: Color32) {
     painter.circle_filled(p(rect, 0.78, 0.32), rect.width() * 0.10, color);
 }
 
+/// グラデーション = 濃淡の帯+ドラッグ方向を示す矢印(v4 §23)。塗りつぶし
+/// (バケツ)とは対照的な、明確に「連続的な変化」を思わせる意匠にする。
+fn gradient_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let box_rect = Rect::from_min_max(p(rect, 0.16, 0.24), p(rect, 0.84, 0.62));
+
+    // 不透明→透明の帯(SPEC §23 の「グラデーション」の見た目そのもの)。
+    const BANDS: i32 = 6;
+    for i in 0..BANDS {
+        let t0 = i as f32 / BANDS as f32;
+        let t1 = (i + 1) as f32 / BANDS as f32;
+        let alpha = (255.0 * (1.0 - i as f32 / (BANDS - 1) as f32))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let band_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+        let band_rect = Rect::from_min_max(
+            pos2(box_rect.min.x + t0 * box_rect.width(), box_rect.min.y),
+            pos2(box_rect.min.x + t1 * box_rect.width(), box_rect.max.y),
+        );
+        painter.rect_filled(band_rect, 0.0, band_color);
+    }
+    painter.rect_stroke(box_rect, 1.0, st, egui::StrokeKind::Middle);
+
+    // ドラッグ方向を示す矢印(始点→終点、SPEC §23: 「ドラッグで始点→終点」)。
+    let arrow_from = p(rect, 0.20, 0.82);
+    let arrow_to = p(rect, 0.80, 0.82);
+    painter.line_segment([arrow_from, arrow_to], st);
+    arrow_head(
+        painter,
+        arrow_to,
+        (arrow_to - arrow_from).normalized(),
+        rect.width() * 0.09,
+        color,
+    );
+}
+
 /// スポイト = 斜めのスポイト(SPEC §15)。軸+球部+採取した色の滴。
 fn picker_icon(painter: &Painter, rect: Rect, color: Color32) {
     let st = line_stroke(rect, color);
@@ -222,6 +262,64 @@ fn select_icon(painter: &Painter, rect: Rect, color: Color32) {
     let dash = rect.width() * 0.10;
     let gap = rect.width() * 0.07;
     painter.extend(Shape::dashed_line(&path, st, dash, gap));
+}
+
+/// 楕円選択 = 破線楕円(v4 §22)。`select_icon`(矩形の破線枠)と対になる
+/// 意匠にし、Shift+M で巡回する 2 つのツールが一目で見分けられるようにする。
+fn ellipse_select_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let center = p(rect, 0.5, 0.5);
+    let radius = vec2(rect.width() * 0.34, rect.height() * 0.30);
+    let steps = 32;
+    let path: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32 * std::f32::consts::TAU;
+            center + vec2(radius.x * t.cos(), radius.y * t.sin())
+        })
+        .collect();
+    let dash = rect.width() * 0.09;
+    let gap = rect.width() * 0.06;
+    painter.extend(Shape::dashed_line(&path, st, dash, gap));
+}
+
+/// なげなわ = 不定形の破線ループ+持ち手(v4 §22)。矩形/楕円の規則的な
+/// 破線枠とは違う「手描きの投げ縄」の輪郭であることを一目で示す。
+fn lasso_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let loop_points = [
+        p(rect, 0.32, 0.30),
+        p(rect, 0.54, 0.16),
+        p(rect, 0.78, 0.28),
+        p(rect, 0.84, 0.50),
+        p(rect, 0.64, 0.68),
+        p(rect, 0.40, 0.64),
+        p(rect, 0.22, 0.48),
+        p(rect, 0.26, 0.34),
+    ];
+    let dash = rect.width() * 0.08;
+    let gap = rect.width() * 0.055;
+    let mut path = loop_points.to_vec();
+    path.push(loop_points[0]);
+    painter.extend(Shape::dashed_line(&path, st, dash, gap));
+    // ループの結び目から伸びる持ち手(実線)。
+    painter.line_segment([loop_points[0], p(rect, 0.14, 0.86)], st);
+}
+
+/// 自動選択 = 魔法の杖(先端のきらめき、v4 §22)。バケツ(塗りつぶし)と
+/// 判定基準は同じだが、道具としての見た目は明確に区別する。
+fn magic_wand_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let tip = p(rect, 0.76, 0.24);
+    let handle = p(rect, 0.24, 0.82);
+    painter.line_segment([handle, tip], st);
+    sparkle_cross(painter, tip, rect.width() * 0.13, st);
+    sparkle_cross(painter, p(rect, 0.34, 0.30), rect.width() * 0.06, st);
+}
+
+/// `magic_wand_icon` のきらめき(大きさ違いの十字を 2 個描くだけの最小意匠)。
+fn sparkle_cross(painter: &Painter, center: Pos2, size: f32, stroke: Stroke) {
+    painter.line_segment([center - vec2(size, 0.0), center + vec2(size, 0.0)], stroke);
+    painter.line_segment([center - vec2(0.0, size), center + vec2(0.0, size)], stroke);
 }
 
 /// 手のひら = 十字矢印(SPEC §15、「手」の代替表現)。

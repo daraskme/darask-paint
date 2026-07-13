@@ -16,6 +16,11 @@ use crate::keymap::{self, Action};
 pub enum MenuAction {
     New,
     Open,
+    /// v4 §26: 「最近使ったファイル」サブメニューの `index` 番目
+    /// (`MenuState::recent_files` と同じ添字)。`PathBuf` を持たせると
+    /// `Copy` にできなくなるため、添字だけを運ぶ(`app.rs::open_recent_file`
+    /// が実際のパスを引く)。
+    OpenRecent(usize),
     Save,
     SaveAs,
     Exit,
@@ -34,10 +39,17 @@ pub enum MenuAction {
     FlipVertical,
     RotateCw,
     RotateCcw,
+    // -- v4 §24: 色調補正(ARCHITECTURE.md §16.5) --------------------------
+    BrightnessContrast,
+    HueSaturation,
+    Invert,
+    Grayscale,
     ZoomIn,
     ZoomOut,
     Zoom100,
     FitWindow,
+    // -- v4 §25: ピクセルグリッド --------------------------------------------
+    TogglePixelGrid,
     // -- v2 §13: レイヤーメニュー(ARCHITECTURE.md §14.8 V2-M2) -----------
     LayerAdd,
     LayerDuplicate,
@@ -46,10 +58,13 @@ pub enum MenuAction {
     LayerMoveDown,
     LayerMergeDown,
     LayerFlatten,
+    // -- v4 §26: ヘルプメニュー ------------------------------------------
+    About,
 }
 
-/// メニュー項目の有効/無効判定に使う状態。
-pub struct MenuState {
+/// メニュー項目の有効/無効判定に使う状態。`recent_files` を借用するため
+/// ライフタイム付き(v4 §26)。
+pub struct MenuState<'a> {
     pub can_undo: bool,
     pub can_redo: bool,
     /// 選択または浮動片がある(切り取り/コピー/削除/トリミングを有効にする)。
@@ -62,6 +77,12 @@ pub struct MenuState {
     pub can_move_layer_down: bool,
     pub can_merge_layer_down: bool,
     pub can_flatten_layers: bool,
+    /// v4 §25: 表示メニューの「ピクセルグリッド」チェック表示用(実際の
+    /// トグルは `MenuAction::TogglePixelGrid` を経由して app.rs が行う)。
+    pub pixel_grid_visible: bool,
+    /// v4 §26: 「ファイル > 最近使ったファイル」サブメニューの中身
+    /// (先頭が最新、`app.rs::recent_files` と同じ順序)。
+    pub recent_files: &'a std::collections::VecDeque<std::path::PathBuf>,
 }
 
 /// クリックされた項目があれば返す(複数同時クリックは起こらないので
@@ -82,6 +103,24 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     action = Some(MenuAction::Open);
                     ui.close();
                 }
+                // v4 §26: 「最近使ったファイル」サブメニュー。
+                ui.menu_button("最近使ったファイル", |ui| {
+                    if state.recent_files.is_empty() {
+                        ui.weak("(なし)");
+                    } else {
+                        for (i, path) in state.recent_files.iter().enumerate() {
+                            let full_path = path.to_string_lossy().into_owned();
+                            let label = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| full_path.clone());
+                            if ui.button(label).on_hover_text(&full_path).clicked() {
+                                action = Some(MenuAction::OpenRecent(i));
+                                ui.close();
+                            }
+                        }
+                    }
+                });
                 if ui
                     .button(keymap::menu_label("上書き保存", Action::Save))
                     .clicked()
@@ -220,6 +259,38 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     action = Some(MenuAction::RotateCcw);
                     ui.close();
                 }
+                ui.separator();
+                // v4 §24: 色調補正サブメニュー。
+                ui.menu_button("色調補正", |ui| {
+                    if ui.button("明るさ・コントラスト…").clicked() {
+                        action = Some(MenuAction::BrightnessContrast);
+                        ui.close();
+                    }
+                    if ui
+                        .button(keymap::menu_label(
+                            "色相・彩度・明度…",
+                            Action::HueSaturation,
+                        ))
+                        .clicked()
+                    {
+                        action = Some(MenuAction::HueSaturation);
+                        ui.close();
+                    }
+                    if ui
+                        .button(keymap::menu_label("階調の反転", Action::Invert))
+                        .clicked()
+                    {
+                        action = Some(MenuAction::Invert);
+                        ui.close();
+                    }
+                    if ui
+                        .button(keymap::menu_label("グレースケール化", Action::Grayscale))
+                        .clicked()
+                    {
+                        action = Some(MenuAction::Grayscale);
+                        ui.close();
+                    }
+                });
             });
             ui.menu_button("レイヤー", |ui| {
                 if ui
@@ -322,6 +393,25 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     .clicked()
                 {
                     action = Some(MenuAction::FitWindow);
+                    ui.close();
+                }
+                ui.separator();
+                // v4 §25: 「ピクセルグリッド…表示メニューにトグル」。実体は
+                // `bool` フィールドを持たないので `Checkbox` の見た目だけ
+                // (`app.rs::MenuState::pixel_grid_visible`)借り、実際の状態
+                // 更新は `MenuAction::TogglePixelGrid` を経由して app.rs が行う
+                // (このモジュールは他のメニュー項目と同じく `&mut self` を
+                // 持たない設計を保つ)。
+                let mut checked = state.pixel_grid_visible;
+                if ui.checkbox(&mut checked, "ピクセルグリッド").clicked() {
+                    action = Some(MenuAction::TogglePixelGrid);
+                    ui.close();
+                }
+            });
+            // v4 §26: 「ヘルプ」メニュー(バージョン情報)。
+            ui.menu_button("ヘルプ", |ui| {
+                if ui.button("バージョン情報").clicked() {
+                    action = Some(MenuAction::About);
                     ui.close();
                 }
             });

@@ -13,8 +13,9 @@ Rust + eframe/egui。単一 exe。UI は日本語。
 - 起動ベンチ兼スモークテスト(GUI 対話不要・自動終了): PowerShell で `$env:DARASK_BENCH='1'; cargo run` → `bench.txt` に起動ミリ秒が書かれる
 
 ## 鉄則
-- 最優先は「起動速度・軽さ・シンプルさ」。機能追加より起動 300ms 以内を守る。
-- 依存 crate は eframe / image / rfd / arboard / ab_glyph(v3 テキストツール用、egui と同版に `=` 固定)のみ。追加しない。
-- ビルドはエラー 0・警告 0。`cargo fmt` 適用。純粋ロジックにはテスト。
+- 最優先は「起動速度・軽さ・シンプルさ」。機能追加より起動 300ms 以内(目標 160ms)を守る。
+- 依存 crate は eframe / image / rfd / arboard / ab_glyph のみ。build-dependency は winresource のみ。追加しない。
+- ビルドはエラー 0・警告 0。`cargo clippy --all-targets -- -D warnings` グリーン(v4 以降)。`cargo fmt` 適用。純粋ロジックにはテスト。
 - I/O・ユーザー入力経路で `unwrap()` しない。パニックせずトーストで通知。
 - 無条件の `request_repaint()` 禁止(アイドル CPU 0% 要件)。
+- CI は GitHub Actions(.github/workflows/)。リリースは `v*` タグ push で自動作成。

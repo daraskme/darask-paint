@@ -1,0 +1,38 @@
+name: Release
+
+# ARCHITECTURE.md §16.8/SPEC §29: `v*` タグ push でリリースビルドを作り、
+# exe を zip に固めて GitHub Release を自動作成する(自動生成ノート付き)。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: zip に固める
+        shell: pwsh
+        run: |
+          $zipName = "darask-paint-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path target/release/darask-paint.exe -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: GitHub Release を作成
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
