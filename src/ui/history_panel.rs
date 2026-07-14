@@ -17,9 +17,7 @@ use crate::history::History;
 /// SPEC §35: 「先頭には常に仮想的な「(初期状態)」行がある」。
 const INITIAL_STATE_LABEL: &str = "(初期状態)";
 
-/// SPEC §35: 「リスト先頭に「(これ以前の履歴は破棄されました)」という
-/// 灰色の注記行を表示する」。
-const TRUNCATED_NOTE: &str = "(これ以前の履歴は破棄されました)";
+const OLDER_HISTORY_NOTE: &str = "(古い履歴もプロジェクトに保存されます)";
 
 /// 履歴パネルを描画する(アクティブタブの `History` を渡す。タブ切替時は
 /// 呼び出し側が渡す `history` が自然に切り替わるだけで追随する、
@@ -31,20 +29,27 @@ pub fn show(ui: &mut egui::Ui, history: &History) -> Option<usize> {
     ui.add_space(4.0);
 
     let current_len = history.undo_len();
+    let redo_len = history.redo_labels_reversed().len();
+    let display_limit = history.display_step_limit();
+    let mut undo_take = current_len.min(display_limit.div_ceil(2));
+    let mut redo_take = redo_len.min(display_limit.saturating_sub(undo_take));
+    let remaining = display_limit.saturating_sub(undo_take + redo_take);
+    undo_take += current_len.saturating_sub(undo_take).min(remaining);
+    let remaining = display_limit.saturating_sub(undo_take + redo_take);
+    redo_take += redo_len.saturating_sub(redo_take).min(remaining);
+    let undo_start = current_len.saturating_sub(undo_take);
 
     egui::ScrollArea::vertical()
         .max_height(140.0)
         .auto_shrink([false, true])
         .id_salt("darask_history_panel_scroll")
         .show(ui, |ui| {
-            // SPEC §35: 破棄されたエントリがあれば先頭に注記(非クリック、
-            // 灰色)。
-            if history.is_truncated() {
-                ui.weak(TRUNCATED_NOTE);
+            if undo_start > 0 {
+                ui.weak(OLDER_HISTORY_NOTE);
             }
 
             // 仮想「(初期状態)」行。target_len = 0(未編集の状態まで戻る)。
-            if row(ui, INITIAL_STATE_LABEL, current_len == 0, false).clicked() {
+            if undo_start == 0 && row(ui, INITIAL_STATE_LABEL, current_len == 0, false).clicked() {
                 jump_target = Some(0);
             }
 
@@ -52,7 +57,7 @@ pub fn show(ui: &mut egui::Ui, history: &History) -> Option<usize> {
             // すると、そのラベルの操作を適用した直後の状態(target_len =
             // i + 1)まで戻る/進む。末尾(target_len == current_len)が
             // 「現在位置」。
-            for (i, label) in history.undo_labels().enumerate() {
+            for (i, label) in history.undo_labels().enumerate().skip(undo_start) {
                 let target = i + 1;
                 if row(ui, label, target == current_len, false).clicked() {
                     jump_target = Some(target);
@@ -62,7 +67,7 @@ pub fn show(ui: &mut egui::Ui, history: &History) -> Option<usize> {
             // redo_stack: 「逆順(直近の undo ほど上)」で、現在位置の直後
             // から時系列順に続く(`History::redo_labels_reversed` のドキュ
             // メント参照)。淡色表示、target_len は現在位置からの通し番号。
-            for (j, label) in history.redo_labels_reversed().enumerate() {
+            for (j, label) in history.redo_labels_reversed().take(redo_take).enumerate() {
                 let target = current_len + j + 1;
                 if row(ui, label, false, true).clicked() {
                     jump_target = Some(target);
@@ -147,9 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_history_renders_the_note_without_a_click_and_returns_none() {
-        // 破棄フラグを立てるだけなので、実際のピクセル領域は不要
-        // (空の `regions` の `Patch` で十分)。
+    fn cache_hint_does_not_truncate_or_break_history_rendering() {
         let mut history = History::new();
         history.set_max_steps(2);
         for label in ["a", "b", "c"] {
@@ -161,8 +164,6 @@ mod tests {
                 label,
             );
         }
-        assert!(history.is_truncated());
-
         assert_eq!(render_without_clicking(&history), None);
     }
 

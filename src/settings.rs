@@ -63,7 +63,7 @@ pub const DEFAULT_BRUSH_HARDNESS: u8 = 100;
 pub const DEFAULT_BRUSH_OPACITY: u8 = 100;
 pub const DEFAULT_BRUSH_SMOOTHING: u8 = 0;
 
-/// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」(1–500、既定 50)。
+/// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。
 /// `history.rs::DEFAULT_MAX_STEPS`(`History::new()` の既定値)と同じ 50 だが、
 /// あちらは `usize`・こちら側は設定ファイルの値域を表す `u32` で、モジュールも
 /// 独立している(`history.rs` は `settings.rs` を知らない)ため、値としてだけ
@@ -71,7 +71,7 @@ pub const DEFAULT_BRUSH_SMOOTHING: u8 = 0;
 /// `default_max_undo_steps_is_50` と `history.rs` 側の
 /// `DEFAULT_MAX_STEPS` を使うテストの双方を確認する)。
 pub const DEFAULT_MAX_UNDO_STEPS: u32 = 50;
-/// SPEC §34: 「保持数」の入力範囲(1–500)。
+/// SPEC §34: 「表示件数」の入力範囲(1–500)。
 pub const MIN_MAX_UNDO_STEPS: u32 = 1;
 pub const MAX_MAX_UNDO_STEPS: u32 = 500;
 
@@ -103,9 +103,8 @@ pub struct Settings {
     pub user_palette: Vec<Color32>,
     pub last_tool: ToolKind,
     pub show_pixel_grid: bool,
-    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」
-    /// (1–500、既定 50)。設定ダイアログ(v6-M2)の OK で更新され、開いている
-    /// 全タブの `History::set_max_steps` へ即座に反映される
+    /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。設定
+    /// ダイアログの OK で更新され、開いている全タブへ即座に反映される
     /// (`app.rs::apply_preferences` 参照)。
     pub max_undo_steps: u32,
 }

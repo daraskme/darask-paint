@@ -495,11 +495,21 @@ impl Tab {
     /// `max_undo_steps`(SPEC §34/ARCHITECTURE.md §18.2・§18.6-2): 新規タブの
     /// `History` は `History::new()` の既定(50)のまま作られるため、設定
     /// ダイアログで既に別の値へ変更済みなら、ここで `set_max_steps` を呼んで
-    /// 新規タブにも同じ上限を適用する(呼び出し元は常に
+    /// 新規タブにも同じ表示件数を適用する(呼び出し元は常に
     /// `DaraskApp::max_undo_steps` を渡す — 新規タブだけ既定値に取り残される
     /// バグを防ぐ)。
     fn new(doc: Document, untitled_number: Option<u32>, max_undo_steps: u32) -> Self {
-        let mut history = History::new();
+        Self::with_history(doc, History::new(), untitled_number, max_undo_steps)
+    }
+
+    /// `.dpaint` から復元した履歴を持つタブ。アプリ設定の表示件数は
+    /// 現在値を再適用するが、復元した undo/redo は一件も削除しない。
+    fn with_history(
+        doc: Document,
+        mut history: History,
+        untitled_number: Option<u32>,
+        max_undo_steps: u32,
+    ) -> Self {
         history.set_max_steps(max_undo_steps as usize);
         Self {
             doc,
@@ -607,8 +617,8 @@ pub struct DaraskApp {
     /// `zoom >= 8.0`(800%)のときだけ実際に描かれる(`canvas_view::
     /// draw_pixel_grid`)。
     show_pixel_grid: bool,
-    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」(1–500、
-    /// 既定 50)。設定ダイアログの OK で更新される、アプリ全体で共有の値
+    /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。設定
+    /// ダイアログの OK で更新される、アプリ全体で共有の値
     /// (`current_settings`/`Tab::new` の呼び出し元がこれを渡す。SPEC §26 の
     /// 永続化対象に追加)。開いている**全タブ**の `History::max_steps` へ即座に
     /// 反映するのは `apply_preferences` の責務(ARCHITECTURE.md §18.6-2:
@@ -767,17 +777,29 @@ impl DaraskApp {
         // (MS ペイント方式)。CLI 引数でファイルが指定されていればそれを開く
         // (SPEC §3: 「プログラムから開く」対応)。
         let mut doc = Document::new(DEFAULT_NEW_WIDTH, DEFAULT_NEW_HEIGHT, Background::White);
+        let mut initial_history = History::new();
         let mut startup_error = None;
         // 開けたら「最近使ったファイル」にも反映する(`app` 構築後に
         // `remember_recent_file` を呼ぶ。SPEC §26)。
         let mut opened_cli_path = None;
         if let Some(path) = cli_path {
-            match io::load_image(&path) {
-                Ok(loaded) => {
-                    doc = loaded;
-                    opened_cli_path = Some(path);
+            if matches!(io::format_for_path(&path), Some(SaveFormat::Project)) {
+                match crate::project::load(&path) {
+                    Ok((loaded, history)) => {
+                        doc = loaded;
+                        initial_history = history;
+                        opened_cli_path = Some(path);
+                    }
+                    Err(e) => startup_error = Some(format!("開けませんでした: {e}")),
                 }
-                Err(e) => startup_error = Some(format!("開けませんでした: {e}")),
+            } else {
+                match io::load_image(&path) {
+                    Ok(loaded) => {
+                        doc = loaded;
+                        opened_cli_path = Some(path);
+                    }
+                    Err(e) => startup_error = Some(format!("開けませんでした: {e}")),
+                }
             }
         }
 
@@ -819,8 +841,9 @@ impl DaraskApp {
             // v5 §30(ARCHITECTURE.md §17.1): 起動時はタブ 1 枚
             // (CLI 引数があればそれを開いた状態、無ければ白紙の新規。
             // SPEC §30: 「セッション復元は非目標」)。
-            tabs: vec![Tab::new(
+            tabs: vec![Tab::with_history(
                 doc,
+                initial_history,
                 initial_untitled_number,
                 settings.max_undo_steps,
             )],
@@ -2974,8 +2997,8 @@ impl DaraskApp {
             Some(p) => p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "無題.png".to_owned()),
-            None => format!("{}.png", self.active_tab().label()),
+                .unwrap_or_else(|| "無題.dpaint".to_owned()),
+            None => format!("{}.dpaint", self.active_tab().label()),
         }
     }
 
@@ -3126,13 +3149,23 @@ impl DaraskApp {
             self.show_toast(tab_limit_toast_message());
             return;
         }
-        match io::load_image(&path) {
-            Ok(doc) => {
-                self.open_new_tab(doc);
-                // SPEC §26: 「最近使ったファイル」。
-                self.remember_recent_file(path);
+        if matches!(io::format_for_path(&path), Some(SaveFormat::Project)) {
+            match crate::project::load(&path) {
+                Ok((doc, history)) => {
+                    self.open_new_tab_with_history(doc, history);
+                    self.remember_recent_file(path);
+                }
+                Err(e) => self.show_toast(format!("開けませんでした: {e}")),
             }
-            Err(e) => self.show_toast(format!("開けませんでした: {e}")),
+        } else {
+            match io::load_image(&path) {
+                Ok(doc) => {
+                    self.open_new_tab(doc);
+                    // SPEC §26: 「最近使ったファイル」。
+                    self.remember_recent_file(path);
+                }
+                Err(e) => self.show_toast(format!("開けませんでした: {e}")),
+            }
         }
     }
 
@@ -3179,6 +3212,14 @@ impl DaraskApp {
     /// `open_path_in_new_tab`)が事前に確認しておくこと(呼び出し文脈により
     /// 上限チェックの要否・タイミングが異なるため、ここでは行わない)。
     fn open_new_tab(&mut self, doc: Document) -> usize {
+        self.open_new_tab_internal(doc, None)
+    }
+
+    fn open_new_tab_with_history(&mut self, doc: Document, history: History) -> usize {
+        self.open_new_tab_internal(doc, Some(history))
+    }
+
+    fn open_new_tab_internal(&mut self, doc: Document, history: Option<History>) -> usize {
         self.commit_open_gesture();
         let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
         // バグ修正: 以前はここで `self.layer_rename = None` を無条件に
@@ -3187,8 +3228,11 @@ impl DaraskApp {
         // 変更しないため、もはや不要(新規 `Tab` は `Tab::new` が
         // `layer_rename: None`/`next_layer_number: 1` で初期化する。
         // `Tab` の docstring 参照)。
-        self.tabs
-            .push(Tab::new(doc, untitled_number, self.max_undo_steps));
+        let tab = match history {
+            Some(history) => Tab::with_history(doc, history, untitled_number, self.max_undo_steps),
+            None => Tab::new(doc, untitled_number, self.max_undo_steps),
+        };
+        self.tabs.push(tab);
         let index = self.tabs.len() - 1;
         self.active_tab = index;
         self.reset_tool_state_for_new_document();
@@ -3270,6 +3314,7 @@ impl DaraskApp {
     /// 「上書き保存」(SPEC §7: Ctrl+S)。パスが未知(無題)なら「名前を
     /// 付けて保存」ダイアログにフォールバックする。
     fn begin_save(&mut self) {
+        self.commit_open_gesture();
         match self.active_tab().doc.path.clone() {
             Some(path) => self.begin_save_to_path(path),
             None => self.pending_dialog = Some(DialogRequest::SaveAs),
@@ -3278,6 +3323,7 @@ impl DaraskApp {
 
     /// 「名前を付けて保存」(SPEC §7: Ctrl+Shift+S)。常にダイアログを表示。
     fn begin_save_as(&mut self) {
+        self.commit_open_gesture();
         self.pending_dialog = Some(DialogRequest::SaveAs);
     }
 
@@ -3319,11 +3365,17 @@ impl DaraskApp {
         // レイヤーが複数ある状態で保存したことをトーストで知らせる
         // (`io::save_image` 自体が統合するため、ここでは判定のみ)。
         let had_multiple_layers = self.active_tab().doc.layers.len() > 1;
-        match io::save_image(&mut self.active_tab_mut().doc, &path, format) {
+        let result = if format == SaveFormat::Project {
+            let tab = self.active_tab();
+            crate::project::save(&tab.doc, &tab.history, &path)
+        } else {
+            io::save_image(&mut self.active_tab_mut().doc, &path, format)
+        };
+        match result {
             Ok(()) => {
                 self.active_tab_mut().doc.path = Some(path.clone());
                 self.active_tab_mut().doc.modified = false;
-                if had_multiple_layers {
+                if had_multiple_layers && format != SaveFormat::Project {
                     self.show_toast("レイヤーは統合して保存されました".to_owned());
                 }
                 // SPEC §26: 「最近使ったファイル」。保存先も対象にする
@@ -3395,7 +3447,9 @@ impl DaraskApp {
         // 必ず新しい番号を払い出す。
         let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
         self.active_tab_mut().doc = doc;
-        self.active_tab_mut().history = History::new();
+        let mut history = History::new();
+        history.set_max_steps(self.max_undo_steps as usize);
+        self.active_tab_mut().history = history;
         self.active_tab_mut().selection = None;
         self.active_tab_mut().floating = None;
         self.select_drag = None;
@@ -3524,12 +3578,8 @@ impl DaraskApp {
     ///
     /// - `self.max_undo_steps` を更新し、即座に設定ファイルへ保存する
     ///   (ARCHITECTURE.md §18.2: 「OK で即座に適用+設定ファイルへ保存」)。
-    /// - **開いている全タブ**の `History::set_max_steps` を呼ぶ
-    ///   (ARCHITECTURE.md §18.6-2: 「既存タブが取り残される、というバグを
-    ///   作らない」)。値を下げて現在の段数がそれを超えていれば、
-    ///   `History::set_max_steps` 内部の `trim_to_limits` がその場で
-    ///   古いものから切り詰める(ARCHITECTURE.md §18.3、新しい仕組みを
-    ///   増やさない)。
+    /// - **開いている全タブ**の `History::set_max_steps` を呼び、履歴パネルの
+    ///   表示上限を揃える。値を下げても undo/redo エントリは削除しない。
     fn apply_preferences(&mut self, new_max_undo_steps: u32) {
         self.max_undo_steps = new_max_undo_steps;
         for tab in &mut self.tabs {
@@ -5861,13 +5911,6 @@ mod tests {
     #[test]
     fn layer_add_refuses_past_the_64_layer_cap() {
         let mut app = new_for_test(Document::new(1, 1, Background::White));
-        // v6 §34/ARCHITECTURE.md §18.3: `History` の既定の保持数上限
-        // (`DEFAULT_MAX_STEPS` = 50)は `MAX_LAYERS - 1`(63)より小さいため、
-        // このテスト固有の目的(レイヤー上限到達時に undo エントリが
-        // 積まれないこと)を保持数キャップの影響で汚染しないよう、ここだけ
-        // 明示的に引き上げておく(このテストは History の保持数キャップ自体を
-        // 検証する場ではない、それは history.rs 側のテストが担う)。
-        app.active_tab_mut().history.set_max_steps(MAX_LAYERS);
         for _ in 0..(MAX_LAYERS - 1) {
             app.layer_add();
         }
@@ -5935,14 +5978,10 @@ mod tests {
         assert_eq!(app.max_undo_steps, 200);
     }
 
-    /// SPEC §34/ARCHITECTURE.md §18.6-2: 「`max_steps` を小さく設定変更した
-    /// 瞬間に現在開いている全タブへ反映すること」。2 つのタブそれぞれに
-    /// デフォルト上限(50)より多くない範囲でエントリを積んでおき、保持数を
-    /// 3 へ下げたら**両方の**タブがその場で 3 件まで切り詰められることを
-    /// 確認する(新規タブだけに適用され既存タブが取り残される、という
-    /// バグの回帰テスト)。
+    /// SPEC §34/ARCHITECTURE.md §18.6-2: 表示件数を変更すると現在開いている
+    /// 全タブへ即時反映しつつ、双方の undo 履歴は全件残ることを確認する。
     #[test]
-    fn apply_preferences_truncates_every_open_tabs_history_immediately() {
+    fn apply_preferences_updates_every_tabs_cache_hint_without_truncating() {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
         for _ in 0..5 {
             app.apply_invert();
@@ -5956,11 +5995,9 @@ mod tests {
         app.apply_preferences(3);
 
         for tab in &mut app.tabs {
+            assert_eq!(tab.history.display_step_limit(), 3);
             let n = count_undo_entries(&mut tab.history, &mut tab.doc);
-            assert_eq!(
-                n, 3,
-                "every open tab's history must be capped to the new limit, not just the active one"
-            );
+            assert_eq!(n, 5, "changing the cache hint must not delete undo history");
         }
     }
 
@@ -5976,10 +6013,11 @@ mod tests {
             app.apply_invert();
         }
         let tab = &mut app.tabs[app.active_tab];
+        assert_eq!(tab.history.display_step_limit(), 3);
         let n = count_undo_entries(&mut tab.history, &mut tab.doc);
         assert_eq!(
-            n, 3,
-            "a newly created tab must already use the app-wide max_undo_steps, not the History default"
+            n, 5,
+            "a newly created tab must keep all history above the cache hint"
         );
     }
 
@@ -6260,6 +6298,25 @@ mod tests {
             app.toast.is_some(),
             "saving a multi-layer document must show a toast"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_a_multi_layer_project_preserves_layers_without_flatten_toast() {
+        let dir = temp_dir_for_app_test("multi_layer_project");
+        let path = dir.join("multi.dpaint");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add();
+        app.begin_save_to_path(path.clone());
+
+        assert!(app.toast.is_none());
+        assert_eq!(app.active_tab().doc.path.as_deref(), Some(path.as_path()));
+        assert!(!app.active_tab().doc.modified);
+        let (loaded, loaded_history) = crate::project::load(&path).expect("load saved project");
+        assert_eq!(loaded.layers.len(), 2);
+        assert!(loaded_history.can_undo());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

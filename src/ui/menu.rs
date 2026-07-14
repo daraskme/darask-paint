@@ -105,6 +105,57 @@ pub enum MenuAction {
     OpenPreferences,
 }
 
+impl MenuAction {
+    /// タイル下段へ常時表示する短い日本語ラベル。完全な操作名と
+    /// ショートカットは従来どおりツールチップへ残す。
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::New => "新規",
+            Self::Open => "開く",
+            Self::OpenRecent(_) => "最近開く",
+            Self::Save => "保存",
+            Self::SaveAs => "別名保存",
+            Self::CloseTab => "タブ閉じ",
+            Self::Exit => "終了",
+            Self::Undo => "元に戻す",
+            Self::Redo => "やり直し",
+            Self::Cut => "切り取り",
+            Self::Copy => "コピー",
+            Self::Paste => "貼り付け",
+            Self::Delete => "削除",
+            Self::SelectAll => "全選択",
+            Self::Deselect => "選択解除",
+            Self::FreeTransform => "自由変形",
+            Self::ImageResize => "画像サイズ",
+            Self::CanvasResize => "キャンバス",
+            Self::Crop => "トリミング",
+            Self::DuplicateSelectionToTab => "選択複製",
+            Self::FlipHorizontal => "左右反転",
+            Self::FlipVertical => "上下反転",
+            Self::RotateCw => "右回転",
+            Self::RotateCcw => "左回転",
+            Self::BrightnessContrast => "明暗調整",
+            Self::HueSaturation => "色相彩度",
+            Self::Invert => "階調反転",
+            Self::Grayscale => "グレー化",
+            Self::ZoomIn => "拡大",
+            Self::ZoomOut => "縮小",
+            Self::Zoom100 => "100%",
+            Self::FitWindow => "全体表示",
+            Self::TogglePixelGrid => "グリッド",
+            Self::LayerAdd => "追加",
+            Self::LayerDuplicate => "複製",
+            Self::LayerDelete => "削除",
+            Self::LayerMoveUp => "上へ",
+            Self::LayerMoveDown => "下へ",
+            Self::LayerMergeDown => "下と結合",
+            Self::LayerFlatten => "画像統合",
+            Self::About => "情報",
+            Self::OpenPreferences => "設定",
+        }
+    }
+}
+
 /// メニュー項目の有効/無効判定に使う状態。`recent_files` を借用するため
 /// ライフタイム付き(v4 §26)。
 pub struct MenuState<'a> {
@@ -135,9 +186,10 @@ pub struct MenuState<'a> {
 /// ボタン」)。アイコン本体は `ui/icons.rs` の流儀どおり正方形の相対座標
 /// (0..1)から組み立てる前提なので、ボタンの縦横比が 1:1 でなくても
 /// 描画前に正方形の `icon_rect` を切り出す(下記 `icon_button`)。
-const BUTTON_W: f32 = 22.0;
-const BUTTON_H: f32 = 24.0;
-const ICON_MARGIN: f32 = 3.0;
+const BUTTON_W: f32 = 44.0;
+const BUTTON_H: f32 = 40.0;
+const ICON_SIZE: f32 = 17.0;
+const LABEL_SIZE: f32 = 8.0;
 /// グループ間の区切り線の幅(行分割の計算にも使う、`slot_width` 参照)。
 const SEP_W: f32 = 6.0;
 
@@ -158,7 +210,13 @@ type PaintFn = fn(&egui::Painter, egui::Rect, egui::Color32);
 /// `Sense::hover()` にして無効化する)。42 個ものボタンを並べる行で毎回
 /// 子 `Ui` を生成するのは無駄なので、単色ペインターの複製だけで済ませる
 /// 軽量な実装にした。
-fn icon_button(ui: &mut egui::Ui, enabled: bool, selected: bool, paint: PaintFn) -> egui::Response {
+fn icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    selected: bool,
+    paint: PaintFn,
+    label: &'static str,
+) -> egui::Response {
     let size = egui::vec2(BUTTON_W, BUTTON_H);
     let sense = if enabled {
         egui::Sense::click()
@@ -166,6 +224,9 @@ fn icon_button(ui: &mut egui::Ui, enabled: bool, selected: bool, paint: PaintFn)
         egui::Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label)
+    });
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
         let mut painter = ui.painter().clone();
@@ -173,9 +234,16 @@ fn icon_button(ui: &mut egui::Ui, enabled: bool, selected: bool, paint: PaintFn)
             painter.multiply_opacity(ui.visuals().disabled_alpha());
         }
         painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
-        let side = rect.width().min(rect.height()) - ICON_MARGIN * 2.0;
-        let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+        let icon_center = egui::pos2(rect.center().x, rect.top() + 12.0);
+        let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(ICON_SIZE, ICON_SIZE));
         paint(&painter, icon_rect, visuals.fg_stroke.color);
+        painter.with_clip_rect(rect.shrink(1.0)).text(
+            egui::pos2(rect.center().x, rect.bottom() - 3.0),
+            egui::Align2::CENTER_BOTTOM,
+            label,
+            egui::FontId::proportional(LABEL_SIZE),
+            visuals.fg_stroke.color,
+        );
     }
     response
 }
@@ -199,7 +267,7 @@ fn recent_files_button(
     recent_files: &std::collections::VecDeque<std::path::PathBuf>,
 ) -> Option<MenuAction> {
     let mut action = None;
-    let response = icon_button(ui, true, false, icons::paint_recent_files_icon)
+    let response = icon_button(ui, true, false, icons::paint_recent_files_icon, "最近開く")
         .on_hover_text("最近使ったファイル");
     egui::Popup::menu(&response).show(|ui| {
         if recent_files.is_empty() {
@@ -225,9 +293,15 @@ fn recent_files_button(
 /// コメントの「行分割を自前で行う」ためのテーブル行)。
 struct MenuItem {
     enabled: bool,
-    tooltip: String,
+    tooltip: Tooltip,
     paint: PaintFn,
     action: MenuAction,
+}
+
+#[derive(Clone, Copy)]
+enum Tooltip {
+    Plain(&'static str),
+    Shortcut(&'static str, Action),
 }
 
 /// アイコン行の 1 スロット。`ui.horizontal_wrapped` を使わず、
@@ -248,10 +322,25 @@ enum Slot {
     Sep,
 }
 
-fn mi(enabled: bool, tooltip: impl Into<String>, paint: PaintFn, action: MenuAction) -> Slot {
+fn mi(enabled: bool, tooltip: &'static str, paint: PaintFn, action: MenuAction) -> Slot {
     Slot::Item(MenuItem {
         enabled,
-        tooltip: tooltip.into(),
+        tooltip: Tooltip::Plain(tooltip),
+        paint,
+        action,
+    })
+}
+
+fn mi_shortcut(
+    enabled: bool,
+    label: &'static str,
+    shortcut: Action,
+    paint: PaintFn,
+    action: MenuAction,
+) -> Slot {
+    Slot::Item(MenuItem {
+        enabled,
+        tooltip: Tooltip::Shortcut(label, shortcut),
         paint,
         action,
     })
@@ -272,27 +361,31 @@ fn slot_width(slot: &Slot) -> f32 {
 fn build_slots(state: &MenuState) -> Vec<Slot> {
     vec![
         // -- ファイル ---------------------------------------------------
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("新規", Action::New),
+            "新規",
+            Action::New,
             icons::paint_new_document_icon,
             MenuAction::New,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("開く", Action::Open),
+            "開く",
+            Action::Open,
             icons::paint_open_icon,
             MenuAction::Open,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("上書き保存", Action::Save),
+            "上書き保存",
+            Action::Save,
             icons::paint_save_icon,
             MenuAction::Save,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("名前を付けて保存", Action::SaveAs),
+            "名前を付けて保存",
+            Action::SaveAs,
             icons::paint_save_as_icon,
             MenuAction::SaveAs,
         ),
@@ -303,9 +396,10 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
         Slot::RecentFiles,
         // v5 §17.6: 「ファイルメニューに「タブを閉じる (Ctrl+W)」を追加
         // (名前を付けて保存の後、終了の前)」。
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("タブを閉じる", Action::CloseTab),
+            "タブを閉じる",
+            Action::CloseTab,
             icons::paint_close_tab_icon,
             MenuAction::CloseTab,
         ),
@@ -321,59 +415,68 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
         ),
         Slot::Sep,
         // -- 編集 ---------------------------------------------------------
-        mi(
+        mi_shortcut(
             state.can_undo,
-            keymap::menu_label("元に戻す", Action::Undo),
+            "元に戻す",
+            Action::Undo,
             icons::paint_undo_icon,
             MenuAction::Undo,
         ),
-        mi(
+        mi_shortcut(
             state.can_redo,
-            keymap::menu_label("やり直し", Action::Redo),
+            "やり直し",
+            Action::Redo,
             icons::paint_redo_icon,
             MenuAction::Redo,
         ),
-        mi(
+        mi_shortcut(
             state.has_selection,
-            keymap::menu_label("切り取り", Action::Cut),
+            "切り取り",
+            Action::Cut,
             icons::paint_cut_icon,
             MenuAction::Cut,
         ),
-        mi(
+        mi_shortcut(
             state.has_selection,
-            keymap::menu_label("コピー", Action::Copy),
+            "コピー",
+            Action::Copy,
             icons::paint_copy_icon,
             MenuAction::Copy,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("貼り付け", Action::Paste),
+            "貼り付け",
+            Action::Paste,
             icons::paint_paste_icon,
             MenuAction::Paste,
         ),
-        mi(
+        mi_shortcut(
             state.has_selection,
-            keymap::menu_label("削除", Action::Delete),
+            "削除",
+            Action::Delete,
             icons::paint_delete_icon,
             MenuAction::Delete,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("すべて選択", Action::SelectAll),
+            "すべて選択",
+            Action::SelectAll,
             icons::paint_select_all_icon,
             MenuAction::SelectAll,
         ),
-        mi(
+        mi_shortcut(
             state.has_selection,
-            keymap::menu_label("選択解除", Action::Deselect),
+            "選択解除",
+            Action::Deselect,
             icons::paint_deselect_icon,
             MenuAction::Deselect,
         ),
         // v6 §33: 編集メニューに新規追加(`MenuAction::FreeTransform`
         // ドキュメントコメント参照)。
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("自由変形", Action::FreeTransform),
+            "自由変形",
+            Action::FreeTransform,
             icons::paint_free_transform_icon,
             MenuAction::FreeTransform,
         ),
@@ -437,35 +540,40 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             icons::paint_brightness_contrast_icon,
             MenuAction::BrightnessContrast,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("色相・彩度・明度…", Action::HueSaturation),
+            "色相・彩度・明度…",
+            Action::HueSaturation,
             icons::paint_hue_saturation_icon,
             MenuAction::HueSaturation,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("階調の反転", Action::Invert),
+            "階調の反転",
+            Action::Invert,
             icons::paint_invert_icon,
             MenuAction::Invert,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("グレースケール化", Action::Grayscale),
+            "グレースケール化",
+            Action::Grayscale,
             icons::paint_grayscale_icon,
             MenuAction::Grayscale,
         ),
         Slot::Sep,
         // -- レイヤー -------------------------------------------------------
-        mi(
+        mi_shortcut(
             state.can_add_layer,
-            keymap::menu_label("新規レイヤー", Action::LayerAdd),
+            "新規レイヤー",
+            Action::LayerAdd,
             icons::paint_layer_add_icon,
             MenuAction::LayerAdd,
         ),
-        mi(
+        mi_shortcut(
             state.can_add_layer,
-            keymap::menu_label("レイヤーを複製", Action::LayerDuplicate),
+            "レイヤーを複製",
+            Action::LayerDuplicate,
             icons::paint_layer_duplicate_icon,
             MenuAction::LayerDuplicate,
         ),
@@ -487,41 +595,47 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             icons::paint_layer_move_down_icon,
             MenuAction::LayerMoveDown,
         ),
-        mi(
+        mi_shortcut(
             state.can_merge_layer_down,
-            keymap::menu_label("下のレイヤーと結合", Action::LayerMergeDown),
+            "下のレイヤーと結合",
+            Action::LayerMergeDown,
             icons::paint_layer_merge_down_icon,
             MenuAction::LayerMergeDown,
         ),
-        mi(
+        mi_shortcut(
             state.can_flatten_layers,
-            keymap::menu_label("画像の統合", Action::LayerFlatten),
+            "画像の統合",
+            Action::LayerFlatten,
             icons::paint_layer_flatten_icon,
             MenuAction::LayerFlatten,
         ),
         Slot::Sep,
         // -- 表示 -----------------------------------------------------------
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("拡大", Action::ZoomIn),
+            "拡大",
+            Action::ZoomIn,
             icons::paint_zoom_in_icon,
             MenuAction::ZoomIn,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("縮小", Action::ZoomOut),
+            "縮小",
+            Action::ZoomOut,
             icons::paint_zoom_out_icon,
             MenuAction::ZoomOut,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("100%", Action::Zoom100),
+            "100%",
+            Action::Zoom100,
             icons::paint_zoom_100_icon,
             MenuAction::Zoom100,
         ),
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("ウィンドウに合わせる", Action::FitWindow),
+            "ウィンドウに合わせる",
+            Action::FitWindow,
             icons::paint_fit_window_icon,
             MenuAction::FitWindow,
         ),
@@ -546,9 +660,10 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
         // v6 §34: 設定(環境設定)ダイアログ。ツールバーの歯車ボタン
         // (`ui/toolbar.rs::ToolbarAction::OpenPreferences`)と同じアイコンを
         // 使う(`icons::paint_settings_icon` を共有)。
-        mi(
+        mi_shortcut(
             true,
-            keymap::menu_label("設定", Action::OpenPreferences),
+            "設定",
+            Action::OpenPreferences,
             icons::paint_settings_icon,
             MenuAction::OpenPreferences,
         ),
@@ -580,6 +695,23 @@ fn pack_rows(slots: &[Slot], avail_width: f32, spacing: f32) -> Vec<Vec<usize>> 
     if !current.is_empty() {
         rows.push(current);
     }
+    // 折り返し自体がカテゴリ境界になるため、行頭・行末に孤立した区切り線は
+    // 描かない。狭い幅で「線だけの行」や行末の不自然な線を作らない。
+    for row in &mut rows {
+        while row
+            .first()
+            .is_some_and(|&index| matches!(slots[index], Slot::Sep))
+        {
+            row.remove(0);
+        }
+        while row
+            .last()
+            .is_some_and(|&index| matches!(slots[index], Slot::Sep))
+        {
+            row.pop();
+        }
+    }
+    rows.retain(|row| !row.is_empty());
     rows
 }
 
@@ -621,9 +753,25 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                     for &i in row {
                         match &slots[i] {
                             Slot::Item(item) => {
-                                let clicked = icon_button(ui, item.enabled, false, item.paint)
-                                    .on_hover_text(item.tooltip.clone())
-                                    .clicked();
+                                let response = icon_button(
+                                    ui,
+                                    item.enabled,
+                                    false,
+                                    item.paint,
+                                    item.action.short_label(),
+                                );
+                                let clicked = response.clicked();
+                                if response.hovered() {
+                                    match item.tooltip {
+                                        Tooltip::Plain(text) => {
+                                            response.on_hover_text(text);
+                                        }
+                                        Tooltip::Shortcut(label, shortcut) => {
+                                            response
+                                                .on_hover_text(keymap::menu_label(label, shortcut));
+                                        }
+                                    }
+                                }
                                 if clicked {
                                     action = Some(item.action);
                                 }
@@ -634,9 +782,17 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
                                 paint,
                                 action: toggle_action,
                             } => {
-                                let clicked = icon_button(ui, true, *selected, *paint)
-                                    .on_hover_text(*tooltip)
-                                    .clicked();
+                                let response = icon_button(
+                                    ui,
+                                    true,
+                                    *selected,
+                                    *paint,
+                                    toggle_action.short_label(),
+                                );
+                                let clicked = response.clicked();
+                                if response.hovered() {
+                                    response.on_hover_text(*tooltip);
+                                }
                                 if clicked {
                                     action = Some(*toggle_action);
                                 }
@@ -661,6 +817,25 @@ mod tests {
 
     fn dummy_item() -> Slot {
         mi(true, "x", icons::paint_about_icon, MenuAction::About)
+    }
+
+    fn all_enabled_state(
+        recent_files: &std::collections::VecDeque<std::path::PathBuf>,
+    ) -> MenuState<'_> {
+        MenuState {
+            can_undo: true,
+            can_redo: true,
+            has_selection: true,
+            can_duplicate_selection_to_tab: true,
+            can_add_layer: true,
+            can_delete_layer: true,
+            can_move_layer_up: true,
+            can_move_layer_down: true,
+            can_merge_layer_down: true,
+            can_flatten_layers: true,
+            pixel_grid_visible: true,
+            recent_files,
+        }
     }
 
     #[test]
@@ -709,6 +884,35 @@ mod tests {
     fn pack_rows_of_empty_slots_produces_no_rows() {
         let slots: Vec<Slot> = Vec::new();
         assert!(pack_rows(&slots, 100.0, 4.0).is_empty());
+    }
+
+    #[test]
+    fn compact_minimum_width_layout_has_no_orphan_separator_and_at_most_four_rows() {
+        let recent_files = std::collections::VecDeque::new();
+        let state = all_enabled_state(&recent_files);
+        let slots = build_slots(&state);
+        let rows = pack_rows(&slots, 640.0 - PANEL_MARGIN_H * 2.0, 8.0);
+        assert!(rows.len() <= 4);
+        for row in rows {
+            assert!(!matches!(slots[row[0]], Slot::Sep));
+            assert!(!matches!(slots[*row.last().unwrap()], Slot::Sep));
+        }
+    }
+
+    #[test]
+    fn every_visible_action_label_is_short_and_nonempty() {
+        let recent_files = std::collections::VecDeque::new();
+        let state = all_enabled_state(&recent_files);
+        for slot in build_slots(&state) {
+            let label = match slot {
+                Slot::Item(item) => item.action.short_label(),
+                Slot::Toggle { action, .. } => action.short_label(),
+                Slot::RecentFiles => "最近開く",
+                Slot::Sep => continue,
+            };
+            assert!(!label.is_empty());
+            assert!(label.chars().count() <= 6, "label too long: {label}");
+        }
     }
 
     /// SPEC §33 の全項目(ファイル7・編集9・画像12・レイヤー7・表示5・その他2

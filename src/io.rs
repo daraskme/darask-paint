@@ -21,6 +21,7 @@ use crate::document::Document;
 /// 保存フォーマット(SPEC §8)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveFormat {
+    Project,
     Png,
     Jpeg { quality: u8 },
     Bmp,
@@ -34,6 +35,7 @@ pub enum SaveFormat {
 pub fn format_for_path(path: &Path) -> Option<SaveFormat> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
+        "dpaint" => Some(SaveFormat::Project),
         "png" => Some(SaveFormat::Png),
         "jpg" | "jpeg" => Some(SaveFormat::Jpeg { quality: 90 }),
         "bmp" => Some(SaveFormat::Bmp),
@@ -83,6 +85,9 @@ pub fn load_image(path: &Path) -> Result<Document, String> {
 pub fn save_image(doc: &mut Document, path: &Path, format: SaveFormat) -> Result<(), String> {
     doc.recomposite_full();
     match format {
+        SaveFormat::Project => {
+            Err("プロジェクト形式は履歴を含む保存APIを使用してください".to_owned())
+        }
         SaveFormat::Png => save_rgba(doc, path, image::ImageFormat::Png),
         SaveFormat::Bmp => save_bmp(doc, path),
         SaveFormat::Jpeg { quality } => save_jpeg(doc, path, quality),
@@ -152,6 +157,7 @@ fn save_bmp(doc: &Document, path: &Path) -> Result<(), String> {
 pub fn open_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("画像を開く")
+        .add_filter("Darask Paint プロジェクト", &["dpaint"])
         .add_filter(
             "画像ファイル",
             &["png", "jpg", "jpeg", "bmp", "gif", "webp"],
@@ -163,8 +169,9 @@ pub fn open_dialog() -> Option<PathBuf> {
 /// 「名前を付けて保存」ダイアログ(SPEC §8)。`default_name` は初期ファイル名。
 pub fn save_dialog(default_name: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("名前を付けて保存")
+        .set_title("プロジェクト保存 / 画像を書き出し")
         .set_file_name(default_name)
+        .add_filter("Darask Paint プロジェクト", &["dpaint"])
         .add_filter("PNG", &["png"])
         .add_filter("JPEG", &["jpg", "jpeg"])
         .add_filter("BMP", &["bmp"])
@@ -210,6 +217,10 @@ mod tests {
 
     #[test]
     fn format_for_path_recognizes_known_extensions() {
+        assert_eq!(
+            format_for_path(Path::new("a.dpaint")),
+            Some(SaveFormat::Project)
+        );
         assert_eq!(format_for_path(Path::new("a.png")), Some(SaveFormat::Png));
         assert_eq!(format_for_path(Path::new("a.PNG")), Some(SaveFormat::Png));
         assert!(matches!(
@@ -244,6 +255,10 @@ mod tests {
 
     #[test]
     fn ensure_extension_keeps_known_extension() {
+        assert_eq!(
+            ensure_extension(PathBuf::from("a.dpaint")),
+            PathBuf::from("a.dpaint")
+        );
         assert_eq!(
             ensure_extension(PathBuf::from("a.jpg")),
             PathBuf::from("a.jpg")

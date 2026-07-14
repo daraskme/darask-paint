@@ -27,13 +27,7 @@ use crate::document::{composite_two, DocSnapshot, Document, IRect, Layer};
 /// タイルサイズ(ARCHITECTURE.md §6: 256×256)。
 const TILE_SIZE: i32 = 256;
 
-/// アンドゥ履歴の合計メモリ上限(SPEC §9: 256MB)。
-const MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
-
-/// 上限を超えても必ず保持する直近の件数(SPEC §9)。
-const MIN_KEEP: usize = 10;
-
-/// v6 §34/ARCHITECTURE.md §18.2・§18.3: 「元に戻す履歴の保持数」の既定値。
+/// SPEC §34: 履歴パネル表示件数の既定値。
 /// 設定ダイアログ(v6-M2)が `Settings::max_undo_steps` を注入するまでの
 /// `History::new()` の既定値としてここで定義する(v6-M1 時点では設定
 /// ダイアログ自体が無いため、`History` はこの既定のまま動く)。
@@ -115,9 +109,9 @@ pub enum HistoryOp {
 /// ドキュメントコメント参照)。`rect` は触れたタイルの矩形(256×256、画像
 /// 境界でクランプ済み)、`before`/`after` はその矩形内のピクセル。
 pub struct PatchRegion {
-    rect: IRect,
-    before: Vec<u8>,
-    after: Vec<u8>,
+    pub(crate) rect: IRect,
+    pub(crate) before: Vec<u8>,
+    pub(crate) after: Vec<u8>,
 }
 
 impl HistoryOp {
@@ -339,9 +333,7 @@ fn paste_region(pixels: &mut [u8], width: u32, height: u32, rect: IRect, data: &
 /// (`HistoryOp`)へ呼び出し元由来の短い日本語ラベル(例: 「ブラシ」「塗り
 /// つぶし」「画像サイズ変更」)を添えたもの。`push`/`commit_stroke` を
 /// 呼ぶすべての箇所がラベルを渡す(ARCHITECTURE.md §18.3 の対応表参照)。
-/// ラベル自体は表示専用でメモリ会計(`HistoryOp::byte_size`)には含めない
-/// (短い日本語文字列数バイト〜十数バイトであり、SPEC §9 の 256MB 上限は
-/// 元々ピクセルデータを対象にした値のため)。
+/// ラベルは表示と `.dpaint` のリビジョン識別に使用する。
 pub struct HistoryEntry {
     pub op: HistoryOp,
     /// v6-M3(ARCHITECTURE.md §18.4): `History::undo_labels`/
@@ -352,25 +344,15 @@ pub struct HistoryEntry {
 
 /// アンドゥ/リドゥスタックとメモリ会計、進行中ストロークの記録を持つ。
 ///
-/// v6 §34〜35(ARCHITECTURE.md §18.2・§18.3)で「元に戻す履歴の保持数」
-/// (`max_steps`)と、破棄の有無を示す `truncated` フラグを追加した:
-/// - `max_steps`: 設定ダイアログ(v6-M2、未実装)から `set_max_steps` で
-///   注入される上限件数(既定 `DEFAULT_MAX_STEPS` = 50)。
-/// - `truncated`: 保持数キャップまたは SPEC §9 のバイト上限で最古のエントリ
-///   を一度でも破棄したら `true` のまま(履歴パネル(v6-M3、未実装)の
-///   「(これ以前の履歴は破棄されました)」注記の表示判定に使う)。
+/// 履歴は `.dpaint` へ undo/redo を全件保存するため論理削除しない。
+/// `max_steps` は互換設定名を維持した履歴パネル表示上限であり、
+/// 履歴エントリを切り捨てる上限ではない。
 pub struct History {
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
     bytes_used: usize,
-    /// SPEC §34: 「元に戻す履歴の保持数」(1–500、既定 50)。値そのものの
-    /// 範囲クランプは設定側([1,500])が担うが、`History` 自身も 0 による
-    /// 除算・無限ループ的な事故を避けるため `set_max_steps` で `1` 未満には
-    /// ならないよう防御する(CLAUDE.md 鉄則: パニックしない)。
+    /// 履歴パネルの表示件数(互換設定名、1–500、既定50)。
     max_steps: usize,
-    /// 一度でも保持数/バイト上限で最古のエントリを破棄したら `true` の
-    /// まま戻らない(ARCHITECTURE.md §18.3 最終項)。
-    truncated: bool,
     stroke: Option<StrokeRecorder>,
 }
 
@@ -387,7 +369,6 @@ impl History {
             redo_stack: Vec::new(),
             bytes_used: 0,
             max_steps: DEFAULT_MAX_STEPS,
-            truncated: false,
             stroke: None,
         }
     }
@@ -536,10 +517,8 @@ impl History {
         self.stroke.is_some()
     }
 
-    /// 履歴に 1 op を積む。redo は新規 push でクリアする
-    /// (ARCHITECTURE.md §6)。メモリ上限(SPEC §9)・保持数上限(SPEC §34、
-    /// `max_steps`)のいずれかを超えたら、`min(MIN_KEEP, max_steps)` 件を
-    /// 残して最古から破棄する(ARCHITECTURE.md §18.3)。
+    /// 履歴に 1 op を積む。redo は新規 push でクリアする。undo/redo は
+    /// `.dpaint` へ全件保存するため、件数や常駐バイト数では切り捨てない。
     ///
     /// v6 §33〜35: `impl Into<String>` の日本語ラベルを 1 つ追加で受け取る
     /// (ARCHITECTURE.md §18.3 の対応表参照。すべての呼び出し元がラベルを
@@ -548,49 +527,25 @@ impl History {
         for removed in self.redo_stack.drain(..) {
             self.bytes_used = self.bytes_used.saturating_sub(removed.op.byte_size());
         }
-        self.bytes_used += op.byte_size();
+        self.bytes_used = self.bytes_used.saturating_add(op.byte_size());
         self.undo_stack.push(HistoryEntry {
             op,
             label: label.into(),
         });
-        self.trim_to_limits();
     }
 
-    /// SPEC §34/ARCHITECTURE.md §18.3: 保持数キャップ(`max_steps`)と
-    /// メモリ上限(SPEC §9、`MEMORY_LIMIT_BYTES`)のどちらかを超えている間、
-    /// 最古のエントリから破棄する。下限は `min(MIN_KEEP, max_steps)` 件
-    /// (v1 §9 の「直近10件は必ず保持」という floor を、`max_steps` 自体が
-    /// それより小さく設定された場合でも矛盾させないための最小値クランプ、
-    /// ARCHITECTURE.md §18.3)。破棄が実際に起きたら `truncated` を立てる
-    /// (一度立ったら戻らない、履歴パネル(v6-M3)の注記表示用)。
-    fn trim_to_limits(&mut self) {
-        let min_keep = MIN_KEEP.min(self.max_steps);
-        while self.undo_stack.len() > min_keep
-            && (self.undo_stack.len() > self.max_steps || self.bytes_used > MEMORY_LIMIT_BYTES)
-        {
-            let removed = self.undo_stack.remove(0);
-            self.bytes_used = self.bytes_used.saturating_sub(removed.op.byte_size());
-            self.truncated = true;
-        }
-    }
-
-    /// SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」の変更を
-    /// 即座に反映する。v6-M2 で配線済み: `app.rs::Tab::new`(新規タブに現在の
-    /// 上限を適用)と `app.rs::apply_preferences`(設定ダイアログの OK 時に
-    /// 開いている全タブへ適用)の 2 箇所から呼ばれる。`0` を渡されても
+    /// SPEC §34: 履歴パネル表示件数の変更を即座に反映する。新規タブと
+    /// 設定ダイアログの全タブ反映から呼ばれる。`0` を渡されても
     /// 無限ループ/パニックしないよう最低 `1` にクランプする(CLAUDE.md 鉄則。
     /// 実際の UI 側の範囲クランプは `settings.rs` が `[1, 500]` で担う、
     /// 二重の防御)。
     pub fn set_max_steps(&mut self, max_steps: usize) {
         self.max_steps = max_steps.max(1);
-        self.trim_to_limits();
     }
 
-    /// 一度でも最古のエントリを破棄したことがあるか(ARCHITECTURE.md
-    /// §18.3・§18.4: 履歴パネル(`ui/history_panel.rs`)の「(これ以前の履歴は
-    /// 破棄されました)」注記の表示判定に使う)。
-    pub fn is_truncated(&self) -> bool {
-        self.truncated
+    /// 履歴パネルに一度に表示する最大操作件数。履歴保持数ではない。
+    pub fn display_step_limit(&self) -> usize {
+        self.max_steps
     }
 
     /// 履歴パネル(v6-M3、ARCHITECTURE.md §18.4)向け: 現在の `undo_stack` の
@@ -653,10 +608,9 @@ impl History {
     /// ARCHITECTURE.md §18.3・§18.4: 履歴パネル(`ui/history_panel.rs`)の
     /// クリックジャンプが使う薄いラッパー。「新しい仕組みを増やさない」
     /// 方針どおり、既存の単発 `undo`/`redo` を `target_len`(ジャンプ後に
-    /// 望む `undo_stack.len()`)に達するまでループ呼び出しするだけ(最大
-    /// `max_steps` 回程度、既定 50 なら軽量)。`target_len` が現在の
-    /// undo+redo の合計件数を超えていても、`undo`/`redo` が `false` を
-    /// 返した時点で安全に打ち切る(パニックしない、CLAUDE.md 鉄則)。
+    /// 望む `undo_stack.len()`)に達するまでループ呼び出しするだけ。
+    /// `target_len` が現在の undo+redo の合計件数を超えていても、
+    /// `undo`/`redo` が `false` を返した時点で安全に打ち切る。
     /// 安全規則(進行中のストローク・浮動片は先に確定してから呼ぶこと)は
     /// 呼び出し元(`app.rs::jump_history_to`)が `commit_open_gesture()` を
     /// 経由して守る(ARCHITECTURE.md §18.6-1: ジャンプだけを特別扱いしない)。
@@ -670,6 +624,32 @@ impl History {
             if !self.redo(doc) {
                 break;
             }
+        }
+    }
+
+    /// プロジェクト保存用。redo は内部スタック順(次に適用する項目が末尾)。
+    pub(crate) fn project_entries(&self) -> (&[HistoryEntry], &[HistoryEntry]) {
+        (&self.undo_stack, &self.redo_stack)
+    }
+
+    /// 検証済み `.dpaint` エントリから履歴を復元する。
+    pub(crate) fn from_project_entries(
+        undo_stack: Vec<HistoryEntry>,
+        redo_stack: Vec<HistoryEntry>,
+        display_step_limit: usize,
+    ) -> Self {
+        let bytes_used = undo_stack
+            .iter()
+            .chain(&redo_stack)
+            .fold(0usize, |sum, entry| {
+                sum.saturating_add(entry.op.byte_size())
+            });
+        Self {
+            undo_stack,
+            redo_stack,
+            bytes_used,
+            max_steps: display_step_limit.max(1),
+            stroke: None,
         }
     }
 }
@@ -1000,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_limit_discards_oldest_but_keeps_last_ten() {
+    fn history_keeps_all_entries_past_the_former_memory_limit_policy() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1009,22 +989,20 @@ mod tests {
         };
         let mut history = History::new();
 
-        // それぞれ大きめの op を積んで 256MB を大きく超えさせる。
-        let big = vec![0u8; 30 * 1024 * 1024]; // 30MB
-        for i in 0..15 {
+        // 保持件数は設定ヒントや旧メモリ方針では切り捨てない。
+        let payload = vec![0u8; 1024];
+        for i in 0..600 {
             history.push(
-                single_region_patch(0, rect, big.clone(), vec![1, 1, 1, 1]),
+                single_region_patch(0, rect, payload.clone(), vec![1, 1, 1, 1]),
                 format!("op{i}"),
             );
         }
-
-        // 直近 10 件は必ず残る。
-        assert_eq!(history.undo_stack.len(), MIN_KEEP);
-        assert!(history.bytes_used <= MEMORY_LIMIT_BYTES.max(MIN_KEEP * (big.len() + 4)));
+        assert_eq!(history.undo_stack.len(), 600);
+        assert_eq!(history.undo_stack.first().unwrap().label, "op0");
     }
 
     #[test]
-    fn memory_limit_never_drops_below_min_keep_even_if_over_limit() {
+    fn cache_hint_does_not_delete_history() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1032,15 +1010,15 @@ mod tests {
             y1: 1,
         };
         let mut history = History::new();
-        // 直近10件だけで既に上限を超えるサイズにする。
-        let huge = vec![0u8; 40 * 1024 * 1024]; // 40MB * 10 > 256MB
+        history.set_max_steps(1);
         for i in 0..10 {
             history.push(
-                single_region_patch(0, rect, huge.clone(), vec![1]),
+                single_region_patch(0, rect, vec![0], vec![1]),
                 format!("op{i}"),
             );
         }
-        assert_eq!(history.undo_stack.len(), MIN_KEEP);
+        assert_eq!(history.undo_stack.len(), 10);
+        assert_eq!(history.display_step_limit(), 1);
     }
 
     #[test]
@@ -1665,8 +1643,7 @@ mod tests {
         assert!(!history.can_undo(), "cancel must not push any undo entry");
     }
 
-    // -- v6 §33〜35(ARCHITECTURE.md §18.3): ラベル付け・保持数キャップ・
-    // ジャンプ ------------------------------------------------------------
+    // -- v6 §33〜35(ARCHITECTURE.md §18.3): ラベル付け・全件保持・ジャンプ --
 
     #[test]
     fn push_records_the_given_label() {
@@ -1714,11 +1691,10 @@ mod tests {
             );
         }
         assert_eq!(history.undo_stack.len(), DEFAULT_MAX_STEPS);
-        assert!(!history.is_truncated());
     }
 
     #[test]
-    fn set_max_steps_evicts_down_to_the_new_cap_immediately_keeping_the_most_recent() {
+    fn set_max_steps_updates_cache_hint_without_evicting() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1735,18 +1711,14 @@ mod tests {
         assert_eq!(history.undo_stack.len(), 8);
 
         history.set_max_steps(3);
-        assert_eq!(
-            history.undo_stack.len(),
-            3,
-            "lowering max_steps must immediately truncate to the new cap"
-        );
-        assert_eq!(history.undo_stack.first().unwrap().label, "op5");
+        assert_eq!(history.undo_stack.len(), 8);
+        assert_eq!(history.undo_stack.first().unwrap().label, "op0");
         assert_eq!(history.undo_stack.last().unwrap().label, "op7");
-        assert!(history.is_truncated());
+        assert_eq!(history.display_step_limit(), 3);
     }
 
     #[test]
-    fn push_after_lowering_max_steps_keeps_enforcing_the_new_cap() {
+    fn push_after_lowering_cache_hint_still_keeps_every_entry() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1761,9 +1733,9 @@ mod tests {
                 format!("op{i}"),
             );
         }
-        assert_eq!(history.undo_stack.len(), 2);
+        assert_eq!(history.undo_stack.len(), 5);
         assert_eq!(history.undo_stack.last().unwrap().label, "op4");
-        assert_eq!(history.undo_stack.first().unwrap().label, "op3");
+        assert_eq!(history.undo_stack.first().unwrap().label, "op0");
     }
 
     #[test]
@@ -1781,16 +1753,13 @@ mod tests {
         // (`settings.rs` の [1,500] クランプと二重の防御、ARCHITECTURE.md
         // §18.3)。
         history.set_max_steps(0);
-        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.undo_stack.len(), 2);
         assert_eq!(history.undo_stack.last().unwrap().label, "b");
+        assert_eq!(history.display_step_limit(), 1);
     }
 
     #[test]
-    fn min_keep_floor_is_the_smaller_of_ten_and_max_steps() {
-        // ARCHITECTURE.md §18.3: 「下限は min(MIN_KEEP, max_steps) 件を必ず
-        // 保持」。max_steps を MIN_KEEP(10)より大きく下げても(ここでは 20)、
-        // 通常の保持数キャップがそのまま効く(floor は 10 のまま)ことを
-        // 確認する対照テスト。
+    fn all_entries_are_kept_above_cache_hint() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1805,15 +1774,11 @@ mod tests {
                 format!("op{i}"),
             );
         }
-        assert_eq!(
-            history.undo_stack.len(),
-            20,
-            "capped at max_steps, not at MIN_KEEP"
-        );
+        assert_eq!(history.undo_stack.len(), 25);
     }
 
     #[test]
-    fn truncated_flag_starts_false_and_becomes_true_after_any_eviction_and_stays_true() {
+    fn undo_and_redo_keep_all_entries_above_the_display_limit() {
         let rect = IRect {
             x0: 0,
             y0: 0,
@@ -1821,32 +1786,21 @@ mod tests {
             y1: 1,
         };
         let mut history = History::new();
-        assert!(!history.is_truncated());
 
         history.set_max_steps(2);
         history.push(single_region_patch(0, rect, vec![0], vec![1]), "a");
-        assert!(
-            !history.is_truncated(),
-            "no eviction yet with only one entry"
-        );
+        assert_eq!(history.undo_stack.len(), 1);
         history.push(single_region_patch(0, rect, vec![0], vec![1]), "b");
-        assert!(
-            !history.is_truncated(),
-            "exactly at the cap, nothing evicted yet"
-        );
+        assert_eq!(history.undo_stack.len(), 2);
 
         history.push(single_region_patch(0, rect, vec![0], vec![1]), "c");
-        assert!(
-            history.is_truncated(),
-            "pushing past the cap must evict the oldest entry and set the flag"
-        );
+        assert_eq!(history.undo_stack.len(), 3);
 
-        // undo/redo は「破棄されたことがある」という事実を消さない。
         let mut doc = Document::new(4, 4, Background::White);
         history.undo(&mut doc);
-        assert!(history.is_truncated());
+        assert_eq!(history.undo_stack.len(), 2);
         history.redo(&mut doc);
-        assert!(history.is_truncated());
+        assert_eq!(history.undo_stack.len(), 3);
     }
 
     #[test]

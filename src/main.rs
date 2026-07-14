@@ -11,6 +11,7 @@ mod history;
 mod icon;
 mod io;
 mod keymap;
+mod project;
 mod raster;
 mod settings;
 mod text;

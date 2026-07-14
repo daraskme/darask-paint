@@ -258,7 +258,7 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
 }
 
 /// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログ。最小構成
-/// として「元に戻す履歴の保持数」(1–500、既定 50)の数値入力のみを持つ。
+/// として「履歴パネルの表示件数」(1–500、既定 50)の数値入力のみを持つ。
 /// `New`/`ImageResize` 等と同じ「ドラフト値を `&mut` で受け取り、OK/
 /// キャンセルで呼び出し側(app.rs)が確定/破棄する」パターン(`ModalState::
 /// Preferences` のドラフト値をそのまま渡す)。
@@ -267,7 +267,7 @@ pub fn show_preferences(ctx: &egui::Context, draft_max_undo_steps: &mut u32) -> 
     let modal = egui::Modal::new(egui::Id::new("darask_dialog_preferences")).show(ctx, |ui| {
         ui.heading("設定");
         ui.horizontal(|ui| {
-            ui.label("元に戻す履歴の保持数:");
+            ui.label("履歴パネルの表示件数:");
             let mut v = *draft_max_undo_steps;
             if ui
                 .add(egui::DragValue::new(&mut v).range(1..=500))
@@ -276,6 +276,7 @@ pub fn show_preferences(ctx: &egui::Context, draft_max_undo_steps: &mut u32) -> 
                 *draft_max_undo_steps = v.clamp(1, 500);
             }
         });
+        ui.weak("undo/redo 自体は全件を保持し、.dpaint に保存します");
         ui.separator();
         confirm_buttons(ui, &mut outcome);
     });

@@ -369,6 +369,55 @@ impl Document {
         doc
     }
 
+    /// `.dpaint` の検証済みリビジョンからドキュメントを復元する。
+    /// 外部入力の寸法・レイヤー数・画素長は呼び出し側が先に検証する。
+    pub(crate) fn try_from_snapshot_owned(
+        snap: DocSnapshot,
+        path: Option<PathBuf>,
+        modified: bool,
+    ) -> Result<Self, String> {
+        if snap.layers.is_empty() {
+            return Err("プロジェクトのレイヤーが空です".to_owned());
+        }
+        let layers = snap.layers;
+        let active = snap.active.min(layers.len().saturating_sub(1));
+        let composite_len = (snap.width as usize)
+            .checked_mul(snap.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "プロジェクトの画像寸法が大きすぎます".to_owned())?;
+        let mut composite = Vec::new();
+        composite
+            .try_reserve_exact(composite_len)
+            .map_err(|_| "プロジェクトの合成バッファを確保できません".to_owned())?;
+        composite.resize(composite_len, 0);
+        let mut doc = Self {
+            width: snap.width,
+            height: snap.height,
+            layers,
+            active,
+            composite,
+            path,
+            modified,
+            dirty: DirtyRegion::new(),
+        };
+        let mut refs = Vec::new();
+        refs.try_reserve_exact(doc.layers.len())
+            .map_err(|_| "プロジェクトのレイヤー参照を確保できません".to_owned())?;
+        refs.extend(doc.layers.iter());
+        composite_layers(
+            &refs,
+            doc.width,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: doc.width as i32,
+                y1: doc.height as i32,
+            },
+            &mut doc.composite,
+        );
+        Ok(doc)
+    }
+
     // -----------------------------------------------------------------
     // アクティブレイヤーアクセス(SPEC §13: 描画・選択・クリップボードは
     // アクティブレイヤーのみに作用する)
@@ -1116,6 +1165,53 @@ mod tests {
         // 土台、ARCHITECTURE.md §14.8 の受け入れ基準)。
         let doc = Document::new(3, 3, Background::White);
         assert_eq!(doc.composite, doc.active_pixels());
+    }
+
+    #[test]
+    fn project_snapshot_constructor_rebuilds_composite_and_state() {
+        let bottom = Layer {
+            name: "背景".to_owned(),
+            visible: true,
+            opacity: 255,
+            pixels: vec![10, 20, 30, 255],
+        };
+        let top = Layer {
+            name: "上".to_owned(),
+            visible: false,
+            opacity: 255,
+            pixels: vec![200, 210, 220, 255],
+        };
+        let doc = Document::try_from_snapshot_owned(
+            DocSnapshot {
+                width: 1,
+                height: 1,
+                layers: vec![bottom, top],
+                active: 1,
+            },
+            None,
+            true,
+        )
+        .expect("validated project snapshot");
+
+        assert_eq!(doc.active, 1);
+        assert!(doc.modified);
+        assert_eq!(doc.composite, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn project_snapshot_constructor_rejects_empty_layers() {
+        let result = Document::try_from_snapshot_owned(
+            DocSnapshot {
+                width: 1,
+                height: 1,
+                layers: Vec::new(),
+                active: 0,
+            },
+            None,
+            false,
+        );
+
+        assert!(matches!(result, Err(message) if message.contains("レイヤー")));
     }
 
     #[test]
