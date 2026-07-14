@@ -39,7 +39,6 @@ jobs:
     # GL コンテキスト作成に失敗しうるため、このジョブの失敗は CI 全体の
     # 成否に影響させない。
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -62,9 +61,17 @@ jobs:
         # (`continue-on-error: true` によりジョブ自体は緑のまま隠れて
         # 壊れ続けていた)。`Start-Process -Wait` でプロセス終了を確実に
         # 待ってから読む。ハング防止に `timeout-minutes` も設定する。
+        id: bench
+        continue-on-error: true
         shell: pwsh
         timeout-minutes: 2
         run: |
           $env:DARASK_BENCH = '1'
           Start-Process -FilePath .\target\release\darask-paint.exe -Wait -NoNewWindow
           Get-Content bench.txt
+
+      - name: Record unavailable headless benchmark
+        if: steps.bench.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Warning 'Startup benchmark could not run on this headless GitHub-hosted runner. Local Windows benchmark remains the performance gate.'
