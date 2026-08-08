@@ -34,7 +34,7 @@ const SIDE_PANEL_WIDTH: f32 = 210.0;
 /// `layers_panel`/`history_panel` のドキュメントコメント参照)。
 pub fn show(
     ui: &mut egui::Ui,
-    doc: &mut Document,
+    doc: &Document,
     rename: &mut RenameState,
     history: &History,
     color_ctx: ColorPanelCtx,

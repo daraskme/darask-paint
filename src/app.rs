@@ -368,6 +368,9 @@ enum ModalState {
 enum DialogRequest {
     OpenFile,
     SaveAs,
+    /// v9 §43: 「ファイルから貼り付け」(画像を選んで現在のタブへ浮動片
+    /// として貼り付ける。MS ペイントの「貼り付け元」に相当)。
+    PasteFile,
 }
 
 /// v4 §26(ARCHITECTURE.md §16.7): 設定から復元する起動時のツール状態の
@@ -484,6 +487,11 @@ struct Tab {
     /// このタブのドキュメントを新規作成/読み込みし直すたびに 1 に
     /// リセットする(タブごとに独立、上記コメント参照)。
     next_layer_number: u32,
+    /// v8 レビュー修正(SPEC §40-①): 保存後に、履歴に積まれない実変更
+    /// (レイヤー名・表示・不透明度)があったか。`History::is_at_saved_state`
+    /// が真でもこれが立っていれば `modified` は下ろさない
+    /// (`refresh_modified_after_history_move` 参照)。保存成功時にクリア。
+    meta_dirty: bool,
 }
 
 impl Tab {
@@ -520,6 +528,7 @@ impl Tab {
             untitled_number,
             layer_rename: None,
             next_layer_number: 1,
+            meta_dirty: false,
         }
     }
 
@@ -772,6 +781,9 @@ impl DaraskApp {
         // ため、無効化しないと必ず egui 側に奪われ、UI 全体の拡大率が
         // ユーザーの意図しないまま変化し続けてしまう)。
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
+        // v9 §44: アプリ全体のビジュアルテーマ(起動時 1 回、`ui/theme.rs`)。
+        crate::ui::theme::apply(&cc.egui_ctx);
 
         // SPEC §3: 起動時は新規 1280×720・白背景のドキュメントを自動作成する
         // (MS ペイント方式)。CLI 引数でファイルが指定されていればそれを開く
@@ -1068,22 +1080,28 @@ impl DaraskApp {
                     let tab = self.active_tab_mut();
                     tab.history.undo(&mut tab.doc);
                     self.clamp_selection_to_doc();
+                    self.refresh_modified_after_history_move();
                 }
                 Action::Redo => {
                     self.commit_open_gesture();
                     let tab = self.active_tab_mut();
                     tab.history.redo(&mut tab.doc);
                     self.clamp_selection_to_doc();
+                    self.refresh_modified_after_history_move();
                 }
 
                 Action::Cut => self.cut_selection_to_clipboard(),
                 Action::Copy => {
                     self.copy_selection_to_clipboard();
                 }
+                // v8 §38: 結合部分をコピー(Ctrl+Shift+C)。
+                Action::CopyMerged => self.copy_merged_selection_to_clipboard(),
                 Action::Paste => self.paste_from_clipboard(),
                 Action::Delete => self.delete_selection(),
                 Action::SelectAll => self.select_all(),
                 Action::Deselect => self.commit_selection(),
+                // v8 §37: 選択範囲を反転(Ctrl+Shift+I)。
+                Action::SelectInverse => self.invert_selection(),
                 Action::FreeTransform => self.free_transform(),
                 Action::CommitFloating => {
                     if is_select_move_or_wand {
@@ -1103,6 +1121,9 @@ impl DaraskApp {
                         self.lasso_freehand_points.clear();
                     }
                 }
+
+                // v9 §41: 矢印キーのナッジ。
+                Action::Nudge(dx, dy) => self.nudge_selection(dx as f32, dy as f32),
 
                 // SPEC §24 §27: 色調補正のショートカット。
                 Action::HueSaturation => self.open_hue_saturation_modal(),
@@ -1790,8 +1811,9 @@ impl DaraskApp {
     /// なら選択を作らない(矩形選択の「単クリックは選択を残さない」と同じ
     /// 考え方)。
     fn finish_lasso_points(&mut self, points: Vec<Pos2>) {
-        let mask = select::polygon_mask(&points)
-            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        // v8 レビュー修正: `select_up` と同じ理由で clipped 版を使う(軌跡が
+        // キャンバス外へ大きくはみ出しても、確保は文書との交差領域だけ)。
+        let mask = select::polygon_mask_clipped(&points, self.doc_full_rect());
         self.active_tab_mut().selection = if mask.is_empty() {
             None
         } else {
@@ -1919,7 +1941,7 @@ impl DaraskApp {
         img: Pos2,
         lock_aspect: bool,
     ) {
-        let Some(floating) = self.active_tab().floating.as_ref() else {
+        let Some((cur_w, cur_h)) = self.active_tab().floating.as_ref().map(|f| (f.w, f.h)) else {
             return;
         };
         let (new_pos, new_w, new_h) = select::resize_floating_rect(
@@ -1935,36 +1957,31 @@ impl DaraskApp {
         );
         let new_w_px = (new_w.round() as u32).max(1);
         let new_h_px = (new_h.round() as u32).max(1);
-        let resampled = if new_w_px != floating.w || new_h_px != floating.h {
-            // v4 §16.3/SPEC §16: ピクセルは bilinear、マスクは nearest で、
-            // どちらも「浮動化時点の元」(`original`/`orig_mask`)から毎回
-            // 再サンプリングする(累積劣化させない)。
-            Some((
-                select::resample_bilinear(
-                    &floating.original,
-                    floating.orig_w,
-                    floating.orig_h,
-                    new_w_px,
-                    new_h_px,
-                ),
-                select::resample_mask_nearest(
-                    &floating.orig_mask,
-                    floating.orig_w,
-                    floating.orig_h,
-                    new_w_px,
-                    new_h_px,
-                ),
-                self.alloc_floating_id(),
-            ))
-        } else {
-            None
-        };
+        let new_id = (new_w_px != cur_w || new_h_px != cur_h).then(|| self.alloc_floating_id());
         let Some(floating) = self.active_tab_mut().floating.as_mut() else {
             return;
         };
-        if let Some((pixels, mask, id)) = resampled {
-            floating.pixels = pixels;
-            floating.mask = mask;
+        if let Some(id) = new_id {
+            // v4 §16.3/SPEC §16: ピクセルは bilinear、マスクは nearest で、
+            // どちらも「浮動化時点の元」(`original`/`orig_mask`)から毎回
+            // 再サンプリングする(累積劣化させない)。v8 レビュー修正③:
+            // 元は最初の拡縮のここで確定する(遅延複製、
+            // `Floating::ensure_resample_source` 参照)。
+            floating.ensure_resample_source();
+            floating.pixels = select::resample_bilinear(
+                &floating.original,
+                floating.orig_w,
+                floating.orig_h,
+                new_w_px,
+                new_h_px,
+            );
+            floating.mask = select::resample_mask_nearest(
+                &floating.orig_mask,
+                floating.orig_w,
+                floating.orig_h,
+                new_w_px,
+                new_h_px,
+            );
             floating.w = new_w_px;
             floating.h = new_h_px;
             floating.id = id;
@@ -2115,16 +2132,24 @@ impl DaraskApp {
                     // 破れる、SPEC §22 の見た目一致に反する)。
                     // `begin_floating_from_selection` と同じ「先に作って
                     // から `SelMask::clamp_to` でクリップする」順序に直す。
+                    // v8 レビュー修正: 「先に作ってから clamp_to」は意味論と
+                    // しては維持しつつ、確保だけはクリップ後の領域に限定する
+                    // `*_clipped` 系(`select::rect_mask_clipped` のコメント
+                    // 参照)を使う。従来はドラッグの外接矩形全体を先に確保
+                    // していたため、低ズームでキャンバス外まで大きくドラッグ
+                    // すると文書サイズと無関係な巨大確保→OOM 中断(release は
+                    // `panic = "abort"`)を起こしえた。楕円の中心・半径は
+                    // 引き続きクリップ前の矩形から計算される(バイト同値、
+                    // select.rs の同値性テスト参照)。
                     let rect = select::irect_from_points(start, end);
+                    let doc_rect = self.doc_full_rect();
                     // SPEC §22: 楕円選択ツールなら楕円マスク、それ以外
                     // (矩形選択)は従来どおり矩形マスク。
                     let mask = if self.tool == ToolKind::EllipseSelect {
-                        select::ellipse_mask(rect)
+                        select::ellipse_mask_clipped(rect, doc_rect)
                     } else {
-                        select::rect_mask(rect)
+                        select::rect_mask_clipped(rect, doc_rect)
                     };
-                    let mask =
-                        mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
                     if mask.is_empty() {
                         None
                     } else {
@@ -2171,12 +2196,15 @@ impl DaraskApp {
         tab.history.ensure_tiles_saved(&tab.doc, rect);
         let pixels = select::extract_region(&tab.doc, &mask);
         select::clear_region_transparent(&mut tab.doc, &mask);
+        // v8 レビュー修正: Esc キャンセル/no-op 確定で戻すため、立てる前の
+        // 値を浮動片に控える(`Floating::prev_modified` のコメント参照)。
+        let prev_modified = tab.doc.modified;
         tab.doc.modified = true;
 
         let pos = pos2(rect.x0 as f32, rect.y0 as f32);
         let id = self.alloc_floating_id();
         let mask_bits = mask.mask.clone();
-        self.active_tab_mut().floating = Some(Floating::new(
+        let mut floating = Floating::new(
             pixels,
             rect.width() as u32,
             rect.height() as u32,
@@ -2184,7 +2212,9 @@ impl DaraskApp {
             pos,
             Some(mask),
             id,
-        ));
+        );
+        floating.prev_modified = prev_modified;
+        self.active_tab_mut().floating = Some(floating);
         self.active_tab_mut().selection = None;
         let offset = img - pos;
         self.select_drag = Some(SelectDrag::MoveFloating { offset });
@@ -2220,7 +2250,18 @@ impl DaraskApp {
             let tab = &mut self.tabs[self.active_tab];
             tab.history.ensure_tiles_saved(&tab.doc, target);
             select::composite_floating(&mut tab.doc, &floating);
+            let undo_before = tab.history.undo_len();
             tab.history.commit_stroke(&mut tab.doc, label);
+            // v8 レビュー修正: before==after で履歴に何も積まれなかった確定
+            // (その場に戻しただけの移動など)は文書を 1 バイトも変えて
+            // いない。浮動化時に未保存ガードのため先行して立てた
+            // `modified`(`begin_floating_from_selection` 参照)を、浮動化
+            // 直前の値へ戻す(SPEC §18 の「完全復元」と SPEC §30 の未保存
+            // 表示の正確さ。実変更があった場合は `commit_stroke` が push と
+            // 同時に `modified = true` を立て直すため巻き戻らない)。
+            if tab.history.undo_len() == undo_before {
+                tab.doc.modified = floating.prev_modified;
+            }
         }
     }
 
@@ -2238,6 +2279,12 @@ impl DaraskApp {
     fn cancel_floating(&mut self) {
         self.select_drag = None;
         if let Some(floating) = self.active_tab_mut().floating.take() {
+            // v8 レビュー修正: キャンセルは文書を浮動化前の状態へ完全復元する
+            // (SPEC §18)ので、浮動化時に先行して立てた `modified` も戻す
+            // (`Floating::prev_modified` のコメント参照。保持中にリネーム等の
+            // 実変更があった場合は該当経路が `prev_modified` を `true` に
+            // 汚染済みなので、未保存ガードを失わない)。
+            self.active_tab_mut().doc.modified = floating.prev_modified;
             if let Some(cut_from) = floating.cut_from {
                 // v4 §16.3: `cut_from` は `SelMask` になったが、復元は
                 // `bbox` 全体をタイルから一括コピーするだけでよい —
@@ -2295,6 +2342,7 @@ impl DaraskApp {
         let tab = self.active_tab_mut();
         tab.history.jump_to(&mut tab.doc, target_len);
         self.clamp_selection_to_doc();
+        self.refresh_modified_after_history_move();
     }
 
     /// SPEC §18: Ctrl+T(自由変形)。選択範囲があれば浮動化してハンドル表示。
@@ -2392,7 +2440,16 @@ impl DaraskApp {
     /// 現在の選択(浮動片優先)の画素を取得する。無ければ `None`。
     fn selected_pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
         if let Some(floating) = &self.active_tab().floating {
-            return Some((floating.w, floating.h, floating.pixels.clone()));
+            // v8 レビュー修正: `floating.pixels` を生のまま返すとマスク外の
+            // 画素(ハンドルの再サンプリングで不透明な値が残りうる、
+            // `floating_layer_pixels` のコメント参照)までコピーされ、
+            // 非矩形選択の形状が保たれない(SPEC §21)。合成・複製と同じく
+            // マスク外を透明化した画素を渡す。
+            return Some((
+                floating.w,
+                floating.h,
+                select::floating_layer_pixels(floating),
+            ));
         }
         if let Some(selection) = &self.active_tab().selection {
             let mask = selection
@@ -2424,6 +2481,54 @@ impl DaraskApp {
                 self.show_toast(format!("コピーに失敗しました: {e}"));
                 false
             }
+        }
+    }
+
+    /// v8 §38: 現在の選択範囲(浮動片があればその足跡)の**可視レイヤー
+    /// 合成結果**の画素。通常の `selected_pixels`(アクティブレイヤーのみ)の
+    /// 「見えているとおり」版で、スポイト(SPEC §13: 「スポイトは合成結果から
+    /// 色を取る」)と同じ意味論。浮動片がある場合は確定せず、合成結果の上へ
+    /// 画面表示と同じ source-over で重ねた画素を作る(SPEC §38: 非破壊 —
+    /// ドキュメント・選択・浮動片の状態を一切変更しない。`&mut self` は
+    /// `composite` キャッシュの最新化(`recompose_if_dirty`)にだけ使う)。
+    fn merged_selected_pixels(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        self.active_tab_mut().doc.recompose_if_dirty();
+        let tab = self.active_tab();
+        // v8 R2 レビュー修正: 浮動片の足跡はキャンバス境界へ**クランプしない**
+        // (SPEC §6: 浮動片はキャンバス外へはみ出してよい。通常コピーが浮動片
+        // 全体を返すのと整合させる)。キャンバス外の合成結果は
+        // `composite_pixel` が `None` → 透明として扱われ、浮動片だけが
+        // その上へ重なる。静的選択は従来どおりクランプ(選択は文書内の
+        // 概念)。
+        let mask = if let Some(floating) = &tab.floating {
+            crate::document::SelMask {
+                bbox: select::floating_target_rect(floating),
+                mask: floating.mask.clone(),
+            }
+        } else if let Some(selection) = &tab.selection {
+            selection.mask.clamp_to(tab.doc.width, tab.doc.height)
+        } else {
+            return None;
+        };
+        if mask.is_empty() {
+            return None;
+        }
+        let mut pixels = select::extract_region_composite(&tab.doc, &mask);
+        if let Some(floating) = &tab.floating {
+            select::overlay_floating_onto_region(&mut pixels, mask.bbox, floating);
+        }
+        Some((mask.bbox.width() as u32, mask.bbox.height() as u32, pixels))
+    }
+
+    /// v8 §38: Ctrl+Shift+C「結合部分をコピー」。`copy_selection_to_clipboard`
+    /// の合成版(そちらと違い戻り値は使い道が無いので返さない — 切り取りに
+    /// 相当する「結合切り取り」は存在しない)。
+    fn copy_merged_selection_to_clipboard(&mut self) {
+        let Some((w, h, pixels)) = self.merged_selected_pixels() else {
+            return;
+        };
+        if let Err(e) = io::copy_image_to_clipboard(w, h, &pixels) {
+            self.show_toast(format!("コピーに失敗しました: {e}"));
         }
     }
 
@@ -2460,6 +2565,73 @@ impl DaraskApp {
                 x1: self.active_tab().doc.width as i32,
                 y1: self.active_tab().doc.height as i32,
             })));
+    }
+
+    /// v9 §41: 矢印キーのナッジ。浮動片があればそれを `(dx, dy)` px 移動し、
+    /// 無ければ選択枠だけを移動する(PS の選択ツール準拠 — 枠の移動は画素を
+    /// 動かさない。画素ごと動かしたい場合は従来どおり浮動化してから)。
+    /// どちらも無ければ何もしない。移動だけなので履歴には積まない(ドラッグ
+    /// 移動と同じ — 確定時にまとめて 1 undo 単位)。
+    fn nudge_selection(&mut self, dx: f32, dy: f32) {
+        if let Some(floating) = self.active_tab_mut().floating.as_mut() {
+            floating.pos += egui::vec2(dx, dy);
+            return;
+        }
+        let (width, height) = {
+            let doc = &self.active_tab().doc;
+            (doc.width, doc.height)
+        };
+        if let Some(selection) = self.active_tab_mut().selection.take() {
+            let mut mask = selection.mask;
+            mask.bbox = crate::document::IRect {
+                x0: mask.bbox.x0 + dx as i32,
+                y0: mask.bbox.y0 + dy as i32,
+                x1: mask.bbox.x1 + dx as i32,
+                y1: mask.bbox.y1 + dy as i32,
+            };
+            let mask = mask.clamp_to(width, height);
+            self.active_tab_mut().selection = if mask.is_empty() {
+                None
+            } else {
+                Some(Selection::new(mask))
+            };
+        }
+    }
+
+    /// v8 §37: Ctrl+Shift+I「選択範囲を反転」。選択マスクの補集合
+    /// (ドキュメント範囲内)を新しい選択にする。全選択の反転は選択解除に
+    /// なる(`invert_mask` が empty を返す)。選択も浮動片も無ければ何も
+    /// しない(メニューは `has_selection` でグレーアウト済み)。履歴には
+    /// 積まない(選択の作成/解除が履歴対象外なのと同じ、SPEC §37)。
+    ///
+    /// 浮動片がある場合は先に確定し(選択の変更は描画クリップを変えるため、
+    /// ツール切替・レイヤー操作と同じ commit-first 規則に乗せる)、その足跡
+    /// (確定位置のマスク)を反転対象にする。
+    fn invert_selection(&mut self) {
+        let footprint =
+            self.active_tab()
+                .floating
+                .as_ref()
+                .map(|floating| crate::document::SelMask {
+                    bbox: select::floating_target_rect(floating),
+                    mask: floating.mask.clone(),
+                });
+        self.commit_open_gesture();
+        // `commit_open_gesture` は選択/移動系ツール使用中しか浮動片を確定
+        // しない(それ以外のツールでは浮動片は存在しない、という `set_tool`
+        // の不変条件に依存している)。ここではその不変条件に頼らず、残って
+        // いれば必ず確定する(no-op なら何もしない冪等な呼び出し)。
+        self.flush_floating_keep_selection();
+        let tab = self.active_tab_mut();
+        let Some(mask) = footprint.or_else(|| tab.selection.take().map(|s| s.mask)) else {
+            return;
+        };
+        let inverted = select::invert_mask(&mask, tab.doc.width, tab.doc.height);
+        tab.selection = if inverted.is_empty() {
+            None
+        } else {
+            Some(Selection::new(inverted))
+        };
     }
 
     /// SPEC §6: 「ドキュメントが完全に未編集・未保存(起動直後の白紙)」の
@@ -2570,8 +2742,12 @@ impl DaraskApp {
         // `commit_selection` 参照)。
         let tab = &mut self.tabs[self.active_tab];
         tab.history.begin_stroke(tab.doc.active);
-        self.active_tab_mut().floating =
-            Some(Floating::new_rect(pixels, w, h, pos, None, id).with_label(label));
+        // v8 レビュー修正: Esc で破棄したときに戻す値を控える
+        // (`Floating::prev_modified`、`begin_floating_from_selection` と同じ)。
+        let prev_modified = tab.doc.modified;
+        let mut floating = Floating::new_rect(pixels, w, h, pos, None, id).with_label(label);
+        floating.prev_modified = prev_modified;
+        self.active_tab_mut().floating = Some(floating);
         self.active_tab_mut().selection = None;
         // M4 で発見・修正したバグ: 浮動片は画面に見えている未保存の変更
         // だが、以前は `commit_selection` で合成されるまで `doc.modified` が
@@ -2605,6 +2781,16 @@ impl DaraskApp {
         self.active_tab_mut()
             .history
             .push(HistoryOp::ReplaceAll { before, after }, "貼り付け");
+        // v8 レビュー修正: 白紙でも選択だけは作れる(Ctrl+A は文書を変更
+        // しないため `doc_is_pristine()` は真のまま)。旧寸法の選択を残すと、
+        // 以後の描画がすべて旧座標のマスクでクリップされ、貼り付け画像が
+        // 旧選択の外にあると「1 画素も描けない」状態になる(SPEC §21 の
+        // クリップ規則が古い選択に適用され続ける)。文書ごと置き換えたので
+        // 選択・浮動片も新規作成時(`reset_active_tab_document`)と同じく
+        // 破棄する。
+        self.active_tab_mut().selection = None;
+        self.active_tab_mut().floating = None;
+        self.select_drag = None;
         self.active_tab_mut().next_layer_number = 1;
         self.reset_tool_state_for_new_document();
     }
@@ -2987,6 +3173,21 @@ impl DaraskApp {
                     None => self.after_save_action = None,
                 }
             }
+            // v9 §43: 画像を読み込み、クリップボード貼り付けと同じ経路
+            // (`paste_pixels` — 白紙なら置き換え、それ以外は浮動片)へ流す。
+            DialogRequest::PasteFile => {
+                if let Some(path) = io::paste_file_dialog() {
+                    match io::load_image(&path) {
+                        Ok(doc) => {
+                            let (w, h) = (doc.width, doc.height);
+                            if let Some(layer) = doc.layers.into_iter().next() {
+                                self.paste_pixels(w, h, layer.pixels);
+                            }
+                        }
+                        Err(e) => self.show_toast(format!("貼り付けに失敗しました: {e}")),
+                    }
+                }
+            }
         }
     }
 
@@ -3365,6 +3566,26 @@ impl DaraskApp {
         // レイヤーが複数ある状態で保存したことをトーストで知らせる
         // (`io::save_image` 自体が統合するため、ここでは判定のみ)。
         let had_multiple_layers = self.active_tab().doc.layers.len() > 1;
+        // v8 レビュー修正(SPEC §36: 「PNG/JPEG/BMPは編集履歴を持たない
+        // flatten画像書き出しであり、`.dpaint`とは意味を分ける」): レイヤーが
+        // 複数ある、または `.dpaint` に紐付いたドキュメントを画像形式へ保存
+        // した場合は**書き出し(エクスポート)**として扱い、タブのパス・
+        // 未保存状態を変えない。従来はパスを画像ファイルへ差し替えて
+        // `modified = false` にしていたため、そのまま閉じると確認なしに
+        // レイヤー・履歴が失われ、以後の Ctrl+S も黙って統合画像の上書きに
+        // なっていた。単一レイヤーで `.dpaint` に紐付いていない文書の画像
+        // 保存だけは、従来どおり「そのファイルを開いて編集している」
+        // MS ペイント型の意味を保つ。
+        let export_only = format != SaveFormat::Project
+            && (had_multiple_layers
+                || matches!(
+                    self.active_tab()
+                        .doc
+                        .path
+                        .as_deref()
+                        .map(io::format_for_path),
+                    Some(Some(SaveFormat::Project))
+                ));
         let result = if format == SaveFormat::Project {
             let tab = self.active_tab();
             crate::project::save(&tab.doc, &tab.history, &path)
@@ -3373,23 +3594,85 @@ impl DaraskApp {
         };
         match result {
             Ok(()) => {
-                self.active_tab_mut().doc.path = Some(path.clone());
-                self.active_tab_mut().doc.modified = false;
-                if had_multiple_layers && format != SaveFormat::Project {
-                    self.show_toast("レイヤーは統合して保存されました".to_owned());
-                }
+                // v8 レビュー修正: 「名前を付けて保存」/書き出しで別タブが
+                // 開いているパスへ書いた場合、同じパスを 2 タブが保持して
+                // 以後の Ctrl+S で互いの内容を黙って上書きし合わないよう、
+                // 他タブからパスの紐付けを外す(内容は失わない)。
+                self.detach_other_tabs_with_path(&path);
                 // SPEC §26: 「最近使ったファイル」。保存先も対象にする
                 // (MS ペイント等と同様、開いたファイルだけでなく保存先も
                 // 「最近使った」に含める)。
-                self.remember_recent_file(path);
-                if let Some(action) = self.after_save_action.take() {
-                    self.execute_pending_action(action);
+                self.remember_recent_file(path.clone());
+                if export_only {
+                    // 書き出し: タブの状態(パス・modified・保存マーカー)は
+                    // 一切変えない。
+                    self.show_toast(if had_multiple_layers {
+                        "レイヤーを統合して書き出しました(プロジェクトとしては未保存)".to_owned()
+                    } else {
+                        "画像として書き出しました(プロジェクトとしては未保存)".to_owned()
+                    });
+                    // 未保存ガードから「保存」を選んで画像形式を選んだ場合、
+                    // プロジェクト内容(レイヤー・履歴)は保存されていない
+                    // ため、続く破壊的操作(閉じる等)は続行しない。
+                    if self.after_save_action.take().is_some() {
+                        self.show_toast(
+                            "画像として書き出しました。閉じる前にプロジェクト(.dpaint)として保存してください"
+                                .to_owned(),
+                        );
+                    }
+                } else {
+                    self.active_tab_mut().doc.path = Some(path);
+                    self.active_tab_mut().doc.modified = false;
+                    // v8 レビュー修正①(SPEC §40): この履歴位置を「保存済み
+                    // 状態」として記録し、メタ変更の記録もクリアする。以後
+                    // undo/redo でこの位置へ戻れば未保存表示が消える。
+                    self.active_tab_mut().history.mark_saved();
+                    self.active_tab_mut().meta_dirty = false;
+                    if let Some(action) = self.after_save_action.take() {
+                        self.execute_pending_action(action);
+                    }
                 }
             }
             Err(e) => {
                 self.after_save_action = None;
                 self.show_toast(format!("保存に失敗しました: {e}"));
             }
+        }
+    }
+
+    /// v8 レビュー修正(`finish_save` 参照): `path` へ保存し終えた直後に、
+    /// 同じパスを保持している**他の**タブからパスの紐付けを外す。外された
+    /// タブは「無題N」(パス無し・未保存)へ戻り、内容はそのまま残る —
+    /// ディスク上のファイルはもうそのタブの内容と一致しないため、以後の
+    /// Ctrl+S で黙って上書きさせない。
+    fn detach_other_tabs_with_path(&mut self, path: &Path) {
+        let normalized = normalize_path_for_compare(path);
+        let detach: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, tab)| {
+                *i != self.active_tab
+                    && tab
+                        .doc
+                        .path
+                        .as_deref()
+                        .is_some_and(|p| normalize_path_for_compare(p) == normalized)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for index in detach {
+            let number = self.take_untitled_number();
+            let tab = &mut self.tabs[index];
+            tab.doc.path = None;
+            tab.untitled_number = Some(number);
+            tab.doc.modified = true;
+            // SPEC §40-①: ディスク上のファイルはもうこのタブの履歴のどの
+            // 位置とも一致しないため、保存済みマーカーを無効化する(undo で
+            // 「保存済み」表示に戻ってしまうと、閉じる確認が出ないまま
+            // このタブの内容が失われうる)。
+            tab.history.invalidate_saved();
+            self.show_toast("同じファイルを開いていた別のタブは「無題」になりました".to_owned());
         }
     }
 
@@ -3456,6 +3739,9 @@ impl DaraskApp {
         self.active_tab_mut().view = CanvasView::new();
         self.active_tab_mut().untitled_number = untitled_number;
         self.active_tab_mut().next_layer_number = 1;
+        // SPEC §40-①: 新しい `History::new()` は初期状態を「保存済み」基準に
+        // 持つ。メタ変更の記録も白紙に戻す。
+        self.active_tab_mut().meta_dirty = false;
         self.reset_tool_state_for_new_document();
     }
 
@@ -3605,7 +3891,35 @@ impl DaraskApp {
         self.active_tab_mut().doc.modified = true;
     }
 
+    /// v9 §42(MS ペイント準拠): 反転/回転は、浮動片(または選択 — 先に
+    /// Ctrl+T と同じ経路で浮動化する)がある場合は**その対象だけ**へ適用する。
+    /// 適用したら `true`。浮動片の変換は履歴に積まない(移動やハンドル拡縮と
+    /// 同じ「確定時にまとめて 1 undo 単位」の意味論 — Esc で丸ごと取り消せる)。
+    fn try_transform_floating(&mut self, transform: select::FloatingTransform) -> bool {
+        if self.active_tab().floating.is_none() {
+            if self.active_tab().selection.is_none() {
+                return false;
+            }
+            // 選択だけがある場合は浮動化してから変換する(SPEC §18 の
+            // 自由変形と同じ入口 — commit-first ガードも同関数が持つ)。
+            self.free_transform();
+        }
+        let id = self.alloc_floating_id();
+        let Some(floating) = self.active_tab_mut().floating.as_mut() else {
+            return false;
+        };
+        select::transform_floating(floating, transform);
+        // 変換後の画素が次の拡縮の再サンプリング元になる(遅延複製、
+        // `Floating::reset_resample_source` 参照)。テクスチャも作り直す。
+        floating.reset_resample_source();
+        floating.id = id;
+        true
+    }
+
     fn apply_flip_horizontal(&mut self) {
+        if self.try_transform_floating(select::FloatingTransform::FlipHorizontal) {
+            return;
+        }
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.flip_horizontal();
@@ -3613,6 +3927,9 @@ impl DaraskApp {
     }
 
     fn apply_flip_vertical(&mut self) {
+        if self.try_transform_floating(select::FloatingTransform::FlipVertical) {
+            return;
+        }
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.flip_vertical();
@@ -3620,6 +3937,9 @@ impl DaraskApp {
     }
 
     fn apply_rotate_cw(&mut self) {
+        if self.try_transform_floating(select::FloatingTransform::RotateCw) {
+            return;
+        }
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.rotate_cw();
@@ -3627,6 +3947,9 @@ impl DaraskApp {
     }
 
     fn apply_rotate_ccw(&mut self) {
+        if self.try_transform_floating(select::FloatingTransform::RotateCcw) {
+            return;
+        }
         self.commit_selection();
         let before = self.active_tab().doc.snapshot();
         self.active_tab_mut().doc.rotate_ccw();
@@ -4041,11 +4364,21 @@ impl DaraskApp {
         let tab = self.active_tab_mut();
         if let Some(layer) = tab.doc.layers.get_mut(idx) {
             layer.name = trimmed;
-            // `ui/layers_panel.rs::show_layer_row` の通常の確定経路と同様、
+            // `commit_rename_action`(パネルの通常の確定経路)と同様、
             // 不透明度・表示切替の隣接ハンドラに揃えて `modified` を立てる
             // (立てないと `doc_is_pristine()` がリネームだけされた文書を
             // 「白紙」のまま誤判定し、Ctrl+V の白紙置換パスに載ってしまう)。
             tab.doc.modified = true;
+            // SPEC §40-①: 履歴に積まれない実変更として記録する。
+            tab.meta_dirty = true;
+            // v8 レビュー修正: 浮動片の保持中に履歴外の実変更(この
+            // リネーム)が起きた場合、浮動片の Esc キャンセルが `modified` を
+            // 浮動化前の値へ巻き戻すとリネームの未保存フラグまで失われて
+            // しまう。復元値を `true` に汚染して巻き戻しを無効化する
+            // (`Floating::prev_modified` のコメント参照)。
+            if let Some(floating) = tab.floating.as_mut() {
+                floating.prev_modified = true;
+            }
         }
     }
 
@@ -4184,7 +4517,71 @@ impl DaraskApp {
             LayersPanelAction::MoveUp => self.layer_move_up(),
             LayersPanelAction::MoveDown => self.layer_move_down(),
             LayersPanelAction::MergeDown => self.layer_merge_down(),
+            // v8 レビュー修正②: 履歴に積まない操作(SPEC §13)も
+            // commit-first 規則(同 §13 最終項)を通す。
+            LayersPanelAction::SetVisible(idx, visible) => self.set_layer_visible(idx, visible),
+            LayersPanelAction::SetOpacity(opacity) => self.set_active_layer_opacity(opacity),
+            LayersPanelAction::CommitRename(idx, name) => self.commit_rename_action(idx, name),
         }
+    }
+
+    /// SPEC §13: 表示切替(履歴には積まない)。v8 レビュー修正②: 以前は
+    /// パネルが `Document` を直接変更しており、浮動片・ストローク進行中でも
+    /// 素通りだった。他のレイヤー操作と同じく先に確定してから適用する。
+    fn set_layer_visible(&mut self, idx: usize, visible: bool) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        if let Some(layer) = tab.doc.layers.get_mut(idx) {
+            if layer.visible != visible {
+                layer.visible = visible;
+                tab.doc.mark_all_dirty();
+                tab.doc.modified = true;
+                // SPEC §40-①: 履歴に積まれない実変更として記録する。
+                tab.meta_dirty = true;
+            }
+        }
+    }
+
+    /// SPEC §13: アクティブレイヤーの不透明度(履歴には積まない)。
+    /// `set_layer_visible` と同じ v8 レビュー修正②。
+    fn set_active_layer_opacity(&mut self, opacity: u8) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        let active = tab.doc.active_index();
+        if let Some(layer) = tab.doc.layers.get_mut(active) {
+            if layer.opacity != opacity {
+                layer.opacity = opacity;
+                tab.doc.mark_all_dirty();
+                tab.doc.modified = true;
+                tab.meta_dirty = true;
+            }
+        }
+    }
+
+    /// レイヤー名変更の確定(パネルの Enter/フォーカス外し経由)。
+    /// `modified` を立てる理由は旧パネル実装から引き継ぎ:
+    /// `doc_is_pristine()` がリネーム済み文書を「白紙」と誤判定して
+    /// Ctrl+V の白紙置換パスに載らないようにするため。
+    fn commit_rename_action(&mut self, idx: usize, name: String) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        if let Some(layer) = tab.doc.layers.get_mut(idx) {
+            if layer.name != name {
+                layer.name = name;
+                tab.doc.modified = true;
+                tab.meta_dirty = true;
+            }
+        }
+    }
+
+    /// v8 レビュー修正①(SPEC §40 の既知課題の解消): undo/redo/履歴
+    /// ジャンプの直後に呼び、「保存時点の履歴位置に戻り、かつ履歴外の
+    /// メタ変更(レイヤー名・表示・不透明度)も無い」なら `modified` を
+    /// 下ろす。逆に保存位置から離れていれば立てる(`apply_before`/
+    /// `apply_after` が常に立てる値を、より正確な判定で上書きする)。
+    fn refresh_modified_after_history_move(&mut self) {
+        let tab = self.active_tab_mut();
+        tab.doc.modified = tab.meta_dirty || !tab.history.is_at_saved_state();
     }
 
     // -----------------------------------------------------------------
@@ -4215,21 +4612,32 @@ impl DaraskApp {
                 let tab = self.active_tab_mut();
                 tab.history.undo(&mut tab.doc);
                 self.clamp_selection_to_doc();
+                self.refresh_modified_after_history_move();
             }
             MenuAction::Redo => {
                 self.commit_open_gesture();
                 let tab = self.active_tab_mut();
                 tab.history.redo(&mut tab.doc);
                 self.clamp_selection_to_doc();
+                self.refresh_modified_after_history_move();
             }
             MenuAction::Cut => self.cut_selection_to_clipboard(),
             MenuAction::Copy => {
                 self.copy_selection_to_clipboard();
             }
+            // v8 §38: 「結合部分をコピー」(Ctrl+Shift+C と同じ処理)。
+            MenuAction::CopyMerged => self.copy_merged_selection_to_clipboard(),
             MenuAction::Paste => self.paste_from_clipboard(),
+            // v9 §43: rfd はブロッキングなので次フレーム冒頭で開く
+            // (ARCHITECTURE.md §12-9、他のダイアログと同じ)。
+            MenuAction::PasteFromFile => {
+                self.pending_dialog = Some(DialogRequest::PasteFile);
+            }
             MenuAction::Delete => self.delete_selection(),
             MenuAction::SelectAll => self.select_all(),
             MenuAction::Deselect => self.commit_selection(),
+            // v8 §37: 「選択範囲を反転」(Ctrl+Shift+I と同じ処理)。
+            MenuAction::SelectInverse => self.invert_selection(),
             // v6 §33(ARCHITECTURE.md §18.1): 編集メニューに追加した
             // 「自由変形」。Ctrl+T(`Action::FreeTransform`)と全く同じ処理を
             // 呼ぶだけ(`free_transform` 自身が commit-first ガードを持つ、
@@ -4681,13 +5089,8 @@ impl eframe::App for DaraskApp {
         // 借用してしまうメソッド呼び出し)ではなく `Tab` への可変参照を
         // 1 回だけ取って両フィールドへ分割借用する。
         let tab = &mut self.tabs[self.active_tab];
-        let (layer_action, history_jump) = side_panel::show(
-            ui,
-            &mut tab.doc,
-            &mut tab.layer_rename,
-            &tab.history,
-            color_ctx,
-        );
+        let (layer_action, history_jump) =
+            side_panel::show(ui, &tab.doc, &mut tab.layer_rename, &tab.history, color_ctx);
         if let Some(action) = layer_action {
             self.handle_layers_panel_action(action);
         }
@@ -4728,7 +5131,9 @@ impl eframe::App for DaraskApp {
         let alt_held = ui.ctx().input(|i| i.modifiers.alt);
         let cursor = self.cursor_for_active_tool(alt_held);
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(64)))
+            // v9 §44: 作業領域の背景もテーマの階調に合わせる(SPEC §3 の
+            // 「暗灰色」の範囲内での色調整)。
+            .frame(egui::Frame::NONE.fill(crate::ui::theme::CANVAS_WORKSPACE_FILL))
             .show(ui, |ui| {
                 let tab = &mut self.tabs[self.active_tab];
                 let output = tab.view.show(ui, &mut tab.doc, force_pan, cursor);
@@ -5663,6 +6068,661 @@ mod tests {
             .as_ref()
             .expect("an actual drag must float the selection");
         assert_eq!(floating.pos, pos2(5.0, 2.0));
+    }
+
+    // -- v8 レビュー修正の回帰テスト -----------------------------------------
+
+    #[test]
+    fn cancel_floating_restores_the_unmodified_flag_on_a_clean_document() {
+        // 「保存済み(未変更)文書で選択を浮動化 → Esc」は文書を 1 バイトも
+        // 変えないので、未保存表示(`*`)も残ってはならない(SPEC §18)。
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.modified = false;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform();
+        assert!(app.active_tab().floating.is_some());
+        assert!(
+            app.active_tab().doc.modified,
+            "浮動化中は未保存ガードが働く"
+        );
+
+        app.cancel_floating();
+        assert!(app.active_tab().floating.is_none());
+        assert!(
+            !app.active_tab().doc.modified,
+            "Esc キャンセル後は浮動化前の未変更状態へ完全復元される"
+        );
+    }
+
+    #[test]
+    fn cancel_floating_keeps_modified_when_it_was_already_set_before_floating() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.modified = true;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform();
+        app.cancel_floating();
+        assert!(
+            app.active_tab().doc.modified,
+            "浮動化前から未保存だった文書はキャンセル後も未保存のまま"
+        );
+    }
+
+    #[test]
+    fn noop_floating_commit_restores_the_unmodified_flag() {
+        // 浮動化して 1px も動かさず Enter 確定(before==after で履歴に何も
+        // 積まれない)場合も、未保存表示は浮動化前の状態へ戻る。
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.modified = false;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform();
+        app.commit_selection();
+        assert!(app.active_tab().floating.is_none());
+        assert!(
+            !app.active_tab().history.can_undo(),
+            "no-op 確定は undo 単位を作らない(前提の確認)"
+        );
+        assert!(!app.active_tab().doc.modified);
+    }
+
+    #[test]
+    fn cancel_floating_keeps_modified_when_a_layer_was_renamed_mid_float() {
+        // 浮動片の保持中にレイヤー名を確定した(履歴外の実変更)場合、Esc の
+        // 巻き戻しでリネームの未保存フラグまで失ってはならない。
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.modified = false;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform();
+        app.active_tab_mut().layer_rename = Some((0, "新しい名前".to_owned(), false));
+        app.commit_pending_layer_rename();
+        assert_eq!(app.active_tab().doc.layers[0].name, "新しい名前");
+
+        app.cancel_floating();
+        assert!(
+            app.active_tab().doc.modified,
+            "リネームは実変更なので Esc 後も未保存のまま"
+        );
+    }
+
+    #[test]
+    fn paste_replace_on_a_pristine_document_discards_a_stale_selection() {
+        // 白紙文書でも Ctrl+A で選択は作れる(文書は変更されないので白紙の
+        // まま)。その状態の貼り付けは文書ごと置き換えるので、旧寸法の選択が
+        // 残って以後の描画をクリップしてはならない。
+        let mut app = new_for_test(Document::new(1280, 720, Background::White));
+        app.select_all();
+        assert!(app.active_tab().selection.is_some());
+        assert!(app.doc_is_pristine());
+
+        app.paste_pixels(4, 4, vec![255u8; 4 * 4 * 4]);
+        assert_eq!(app.active_tab().doc.width, 4, "白紙置き換え貼り付け");
+        assert!(
+            app.active_tab().selection.is_none(),
+            "置き換え後に旧寸法の選択が残ってはならない"
+        );
+        assert!(app.active_tab().floating.is_none());
+    }
+
+    #[test]
+    fn selected_pixels_applies_the_floating_mask_outside_pixels() {
+        // 非矩形浮動片のコピーはマスク外を透明として書き出す(SPEC §21)。
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let pixels = [9u8, 9, 9, 255].repeat(4); // 2x2 全画素不透明
+        let mask = vec![255, 0, 0, 255]; // 対角だけ選択
+        app.active_tab_mut().floating = Some(select::Floating::new(
+            pixels,
+            2,
+            2,
+            mask,
+            pos2(0.0, 0.0),
+            None,
+            1,
+        ));
+        let (w, h, out) = app.selected_pixels().expect("floating must copy");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&out[0..4], &[9, 9, 9, 255], "マスク内は画素そのまま");
+        assert_eq!(&out[4..8], &[0, 0, 0, 0], "マスク外は透明");
+        assert_eq!(&out[8..12], &[0, 0, 0, 0]);
+        assert_eq!(&out[12..16], &[9, 9, 9, 255]);
+    }
+
+    #[test]
+    fn select_up_with_a_huge_out_of_canvas_drag_creates_a_doc_bounded_selection() {
+        // v8 レビュー修正: キャンバス外まで極端にドラッグしても、確保・選択
+        // とも文書境界へクリップされる(OOM しない)。
+        let mut app = new_for_test(Document::new(16, 16, Background::White));
+        app.tool = ToolKind::Select;
+        app.handle_select_event(ToolEvent::Down {
+            img: pos2(-1_000_000.0, -1_000_000.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Drag {
+            img: pos2(1_000_000.0, 1_000_000.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Up {
+            img: pos2(1_000_000.0, 1_000_000.0),
+            button: PointerButton::Primary,
+        });
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("the drag must create a selection");
+        assert_eq!(
+            (
+                selection.mask.bbox.x0,
+                selection.mask.bbox.y0,
+                selection.mask.bbox.x1,
+                selection.mask.bbox.y1
+            ),
+            (0, 0, 16, 16)
+        );
+        assert_eq!(selection.mask.mask.len(), 16 * 16);
+    }
+
+    #[test]
+    fn saving_to_a_path_held_by_another_tab_detaches_that_tab() {
+        // v8 レビュー修正: 「名前を付けて保存」で他タブのパスへ保存したら、
+        // そのタブはパスの紐付けを失い「無題」(未保存)へ戻る — 以後の
+        // Ctrl+S が互いの内容を黙って上書きしない。
+        let dir = temp_dir_for_app_test("detach_on_save_as");
+        let path = dir.join("shared.png");
+        let mut seed_doc = Document::new(3, 3, Background::White);
+        io::save_image(&mut seed_doc, &path, SaveFormat::Png).expect("seed file should save");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        // タブ 0 がそのファイルを開いている状態を作る。
+        app.open_path_in_new_tab(path.clone());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        let opened_tab = 1;
+        // 別の(無題)タブをアクティブにして、同じパスへ「名前を付けて保存」。
+        app.switch_tab(0);
+        app.finish_save(path.clone(), SaveFormat::Png);
+
+        assert_eq!(
+            app.tabs[0].doc.path.as_deref(),
+            Some(path.as_path()),
+            "保存したタブがパスを取得する"
+        );
+        assert!(
+            app.tabs[opened_tab].doc.path.is_none(),
+            "同じパスを持っていた他タブはパスを失う"
+        );
+        assert!(
+            app.tabs[opened_tab].doc.modified,
+            "外されたタブは未保存扱いになる(内容はディスクと不一致のため)"
+        );
+        assert!(
+            app.tabs[opened_tab].untitled_number.is_some(),
+            "外されたタブは「無題N」の採番を受ける"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v9 §45-3: 画像形式への保存は「書き出し」 -----------------------------
+
+    #[test]
+    fn image_save_of_a_multi_layer_document_is_an_export_and_keeps_the_tab_unsaved() {
+        let dir = temp_dir_for_app_test("export_multi_layer");
+        let path = dir.join("export.png");
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add();
+        assert!(app.active_tab().doc.modified);
+
+        app.finish_save(path.clone(), SaveFormat::Png);
+
+        assert!(path.exists(), "画像自体は書き出される");
+        assert!(
+            app.active_tab().doc.path.is_none(),
+            "書き出しはタブのパスを奪わない(SPEC §45-3)"
+        );
+        assert!(
+            app.active_tab().doc.modified,
+            "レイヤー・履歴は保存されていないので未保存のまま"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_save_of_a_dpaint_bound_document_keeps_the_project_path() {
+        let dir = temp_dir_for_app_test("export_from_dpaint");
+        let dpaint = dir.join("work.dpaint");
+        let png = dir.join("out.png");
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+        app.finish_save(dpaint.clone(), SaveFormat::Project);
+        assert_eq!(app.active_tab().doc.path.as_deref(), Some(dpaint.as_path()));
+        assert!(!app.active_tab().doc.modified);
+
+        app.finish_save(png.clone(), SaveFormat::Png);
+
+        assert!(png.exists());
+        assert_eq!(
+            app.active_tab().doc.path.as_deref(),
+            Some(dpaint.as_path()),
+            ".dpaint の紐付けは書き出しで変わらない"
+        );
+        assert!(
+            !app.active_tab().doc.modified,
+            "プロジェクトは保存済みのままなので未保存にもならない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_save_of_a_single_layer_plain_document_binds_the_path_as_before() {
+        let dir = temp_dir_for_app_test("plain_png_save");
+        let path = dir.join("plain.png");
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+
+        app.finish_save(path.clone(), SaveFormat::Png);
+
+        assert_eq!(
+            app.active_tab().doc.path.as_deref(),
+            Some(path.as_path()),
+            "単一レイヤー・非プロジェクト文書は MS ペイント型のまま"
+        );
+        assert!(!app.active_tab().doc.modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v9 §41: 矢印キーのナッジ --------------------------------------------
+
+    #[test]
+    fn arrow_nudge_moves_a_floating_then_a_plain_selection_outline() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        // 選択のみ: 枠だけが動き、画素は動かない。
+        app.nudge_selection(1.0, 0.0);
+        let bbox = app.active_tab().selection.as_ref().map(|s| s.mask.bbox);
+        assert_eq!(
+            bbox.map(|b| (b.x0, b.y0, b.x1, b.y1)),
+            Some((3, 2, 7, 6)),
+            "選択枠が 1px 右へ"
+        );
+        assert!(!app.active_tab().doc.modified, "枠の移動は画素を動かさない");
+
+        // 浮動化してからは浮動片が動く。
+        app.free_transform();
+        let before = app.active_tab().floating.as_ref().map(|f| f.pos);
+        app.nudge_selection(0.0, -3.0);
+        let after = app.active_tab().floating.as_ref().map(|f| f.pos);
+        assert_eq!(
+            after,
+            before.map(|p| pos2(p.x, p.y - 3.0)),
+            "浮動片が 3px 上へ"
+        );
+    }
+
+    // -- v9 §42: 選択範囲・浮動片の反転/回転 ---------------------------------
+
+    #[test]
+    fn flip_horizontal_applies_to_the_floating_only() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.set_pixel(2, 2, [255, 0, 0, 255]); // 左上隅に赤
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+
+        app.apply_flip_horizontal();
+
+        let floating = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .expect("選択は浮動化されてから反転される");
+        assert_eq!((floating.w, floating.h), (4, 4));
+        // 赤(浮動化前はローカル (0,0))が反転でローカル (3,0) へ。
+        assert_eq!(&floating.pixels[3 * 4..3 * 4 + 4], &[255, 0, 0, 255]);
+        assert_eq!(&floating.pixels[0..4], &[255, 255, 255, 255]);
+        // 文書全体には ReplaceAll が積まれていない(全レイヤー反転して
+        // いない)。浮動化のストロークが開いているだけ。
+        assert!(!app.active_tab().history.can_undo());
+        assert!(app.active_tab().history.has_open_stroke());
+    }
+
+    #[test]
+    fn rotate_cw_swaps_floating_dimensions_and_keeps_the_center() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 4,
+            x1: 8,
+            y1: 8,
+        }))); // 6x4
+        app.free_transform();
+        app.apply_rotate_cw();
+        let floating = app.active_tab().floating.as_ref().expect("still floating");
+        assert_eq!((floating.w, floating.h), (4, 6), "幅高が入れ替わる");
+        let center = (
+            floating.pos.x + floating.w as f32 / 2.0,
+            floating.pos.y + floating.h as f32 / 2.0,
+        );
+        assert_eq!(center, (5.0, 6.0), "見た目の中心は維持");
+    }
+
+    #[test]
+    fn flip_without_selection_still_flips_the_whole_document() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.active_tab_mut().doc.set_pixel(0, 0, [255, 0, 0, 255]);
+        app.active_tab_mut().doc.mark_all_dirty();
+        app.apply_flip_horizontal();
+        assert_eq!(
+            app.active_tab().doc.get_pixel(3, 0),
+            Some([255, 0, 0, 255]),
+            "従来どおり全レイヤーが反転される"
+        );
+        assert!(app.active_tab().history.can_undo(), "ReplaceAll が積まれる");
+    }
+
+    // -- v8 レビュー修正①(SPEC §40): 保存カーソルと modified の同期 ----------
+
+    /// ペンで 1 ストローク描く小ヘルパー(既存テストの Down/Up パターン)。
+    fn draw_one_stroke(app: &mut DaraskApp, x: f32, y: f32) {
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(x, y),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(x, y),
+                button: PointerButton::Primary,
+            },
+        ]);
+    }
+
+    #[test]
+    fn undo_then_redo_back_to_the_saved_state_clears_the_modified_flag() {
+        let dir = temp_dir_for_app_test("saved_state_sync");
+        let path = dir.join("saved.png");
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+        draw_one_stroke(&mut app, 5.0, 5.0);
+        app.finish_save(path, SaveFormat::Png);
+        assert!(!app.active_tab().doc.modified, "保存直後は未変更");
+
+        app.handle_menu_action(MenuAction::Undo);
+        assert!(app.active_tab().doc.modified, "保存位置から離れたら未保存");
+        app.handle_menu_action(MenuAction::Redo);
+        assert!(
+            !app.active_tab().doc.modified,
+            "redo で保存時と同じ内容に戻ったら未保存表示は消える"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_meta_change_after_saving_keeps_modified_across_history_moves() {
+        let dir = temp_dir_for_app_test("saved_state_meta");
+        let path = dir.join("saved.png");
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+        app.finish_save(path, SaveFormat::Png);
+
+        // 履歴に積まれない実変更(リネーム)。
+        app.commit_rename_action(0, "改名".to_owned());
+        assert!(app.active_tab().doc.modified);
+
+        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Redo);
+        assert!(
+            app.active_tab().doc.modified,
+            "履歴位置は保存時と同じでも、メタ変更があるので未保存のまま"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undoing_everything_on_a_fresh_document_returns_to_unmodified() {
+        // 新規文書は初期状態(白紙)が保存済み基準(SPEC §40-①)。全部
+        // undo したら内容は起動直後と同一なので、未保存表示も消える。
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+        assert!(app.active_tab().doc.modified);
+        app.handle_menu_action(MenuAction::Undo);
+        assert!(!app.active_tab().doc.modified);
+    }
+
+    #[test]
+    fn pushing_below_the_saved_position_keeps_modified_forever() {
+        let dir = temp_dir_for_app_test("saved_state_invalidate");
+        let path = dir.join("saved.png");
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.tool = ToolKind::Pen;
+        draw_one_stroke(&mut app, 2.0, 2.0);
+        draw_one_stroke(&mut app, 5.0, 5.0);
+        app.finish_save(path, SaveFormat::Png);
+
+        app.handle_menu_action(MenuAction::Undo);
+        draw_one_stroke(&mut app, 6.0, 6.0); // 保存位置より手前で新規 push
+        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo);
+        assert!(
+            app.active_tab().doc.modified,
+            "保存済み状態はタイムライン書き換えで到達不能になった"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v8 レビュー修正②(SPEC §13 最終項): 表示/不透明度の commit-first ----
+
+    #[test]
+    fn toggling_layer_visibility_commits_an_open_floating_first() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform();
+        assert!(app.active_tab().floating.is_some());
+
+        app.handle_layers_panel_action(LayersPanelAction::SetVisible(0, false));
+        assert!(
+            app.active_tab().floating.is_none(),
+            "表示切替も先に浮動片を確定する(SPEC §13 最終項)"
+        );
+        assert!(!app.active_tab().doc.layers[0].visible);
+    }
+
+    #[test]
+    fn opacity_change_goes_through_the_action_path_and_sets_meta_dirty() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.handle_layers_panel_action(LayersPanelAction::SetOpacity(128));
+        assert_eq!(app.active_tab().doc.layers[0].opacity, 128);
+        assert!(app.active_tab().doc.modified);
+        assert!(app.active_tab().meta_dirty);
+    }
+
+    // -- v8 §37: 選択範囲を反転(Ctrl+Shift+I) -------------------------------
+
+    #[test]
+    fn invert_selection_replaces_a_plain_selection_with_its_complement() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.invert_selection();
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("the complement must remain selected");
+        assert!(!selection.mask.contains(3, 3), "旧選択内は非選択になる");
+        assert!(selection.mask.contains(0, 0));
+        assert!(selection.mask.contains(9, 9));
+        assert!(
+            !app.active_tab().history.can_undo(),
+            "選択の反転は履歴に積まない(SPEC §37)"
+        );
+        assert!(!app.active_tab().doc.modified, "ドキュメントは非破壊");
+    }
+
+    #[test]
+    fn invert_selection_of_the_full_canvas_clears_the_selection() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.select_all();
+        assert!(app.active_tab().selection.is_some());
+        app.invert_selection();
+        assert!(
+            app.active_tab().selection.is_none(),
+            "全選択の反転は選択解除と同じ(SPEC §37)"
+        );
+    }
+
+    #[test]
+    fn invert_selection_without_a_selection_is_a_no_op() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.invert_selection();
+        assert!(app.active_tab().selection.is_none());
+        assert!(!app.active_tab().history.can_undo());
+    }
+
+    #[test]
+    fn invert_selection_with_a_floating_commits_it_and_inverts_its_footprint() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        // Ctrl+T 相当で浮動化してから反転する(SPEC §37: 「浮動片がある場合は
+        // 先に確定してから、その足跡を反転対象にする」)。
+        app.free_transform();
+        assert!(app.active_tab().floating.is_some());
+
+        app.invert_selection();
+
+        assert!(
+            app.active_tab().floating.is_none(),
+            "浮動片は commit-first 規則で確定される"
+        );
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("the complement of the floating footprint must be selected");
+        assert!(!selection.mask.contains(3, 3), "確定位置の内側は非選択");
+        assert!(selection.mask.contains(0, 0));
+        assert!(selection.mask.contains(9, 9));
+    }
+
+    // -- v8 §38: 結合部分をコピー(Ctrl+Shift+C) -----------------------------
+
+    #[test]
+    fn merged_selected_pixels_reads_the_composite_not_the_active_layer() {
+        let mut doc = Document::new(4, 4, Background::Transparent);
+        doc.set_pixel(1, 1, [255, 0, 0, 255]); // 背景レイヤーに赤
+        assert!(doc.add_layer("上".to_owned()));
+        doc.set_pixel(1, 1, [0, 0, 255, 255]); // 上のレイヤーに青
+        doc.active = 0; // アクティブは背景(赤)のまま
+        doc.recomposite_full();
+        let mut app = new_for_test(doc);
+        app.select_all();
+
+        let (w, h, merged) = app
+            .merged_selected_pixels()
+            .expect("a selection must yield merged pixels");
+        assert_eq!((w, h), (4, 4));
+        // (1,1) = index 5、byte offset 20。
+        let idx = 5 * 4;
+        assert_eq!(&merged[idx..idx + 4], &[0, 0, 255, 255], "合成 = 上の青");
+
+        let (_, _, active) = app.selected_pixels().expect("plain copy still works");
+        assert_eq!(
+            &active[idx..idx + 4],
+            &[255, 0, 0, 255],
+            "通常コピーはアクティブレイヤーの赤のまま"
+        );
+    }
+
+    #[test]
+    fn merged_selected_pixels_with_a_floating_overlays_it_without_committing() {
+        let mut doc = Document::new(4, 4, Background::White);
+        doc.recomposite_full();
+        let mut app = new_for_test(doc);
+        app.active_tab_mut().floating = Some(select::Floating::new_rect(
+            [255u8, 0, 0, 255].repeat(4),
+            2,
+            2,
+            pos2(1.0, 1.0),
+            None,
+            7,
+        ));
+
+        let (w, h, merged) = app
+            .merged_selected_pixels()
+            .expect("a floating must yield merged pixels");
+        assert_eq!((w, h), (2, 2), "対象は浮動片の足跡");
+        assert_eq!(&merged[0..4], &[255, 0, 0, 255], "浮動片が白の上に見える");
+
+        // SPEC §38: 非破壊 — 浮動片は確定されず、ドキュメントも履歴も不変。
+        assert!(app.active_tab().floating.is_some());
+        assert_eq!(
+            app.active_tab().doc.get_pixel(1, 1),
+            Some([255, 255, 255, 255]),
+            "ドキュメント自体は白のまま"
+        );
+        assert!(!app.active_tab().history.can_undo());
+        assert!(!app.active_tab().doc.modified);
+    }
+
+    #[test]
+    fn merged_selected_pixels_without_a_selection_is_none() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        assert!(app.merged_selected_pixels().is_none());
     }
 
     // -- v2 レビューで発見・修正したバグ: Ctrl+A→Delete/Ctrl+X が開いた

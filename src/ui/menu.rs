@@ -60,10 +60,20 @@ pub enum MenuAction {
     Redo,
     Cut,
     Copy,
+    /// v8 §38: 「結合部分をコピー」(Ctrl+Shift+C)。通常のコピー(アクティブ
+    /// レイヤーのみ)と違い可視レイヤーの合成結果をコピーする
+    /// (`app.rs::copy_merged_selection_to_clipboard`)。
+    CopyMerged,
     Paste,
+    /// v9 §43: 「ファイルから貼り付け」(MS ペイントの「貼り付け元」相当。
+    /// 画像を選び、クリップボード貼り付けと同じ規則で現在のタブへ)。
+    PasteFromFile,
     Delete,
     SelectAll,
     Deselect,
+    /// v8 §37: 「選択範囲を反転」(Ctrl+Shift+I)。選択マスクの補集合を
+    /// 新しい選択にする(`app.rs::invert_selection`)。
+    SelectInverse,
     /// v6 §33(ARCHITECTURE.md §18.1): 編集メニューに新規追加された
     /// 「自由変形」(Ctrl+T と同じ、`app.rs::free_transform` を呼ぶだけ。
     /// v3 §18 で実装済みの機能に、メニューからのアクセス経路を追加する)。
@@ -121,10 +131,13 @@ impl MenuAction {
             Self::Redo => "やり直し",
             Self::Cut => "切り取り",
             Self::Copy => "コピー",
+            Self::CopyMerged => "結合コピー",
             Self::Paste => "貼り付け",
+            Self::PasteFromFile => "画像貼付",
             Self::Delete => "削除",
             Self::SelectAll => "全選択",
             Self::Deselect => "選択解除",
+            Self::SelectInverse => "選択反転",
             Self::FreeTransform => "自由変形",
             Self::ImageResize => "画像サイズ",
             Self::CanvasResize => "キャンバス",
@@ -443,12 +456,28 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             icons::paint_copy_icon,
             MenuAction::Copy,
         ),
+        // v8 §38: 「コピー」の直後に「結合部分をコピー」を追加(SPEC §33 の
+        // 編集グループへの v8 追記)。有効条件はコピーと同じ。
+        mi_shortcut(
+            state.has_selection,
+            "結合部分をコピー",
+            Action::CopyMerged,
+            icons::paint_copy_merged_icon,
+            MenuAction::CopyMerged,
+        ),
         mi_shortcut(
             true,
             "貼り付け",
             Action::Paste,
             icons::paint_paste_icon,
             MenuAction::Paste,
+        ),
+        // v9 §43: 「貼り付け」の直後に「ファイルから貼り付け」を追加。
+        mi(
+            true,
+            "ファイルから貼り付け…",
+            icons::paint_paste_file_icon,
+            MenuAction::PasteFromFile,
         ),
         mi_shortcut(
             state.has_selection,
@@ -470,6 +499,15 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             Action::Deselect,
             icons::paint_deselect_icon,
             MenuAction::Deselect,
+        ),
+        // v8 §37: 「選択解除」の直後に「選択範囲を反転」を追加(SPEC §33 の
+        // 編集グループへの v8 追記)。有効条件は他の選択依存項目と同じ。
+        mi_shortcut(
+            state.has_selection,
+            "選択範囲を反転",
+            Action::SelectInverse,
+            icons::paint_select_inverse_icon,
+            MenuAction::SelectInverse,
         ),
         // v6 §33: 編集メニューに新規追加(`MenuAction::FreeTransform`
         // ドキュメントコメント参照)。
@@ -887,16 +925,33 @@ mod tests {
     }
 
     #[test]
-    fn compact_minimum_width_layout_has_no_orphan_separator_and_at_most_four_rows() {
+    fn compact_minimum_width_layout_has_no_orphan_separator_and_at_most_five_rows() {
+        // v9 §43 で編集グループが 45 項目になり、最小幅 640px では 5 行に
+        // なった(ARCHITECTURE.md §18.1 の「4 行以内」は目安であり、本質は
+        // §18.6-6 の「最小幅でも操作不能にならない」こと。通常幅(既定
+        // 1280px)では従来どおり 2 行以内に収まる — 下のテスト参照)。
         let recent_files = std::collections::VecDeque::new();
         let state = all_enabled_state(&recent_files);
         let slots = build_slots(&state);
         let rows = pack_rows(&slots, 640.0 - PANEL_MARGIN_H * 2.0, 8.0);
-        assert!(rows.len() <= 4);
+        assert!(rows.len() <= 5);
         for row in rows {
             assert!(!matches!(slots[row[0]], Slot::Sep));
             assert!(!matches!(slots[*row.last().unwrap()], Slot::Sep));
         }
+    }
+
+    #[test]
+    fn default_window_width_layout_stays_within_two_rows() {
+        let recent_files = std::collections::VecDeque::new();
+        let state = all_enabled_state(&recent_files);
+        let slots = build_slots(&state);
+        let rows = pack_rows(&slots, 1280.0 - PANEL_MARGIN_H * 2.0, 8.0);
+        assert!(
+            rows.len() <= 2,
+            "既定幅では 2 行以内(実際は {} 行)",
+            rows.len()
+        );
     }
 
     #[test]
@@ -916,8 +971,11 @@ mod tests {
     }
 
     /// SPEC §33 の全項目(ファイル7・編集9・画像12・レイヤー7・表示5・その他2
-    /// の合計42)と区切り5、合わせて47スロットであることの静的テスト
-    /// (ARCHITECTURE.md §18.6-3 と同種の「項目の過不足に気づく」ための数合わせ)。
+    /// の合計42)に v8 §37〜§38 の編集グループ 2 項目(結合部分をコピー・
+    /// 選択範囲を反転)と v9 §43 の 1 項目(ファイルから貼り付け)を足した
+    /// 45、区切り5、合わせて50スロットであることの静的テスト
+    /// (ARCHITECTURE.md §18.6-3 と同種の「項目の過不足に気づく」ための
+    /// 数合わせ)。
     #[test]
     fn build_slots_has_the_expected_total_count() {
         let recent_files = std::collections::VecDeque::new();
@@ -938,9 +996,9 @@ mod tests {
         let slots = build_slots(&state);
         let item_count = slots.iter().filter(|s| !matches!(s, Slot::Sep)).count();
         let sep_count = slots.iter().filter(|s| matches!(s, Slot::Sep)).count();
-        assert_eq!(item_count, 42);
+        assert_eq!(item_count, 45);
         assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 47);
+        assert_eq!(slots.len(), 50);
     }
 
     /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を

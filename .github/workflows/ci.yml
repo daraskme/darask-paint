@@ -31,6 +31,16 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      # v8 レビュー修正: SPEC §0 の「単一 exe 15MB 以下」を CI で退行検知する
+      # (起動時間ベンチはヘッドレスランナーで実行不能なため bench-smoke の
+      # ままだが、サイズは常時検査できる)。
+      - name: exe サイズ検査(15MB 以下)
+        shell: pwsh
+        run: |
+          $size = (Get-Item target/release/darask-paint.exe).Length
+          "darask-paint.exe: $size bytes ($([math]::Round($size / 1MB, 2)) MB)"
+          if ($size -gt 15MB) { throw "exe が 15MB 上限を超えています: $size bytes" }
+
       - name: cargo test --release
         run: cargo test --release
 

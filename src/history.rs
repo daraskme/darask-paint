@@ -354,6 +354,16 @@ pub struct History {
     /// 履歴パネルの表示件数(互換設定名、1–500、既定50)。
     max_steps: usize,
     stroke: Option<StrokeRecorder>,
+    /// v8 レビュー修正(SPEC §40-①): 「保存済み状態」に対応する
+    /// `undo_stack` の長さ。`Some(L)` のとき、undo/redo で位置 `L` へ戻れば
+    /// 文書内容は保存時と一致する(`is_at_saved_state`)。初期状態
+    /// (`new()`)・読込直後は「その時点=ディスク上の状態(新規なら白紙)」
+    /// を基準に `Some(現在長)`。位置 `L` より**手前**で新しい op を push
+    /// すると、その時点で位置 `L` 以降のタイムラインが書き換わる(redo が
+    /// クリアされる)ため `None`(以後どの位置でも保存済みと一致しない)へ
+    /// 無効化する。位置 `L` 以上での push は状態 `0..=L` を変えないので
+    /// 無効化しない。
+    saved_len: Option<usize>,
 }
 
 impl Default for History {
@@ -370,7 +380,31 @@ impl History {
             bytes_used: 0,
             max_steps: DEFAULT_MAX_STEPS,
             stroke: None,
+            saved_len: Some(0),
         }
+    }
+
+    /// v8 レビュー修正(SPEC §40-①): 保存に成功した時点の履歴位置を
+    /// 「保存済み状態」として記録する(`finish_save` から呼ばれる)。
+    pub fn mark_saved(&mut self) {
+        self.saved_len = Some(self.undo_stack.len());
+    }
+
+    /// 「保存済み状態」の記録を破棄する(以後、履歴移動だけでは未保存
+    /// 表示が消えなくなる)。別名保存でパスの紐付けを失ったタブ
+    /// (`app.rs::detach_other_tabs_with_path`)のように、ディスク上の
+    /// ファイルがもはやこの履歴のどの位置とも一致しない場合に呼ぶ。
+    pub fn invalidate_saved(&mut self) {
+        self.saved_len = None;
+    }
+
+    /// 現在の履歴位置が「保存済み状態」と一致するか(SPEC §40-①:
+    /// 保存→undo→redo で保存時と同じ内容に戻ったら未保存表示を消す)。
+    /// 履歴外のメタ変更(レイヤー名・表示・不透明度)は関知しないため、
+    /// 呼び出し側(`app.rs::refresh_modified_after_history_move`)が
+    /// `Tab::meta_dirty` と合わせて判定する。
+    pub fn is_at_saved_state(&self) -> bool {
+        self.saved_len == Some(self.undo_stack.len())
     }
 
     /// ストローク(1 undo 単位)の記録を開始する。`layer` はこのストロークが
@@ -524,6 +558,15 @@ impl History {
     /// (ARCHITECTURE.md §18.3 の対応表参照。すべての呼び出し元がラベルを
     /// 渡すようになった、機械的なシグネチャ変更)。
     pub fn push(&mut self, op: HistoryOp, label: impl Into<String>) {
+        // v8 レビュー修正(SPEC §40-①): 保存位置より手前での push は redo 側の
+        // タイムライン(保存済み状態を含む)を破棄するため、保存マーカーを
+        // 無効化する(`saved_len` のドキュメントコメント参照)。
+        if self
+            .saved_len
+            .is_some_and(|len| self.undo_stack.len() < len)
+        {
+            self.saved_len = None;
+        }
         for removed in self.redo_stack.drain(..) {
             self.bytes_used = self.bytes_used.saturating_sub(removed.op.byte_size());
         }
@@ -577,12 +620,54 @@ impl History {
 
     /// 直近の op を取り消して `doc` に適用する。何も無ければ `false`。
     pub fn undo(&mut self, doc: &mut Document) -> bool {
-        let Some(entry) = self.undo_stack.pop() else {
+        let Some(mut entry) = self.undo_stack.pop() else {
             return false;
         };
+        self.refresh_op_for_redo(doc, &mut entry.op);
         apply_before(doc, &entry.op);
         self.redo_stack.push(entry);
         true
+    }
+
+    /// v8 レビュー修正: レイヤーの名前・表示・不透明度は履歴に積まない
+    /// (SPEC §13)ため、構造 op(追加/複製)を undo→redo すると op 生成時の
+    /// 古いスナップショットが復活し、その後にユーザーが変更したメタデータが
+    /// 消えていた。undo でレイヤーを取り除く**直前**に、op が redo 用に保持
+    /// する内容を現在のレイヤーで刷新することで、redo が「消した直前の姿」を
+    /// そのまま復元するようにする(`.dpaint` へ保存される redo 側 op も刷新後の
+    /// 値になる、SPEC §36 の全履歴保存とも整合)。
+    ///
+    /// - `AddLayer`: `name` だけを刷新する(表示・不透明度のフィールドを
+    ///   持たないため、追加後に変更した表示/不透明度は redo で既定値に戻る
+    ///   — 既知の残課題。フィールド追加は `.dpaint` v1 の符号化変更を伴う
+    ///   ため見送り、`project.rs` の互換性を優先した)。
+    /// - `DuplicateLayer`: 保持レイヤーを丸ごと刷新する(画素は「複製 op の
+    ///   undo 時点 = 後続 Patch がすべて undo 済み」の不変条件により複製時と
+    ///   一致するので、メタデータ刷新と同時に写しても状態は変わらない)。
+    /// - `MergeDown`: `lower_before` は「undo が復元すべき結合前の下レイヤー」
+    ///   そのものなので刷新できない(redo 用と undo 用を兼ねる)。結合後の
+    ///   メタデータ変更は redo で既定値に戻る — `AddLayer` と同じ残課題。
+    fn refresh_op_for_redo(&mut self, doc: &Document, op: &mut HistoryOp) {
+        match op {
+            HistoryOp::AddLayer { index, name, .. } => {
+                if let Some(layer) = doc.layers.get(*index) {
+                    self.bytes_used = self
+                        .bytes_used
+                        .saturating_sub(name.len())
+                        .saturating_add(layer.name.len());
+                    name.clone_from(&layer.name);
+                }
+            }
+            HistoryOp::DuplicateLayer { index, layer, .. } => {
+                if let Some(current) = doc.layers.get(*index) {
+                    // `byte_size` は `layer.pixels.len()` のみを数える。複製 op と
+                    // その undo の間に寸法が変わる操作(`ReplaceAll`)は先に undo
+                    // されるため長さは一致し、会計の補正は不要。
+                    layer.clone_from(current);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// 直近に取り消した op をやり直す。何も無ければ `false`。
@@ -644,12 +729,16 @@ impl History {
             .fold(0usize, |sum, entry| {
                 sum.saturating_add(entry.op.byte_size())
             });
+        let saved_len = Some(undo_stack.len());
         Self {
             undo_stack,
             redo_stack,
             bytes_used,
             max_steps: display_step_limit.max(1),
             stroke: None,
+            // `.dpaint` の読込直後=ディスク上の状態が「保存済み」基準
+            // (SPEC §40-①)。
+            saved_len,
         }
     }
 }
@@ -834,6 +923,185 @@ mod tests {
                 after,
             }],
         }
+    }
+
+    // -- v8 レビュー修正①(SPEC §40): 保存済み状態マーカー --------------------
+
+    #[test]
+    fn saved_state_marker_tracks_the_history_position() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        assert!(history.is_at_saved_state(), "初期状態が基準");
+
+        history.push(
+            single_region_patch(
+                0,
+                IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 1,
+                    y1: 1,
+                },
+                vec![0; 4],
+                vec![9; 4],
+            ),
+            "テスト",
+        );
+        assert!(!history.is_at_saved_state());
+
+        history.mark_saved();
+        assert!(history.is_at_saved_state(), "保存位置=現在位置");
+        assert!(history.undo(&mut doc));
+        assert!(!history.is_at_saved_state(), "保存位置より手前");
+        assert!(history.redo(&mut doc));
+        assert!(history.is_at_saved_state(), "redo で保存位置へ戻った");
+    }
+
+    #[test]
+    fn pushing_below_the_saved_position_invalidates_the_marker() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        let patch = |v: u8| {
+            single_region_patch(
+                0,
+                IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 1,
+                    y1: 1,
+                },
+                vec![0; 4],
+                vec![v; 4],
+            )
+        };
+        history.push(patch(1), "1");
+        history.push(patch(2), "2");
+        history.mark_saved(); // 保存位置 = 2
+        assert!(history.undo(&mut doc)); // 位置 1(保存位置より手前)
+        history.push(patch(3), "3"); // タイムライン書き換え → マーカー無効化
+        assert!(
+            !history.is_at_saved_state(),
+            "位置は 2 に戻ったが内容は保存時と異なる"
+        );
+        // 以後どの位置でも保存済みにはならない。
+        assert!(history.undo(&mut doc));
+        assert!(!history.is_at_saved_state());
+        assert!(history.undo(&mut doc));
+        assert!(!history.is_at_saved_state());
+    }
+
+    #[test]
+    fn pushing_at_or_beyond_the_saved_position_keeps_the_marker() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        let patch = |v: u8| {
+            single_region_patch(
+                0,
+                IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 1,
+                    y1: 1,
+                },
+                vec![0; 4],
+                vec![v; 4],
+            )
+        };
+        history.push(patch(1), "1");
+        history.mark_saved(); // 保存位置 = 1
+        history.push(patch(2), "2"); // 保存位置より先へ伸ばすだけ
+        assert!(!history.is_at_saved_state());
+        assert!(history.undo(&mut doc)); // 位置 1 へ戻る
+        assert!(
+            history.is_at_saved_state(),
+            "保存位置以深の push は状態 0..=保存位置 を変えない"
+        );
+    }
+
+    // -- v8 レビュー修正: undo 時の redo 用メタデータ刷新
+    // (`History::refresh_op_for_redo`) -------------------------------------
+
+    #[test]
+    fn redo_of_add_layer_preserves_a_rename_done_after_the_add() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("レイヤー 1".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "レイヤー 1".to_owned(),
+                before_active: 0,
+            },
+            "レイヤーを追加",
+        );
+        // 追加後のリネームは履歴に積まれない(SPEC §13)。
+        doc.layers[1].name = "スケッチ".to_owned();
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.layers.len(), 1);
+        assert!(history.redo(&mut doc));
+        assert_eq!(
+            doc.layers[1].name, "スケッチ",
+            "undo→redo で追加後のリネームが失われてはならない"
+        );
+    }
+
+    #[test]
+    fn redo_of_duplicate_layer_preserves_meta_edits_done_after_the_duplicate() {
+        let mut doc = Document::new(4, 4, Background::White);
+        doc.set_pixel(1, 1, [1, 2, 3, 255]);
+        let before_active = doc.active_index();
+        assert!(doc.duplicate_active_layer());
+        let index = doc.active_index();
+        let mut history = History::new();
+        history.push(
+            HistoryOp::DuplicateLayer {
+                index,
+                layer: doc.layers[index].clone(),
+                before_active,
+            },
+            "レイヤーを複製",
+        );
+        // 複製後のメタデータ変更は履歴に積まれない(SPEC §13)。
+        doc.layers[index].name = "上書き".to_owned();
+        doc.layers[index].visible = false;
+        doc.layers[index].opacity = 128;
+        let pixels_after_edit = doc.layers[index].pixels.clone();
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.layers.len(), 1);
+        assert!(history.redo(&mut doc));
+        let layer = &doc.layers[index];
+        assert_eq!(layer.name, "上書き");
+        assert!(!layer.visible);
+        assert_eq!(layer.opacity, 128);
+        assert_eq!(
+            layer.pixels, pixels_after_edit,
+            "画素も複製時と一致したまま(不変条件どおり)"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_the_byte_accounting_in_sync_when_the_name_length_changes() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("A".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "A".to_owned(),
+                before_active: 0,
+            },
+            "レイヤーを追加",
+        );
+        // 1 バイト名 → 長い名前に変更してから undo(刷新)。
+        doc.layers[1].name = "とても長いレイヤー名".to_owned();
+        assert!(history.undo(&mut doc));
+        assert_eq!(
+            history.bytes_used,
+            "とても長いレイヤー名".len(),
+            "AddLayer の byte_size は name.len() — 刷新後の長さへ追随する"
+        );
     }
 
     #[test]

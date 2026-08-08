@@ -4,20 +4,24 @@
 //! ダブルクリックで名前変更・新規/複製/削除/上へ/下へ/下と結合ボタン・
 //! アクティブレイヤーの不透明度スライダーを表示する。
 //!
-//! 構造を変える操作(新規/複製/削除/上へ/下へ/下と結合、および
-//! アクティブ化)は 1 undo 単位(新規/複製/削除/上下移動/結合)または
-//! 「先に確定」フックが必要(アクティブ化、ARCHITECTURE.md §14.9-3)なため、
-//! `LayersPanelAction` として返すだけに留め、実際の `Document` 操作は
-//! `app.rs` が行う。表示切替・不透明度・名前変更は履歴に積まない
-//! (SPEC §13 に明記)ので、ここで直接 `Document` を変更してよい。
+//! v8 レビュー修正で全操作を `LayersPanelAction` 経由に統一した: 以前は
+//! 「表示切替・不透明度・名前変更は履歴に積まない(SPEC §13)ので、ここで
+//! 直接 `Document` を変更してよい」としていたが、SPEC §13 最終項の
+//! 「レイヤー操作は浮動片やストローク進行中にはツール切替と同じ扱い
+//! (先に確定してから実行)」は履歴に積まない操作にも及ぶ(ARCHITECTURE.md
+//! §14.9-3)。パネルは常に「何を要求されたか」だけを返し、`app.rs` が
+//! `commit_open_gesture()` を通してから適用する(メニュー・ツールバーと
+//! 同じ流儀に揃った)。
 
 use eframe::egui;
 
 use crate::document::{Document, MAX_LAYERS};
 use crate::keymap::{self, Action};
 
-/// 構造を変える(または「先に確定」が必要な)操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// パネルからの操作要求。構造を変える操作(1 undo 単位)も、履歴に積まない
+/// 操作(表示/不透明度/名前 — SPEC §13)も、すべて `app.rs` が commit-first
+/// ガードを通してから適用する。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayersPanelAction {
     Activate(usize),
     Add,
@@ -26,6 +30,12 @@ pub enum LayersPanelAction {
     MoveUp,
     MoveDown,
     MergeDown,
+    /// 表示切替(SPEC §13: 履歴には積まない)。
+    SetVisible(usize, bool),
+    /// アクティブレイヤーの不透明度(0-255。SPEC §13: 履歴には積まない)。
+    SetOpacity(u8),
+    /// 名前変更の確定(ダブルクリック編集の Enter/フォーカス外し)。
+    CommitRename(usize, String),
 }
 
 /// ダブルクリックで開始した名前編集の状態(`app.rs` が保持する)。
@@ -43,10 +53,12 @@ pub enum LayersPanelAction {
 /// 「編集開始フレームのみ `request_focus()` する」パターンで回避する。
 pub type RenameState = Option<(usize, String, bool)>;
 
-/// レイヤーパネルを描画する。クリックされた構造操作があれば返す。
+/// レイヤーパネルを描画する。要求された操作があれば返す(`Document` は
+/// 一切変更しない — 読み取り専用。適用は `app.rs` の
+/// `handle_layers_panel_action`)。
 pub fn show(
     ui: &mut egui::Ui,
-    doc: &mut Document,
+    doc: &Document,
     rename: &mut RenameState,
 ) -> Option<LayersPanelAction> {
     let mut action = None;
@@ -119,15 +131,20 @@ pub fn show(
     });
 
     ui.add_space(6.0);
-    show_opacity_slider(ui, doc, active);
+    show_opacity_slider(ui, doc, active, &mut action);
 
     action
 }
 
 /// アクティブレイヤーの不透明度スライダー(SPEC §13)。ARCHITECTURE.md
-/// §14.9-8: 値が実際に変わったフレームだけ `mark_all_dirty` する
+/// §14.9-8: 値が実際に変わったフレームだけ `SetOpacity` を要求する
 /// (ドラッグ中に全面 recomposite が毎フレーム 1 回に抑えられる)。
-fn show_opacity_slider(ui: &mut egui::Ui, doc: &mut Document, active: usize) {
+fn show_opacity_slider(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    active: usize,
+    action: &mut Option<LayersPanelAction>,
+) {
     ui.label("不透明度:");
     let Some(layer) = doc.layers.get(active) else {
         return;
@@ -138,19 +155,15 @@ fn show_opacity_slider(ui: &mut egui::Ui, doc: &mut Document, active: usize) {
         .changed()
     {
         let new_opacity = ((opacity_pct.clamp(0, 100) as f32) / 100.0 * 255.0).round() as u8;
-        if let Some(layer) = doc.layers.get_mut(active) {
-            if layer.opacity != new_opacity {
-                layer.opacity = new_opacity;
-                doc.mark_all_dirty();
-                doc.modified = true;
-            }
+        if layer.opacity != new_opacity {
+            *action = Some(LayersPanelAction::SetOpacity(new_opacity));
         }
     }
 }
 
 fn show_layer_row(
     ui: &mut egui::Ui,
-    doc: &mut Document,
+    doc: &Document,
     idx: usize,
     active: usize,
     rename: &mut RenameState,
@@ -164,11 +177,9 @@ fn show_layer_row(
     ui.horizontal(|ui| {
         let mut visible = layer_visible;
         if ui.checkbox(&mut visible, "").changed() {
-            if let Some(layer) = doc.layers.get_mut(idx) {
-                layer.visible = visible;
-            }
-            doc.mark_all_dirty();
-            doc.modified = true;
+            // v8 レビュー修正: 直接変更せず要求として返す(commit-first
+            // ガードを app.rs で通すため、モジュールコメント参照)。
+            *action = Some(LayersPanelAction::SetVisible(idx, visible));
         }
 
         let is_editing = matches!(rename, Some((i, _, _)) if *i == idx);
@@ -192,18 +203,9 @@ fn show_layer_row(
                 if let Some((_, text, _)) = rename.take() {
                     let trimmed = text.trim().to_owned();
                     if !trimmed.is_empty() {
-                        if let Some(layer) = doc.layers.get_mut(idx) {
-                            layer.name = trimmed;
-                            // バグ修正: 上の表示切替・下の不透明度ハンドラは
-                            // どちらも変更時に `doc.modified` を立てるが、
-                            // リネームだけこれを欠いていた。立てないと
-                            // `doc_is_pristine()`(`path.is_none() &&
-                            // !modified` のみ判定)がリネーム済みの文書を
-                            // 「白紙」のまま誤判定し、Ctrl+V の白紙置換
-                            // パス(`replace_document_with_pasted_image`)に
-                            // 載ってドキュメントごと差し替わってしまう。
-                            doc.modified = true;
-                        }
+                        // 適用は app.rs(`modified` を立てる理由も含めて
+                        // `commit_rename_action` のコメント参照)。
+                        *action = Some(LayersPanelAction::CommitRename(idx, trimmed));
                     }
                 }
             }
@@ -243,7 +245,7 @@ mod tests {
     /// (`app.rs::ctx_with_key_event` と同じ手法)。
     #[test]
     fn layer_rename_textedit_loses_focus_on_enter_and_commits_name() {
-        let mut doc = Document::new(4, 4, Background::White);
+        let doc = Document::new(4, 4, Background::White);
         let mut rename: RenameState = Some((0, "old".to_owned(), true));
 
         let ctx = egui::Context::default();
@@ -252,7 +254,7 @@ mod tests {
         // 呼ばれ TextEdit がフォーカスを得る。
         ctx.begin_pass(egui::RawInput::default());
         egui::Area::new(egui::Id::new("test_area")).show(&ctx, |ui| {
-            show(ui, &mut doc, &mut rename);
+            show(ui, &doc, &mut rename);
         });
         let _ = ctx.end_pass();
         assert!(
@@ -267,6 +269,7 @@ mod tests {
         if let Some((_, text, _)) = rename.as_mut() {
             *text = "new name".to_owned();
         }
+        let mut committed = None;
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Enter,
@@ -278,7 +281,7 @@ mod tests {
             ..Default::default()
         });
         egui::Area::new(egui::Id::new("test_area")).show(&ctx, |ui| {
-            show(ui, &mut doc, &mut rename);
+            committed = show(ui, &doc, &mut rename);
         });
         let _ = ctx.end_pass();
 
@@ -288,9 +291,13 @@ mod tests {
              following request_focus() would reclaim it every frame and lost_focus() would \
              never fire, leaving the rename box (and keyboard shortcuts) stuck open forever"
         );
+        // v8 レビュー修正②: パネルは `Document` を直接変更せず、確定内容を
+        // `CommitRename` として返す(適用は app.rs の commit-first 経由)。
         assert_eq!(
-            doc.layers[0].name, "new name",
-            "lost_focus() firing must commit the edited name"
+            committed,
+            Some(LayersPanelAction::CommitRename(0, "new name".to_owned())),
+            "lost_focus() firing must request the rename commit"
         );
+        assert_eq!(doc.layers[0].name, "背景", "パネル自身は文書を変更しない");
     }
 }

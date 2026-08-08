@@ -148,11 +148,19 @@ pub enum Action {
     Delete,
     SelectAll,
     Deselect,
+    /// v8 §37: `Ctrl+Shift+I`: 選択範囲を反転(PS 準拠)。
+    SelectInverse,
+    /// v8 §38: `Ctrl+Shift+C`: 結合部分をコピー(PS 準拠。通常のコピーは
+    /// アクティブレイヤーのみ、こちらは可視レイヤーの合成結果)。
+    CopyMerged,
     FreeTransform,
     /// Enter: 浮動片の確定(選択/移動ツール使用中のみ有効、SPEC §6/§18)。
     CommitFloating,
     /// Esc: 浮動片のキャンセル(選択/移動ツール使用中のみ有効、SPEC §18)。
     CancelFloating,
+    /// v9 §41: 矢印キーで浮動片(無ければ選択枠)を `(dx, dy)` px 移動する。
+    /// 素の矢印=±1px、Shift+矢印=±10px(PS 準拠のナッジ)。
+    Nudge(i8, i8),
     /// v4 §24 §27: `Ctrl+U`: 色相・彩度・明度…モーダルを開く。
     HueSaturation,
     /// v4 §24 §27: `Ctrl+I`: 階調の反転(即時)。
@@ -276,13 +284,40 @@ pub const KEYMAP: &[Entry] = &[
     e(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Z, Action::Redo),
     e(Modifiers::CTRL, Key::X, Action::Cut),
     e(Modifiers::CTRL, Key::C, Action::Copy),
+    // v8 §38/§39: Ctrl+Shift+C は素の Ctrl+C より先に消費する必要がある
+    // (Ctrl+Shift+Z と Ctrl+Z の関係と同じ。`poll` の specificity 降順
+    // ソートが保証する)。
+    e(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::C,
+        Action::CopyMerged,
+    ),
     e(Modifiers::CTRL, Key::V, Action::Paste),
     e(Modifiers::NONE, Key::Delete, Action::Delete),
     e(Modifiers::CTRL, Key::A, Action::SelectAll),
     e(Modifiers::CTRL, Key::D, Action::Deselect),
+    // v8 §37/§39: Ctrl+Shift+I(素の Ctrl+I = 階調の反転より先に消費、上と
+    // 同じ specificity 規則)。
+    e(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::I,
+        Action::SelectInverse,
+    ),
     e(Modifiers::CTRL, Key::T, Action::FreeTransform),
     e(Modifiers::NONE, Key::Enter, Action::CommitFloating),
     e(Modifiers::NONE, Key::Escape, Action::CancelFloating),
+    // v9 §41: 矢印キーのナッジ(浮動片/選択枠の移動)。Shift 付きが specificity
+    // 降順で先に消費される(既存規則)。矢印キーは他のどの操作にも
+    // 束縛されていない(egui のフォーカス移動はウィジェットにフォーカスが
+    // ある場合のみで、そのときは `wants_keyboard_input` ガードで無効)。
+    e(Modifiers::NONE, Key::ArrowLeft, Action::Nudge(-1, 0)),
+    e(Modifiers::NONE, Key::ArrowRight, Action::Nudge(1, 0)),
+    e(Modifiers::NONE, Key::ArrowUp, Action::Nudge(0, -1)),
+    e(Modifiers::NONE, Key::ArrowDown, Action::Nudge(0, 1)),
+    e(Modifiers::SHIFT, Key::ArrowLeft, Action::Nudge(-10, 0)),
+    e(Modifiers::SHIFT, Key::ArrowRight, Action::Nudge(10, 0)),
+    e(Modifiers::SHIFT, Key::ArrowUp, Action::Nudge(0, -10)),
+    e(Modifiers::SHIFT, Key::ArrowDown, Action::Nudge(0, 10)),
     // v4 §24 §27: 色調補正。Ctrl+Shift+U は Ctrl+U より先に消費する必要が
     // ある(ARCHITECTURE.md §15.4 ②、Ctrl+Shift+Z が Ctrl+Z より先なのと同じ
     // 理由)。`poll` が修飾キー数の降順で並べ替えるので、登場順はどちらでもよい。
@@ -778,6 +813,36 @@ mod tests {
         );
     }
 
+    // -- v8 §37〜§39: 選択範囲を反転(Ctrl+Shift+I)・結合部分をコピー
+    // (Ctrl+Shift+C) --------------------------------------------------------
+
+    #[test]
+    fn select_inverse_and_copy_merged_keys_match_spec_39() {
+        assert_eq!(
+            binding_for(Action::SelectInverse),
+            Some(Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::I))
+        );
+        assert_eq!(
+            binding_for(Action::CopyMerged),
+            Some(Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::C))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_i_and_c_take_priority_over_their_bare_ctrl_bindings() {
+        // ARCHITECTURE.md §15.4 ②(Ctrl+Shift+Z が Ctrl+Z より先なのと同じ
+        // 理由): Ctrl+Shift+I は Ctrl+I(階調の反転)、Ctrl+Shift+C は
+        // Ctrl+C(コピー)より specificity が高く、`poll` が先に消費する。
+        let ctrl_i = Binding::new(Modifiers::CTRL, Key::I).specificity();
+        let ctrl_shift_i =
+            Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::I).specificity();
+        assert!(ctrl_shift_i > ctrl_i);
+        let ctrl_c = Binding::new(Modifiers::CTRL, Key::C).specificity();
+        let ctrl_shift_c =
+            Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::C).specificity();
+        assert!(ctrl_shift_c > ctrl_c);
+    }
+
     #[test]
     fn ctrl_shift_tab_takes_priority_over_ctrl_tab() {
         // ARCHITECTURE.md §15.4 ②と同じ理由(Ctrl+Shift+Z が Ctrl+Z より先の
@@ -810,7 +875,41 @@ mod tests {
         // Ctrl+Shift+Tab(PrevTab) = 59 + 2 = 61。
         // v5 §30/§32(V5-M3)でさらに 1 件追加: Ctrl+W(CloseTab) = 61 + 1 = 62。
         // v6 §34(V6-M2)でさらに 1 件追加: Ctrl+K(OpenPreferences) = 62 + 1 = 63。
-        assert_eq!(KEYMAP.len(), 63);
+        // v8 §37〜§39 でさらに 2 件追加: Ctrl+Shift+I(SelectInverse) +
+        // Ctrl+Shift+C(CopyMerged) = 63 + 2 = 65。
+        // v9 §41 でさらに 8 件追加: 矢印×4(Nudge ±1) + Shift+矢印×4
+        // (Nudge ±10) = 65 + 8 = 73。
+        assert_eq!(KEYMAP.len(), 73);
+    }
+
+    // -- v9 §41: 矢印キーのナッジ ---------------------------------------------
+
+    #[test]
+    fn arrow_keys_nudge_by_one_and_shift_by_ten() {
+        assert_eq!(
+            binding_for(Action::Nudge(-1, 0)),
+            Some(Binding::new(Modifiers::NONE, Key::ArrowLeft))
+        );
+        assert_eq!(
+            binding_for(Action::Nudge(1, 0)),
+            Some(Binding::new(Modifiers::NONE, Key::ArrowRight))
+        );
+        assert_eq!(
+            binding_for(Action::Nudge(0, -1)),
+            Some(Binding::new(Modifiers::NONE, Key::ArrowUp))
+        );
+        assert_eq!(
+            binding_for(Action::Nudge(0, 1)),
+            Some(Binding::new(Modifiers::NONE, Key::ArrowDown))
+        );
+        assert_eq!(
+            binding_for(Action::Nudge(0, 10)),
+            Some(Binding::new(Modifiers::SHIFT, Key::ArrowDown))
+        );
+        assert_eq!(
+            binding_for(Action::Nudge(-10, 0)),
+            Some(Binding::new(Modifiers::SHIFT, Key::ArrowLeft))
+        );
     }
 
     #[test]

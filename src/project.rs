@@ -20,7 +20,9 @@ const ENDIAN_LITTLE: u8 = 1;
 const HEADER_SIZE: u8 = 16;
 const TILE_SIZE: u32 = 256;
 const CHECKPOINT_INTERVAL: u32 = 16;
-const MAX_DIMENSION: u32 = 8192;
+// v8 レビュー修正: 寸法上限は `document.rs` に一本化した(「開く」/
+// クリップボードの検査(io.rs)と同じ値を共有する)。
+const MAX_DIMENSION: u32 = crate::document::MAX_DIMENSION;
 const MAX_REVISIONS: usize = 1_000_000;
 const MAX_TILES: usize = 4_000_000;
 const MAX_STRING_BYTES: usize = 1024 * 1024;
@@ -555,6 +557,10 @@ fn encode_entry(
     encode_op(out, &entry.op, width, height, tiles)
 }
 
+/// v8 レビュー修正③以降、メモリ組み立ては `encode_project`(テスト専用)しか
+/// 使わないため、その従属関数ごと `#[cfg(test)]`(出荷バイナリに死んだ
+/// コードを残さない)。本体の保存経路は `save` + `write_chunk_to`。
+#[cfg(test)]
 fn checked_projected_file_len(current: usize, payload: usize) -> Result<usize, String> {
     let projected = u64::try_from(current)
         .ok()
@@ -567,6 +573,7 @@ fn checked_projected_file_len(current: usize, payload: usize) -> Result<usize, S
     usize::try_from(projected).map_err(|_| "プロジェクトファイルが大きすぎます".to_owned())
 }
 
+#[cfg(test)]
 fn append_chunk(out: &mut Vec<u8>, tag: [u8; 4], payload: &[u8]) -> Result<(), String> {
     if payload.len() > MAX_CHUNK_BYTES {
         return Err("プロジェクトchunkが大きすぎます".to_owned());
@@ -656,7 +663,20 @@ fn loaded_project_memory_bytes(
     Ok(budget.bytes)
 }
 
-fn encode_project(doc: &Document, history: &History) -> Result<Vec<u8>, String> {
+/// v8 レビュー修正③(ストリーム書き出し): 4 つの chunk ペイロードと予測
+/// 全長。`save` はこれを一時ファイルへ直接流し込み、**最終ファイル全体を
+/// もう 1 本の `Vec` に組み立てない**(従来はペイロード群+完成ファイルで
+/// ピーク時に約 2 倍のメモリを要した)。`encode_project`(テスト・検証用の
+/// メモリ組み立て版)と `save` が同じペイロード生成を共有する。
+struct EncodedPayloads {
+    meta: Vec<u8>,
+    tiles: Vec<u8>,
+    document: Vec<u8>,
+    revisions: Vec<u8>,
+    predicted_len: usize,
+}
+
+fn encode_project_payloads(doc: &Document, history: &History) -> Result<EncodedPayloads, String> {
     let (undo, redo) = history.project_entries();
     let display_step_limit = history.display_step_limit();
     if !(1..=MAX_DISPLAY_STEPS).contains(&display_step_limit) {
@@ -741,21 +761,36 @@ fn encode_project(doc: &Document, history: &History) -> Result<Vec<u8>, String> 
     put_len(&mut meta_payload, display_step_limit, "キャッシュヒント")?;
     put_u32(&mut meta_payload, 0);
 
+    Ok(EncodedPayloads {
+        meta: meta_payload,
+        tiles: tiles_payload,
+        document: document_payload,
+        revisions: revisions_payload,
+        predicted_len: predicted_encoded_len,
+    })
+}
+
+/// テスト・検証用のメモリ組み立て版(`save` は `encode_project_payloads` +
+/// ストリーム書き出しを使う。両者が同一のバイト列を生むことは
+/// `streamed_save_matches_in_memory_encoding` が担保する)。
+#[cfg(test)]
+fn encode_project(doc: &Document, history: &History) -> Result<Vec<u8>, String> {
+    let payloads = encode_project_payloads(doc, history)?;
     let mut out = Vec::new();
-    try_reserve_exact(&mut out, predicted_encoded_len, "プロジェクトファイル")?;
+    try_reserve_exact(&mut out, payloads.predicted_len, "プロジェクトファイル")?;
     out.extend_from_slice(MAGIC);
     put_u16(&mut out, VERSION);
     put_u8(&mut out, ENDIAN_LITTLE);
     put_u8(&mut out, HEADER_SIZE);
     put_u32(&mut out, 0);
-    append_chunk(&mut out, CHUNK_META, &meta_payload)?;
-    append_chunk(&mut out, CHUNK_TILES, &tiles_payload)?;
-    append_chunk(&mut out, CHUNK_DOCUMENT, &document_payload)?;
-    append_chunk(&mut out, CHUNK_REVISIONS, &revisions_payload)?;
+    append_chunk(&mut out, CHUNK_META, &payloads.meta)?;
+    append_chunk(&mut out, CHUNK_TILES, &payloads.tiles)?;
+    append_chunk(&mut out, CHUNK_DOCUMENT, &payloads.document)?;
+    append_chunk(&mut out, CHUNK_REVISIONS, &payloads.revisions)?;
     if out.len() as u64 > MAX_FILE_BYTES {
         return Err("プロジェクトファイルが安全上限を超えています".to_owned());
     }
-    if out.len() != predicted_encoded_len {
+    if out.len() != payloads.predicted_len {
         return Err("プロジェクトの符号化長が一致しません".to_owned());
     }
     Ok(out)
@@ -1029,6 +1064,15 @@ fn decode_op(
             budget.add_vec::<PatchRegion>(region_count)?;
             let mut regions = Vec::new();
             try_reserve_exact(&mut regions, region_count, "パッチ領域")?;
+            // v8 レビュー修正③(SPEC §36 の防御強化): writer(StrokeRecorder)は
+            // 常に「256px タイル格子に整列し、ドキュメント境界でだけ切り
+            // 詰められた」矩形を重複なく書く。CRC が正しくても、格子に
+            // 合わない・重複する領域を持つ外部ファイルは順序依存の
+            // before/after を構成できるため拒否する。重複判定はタイル格子の
+            // ビットセット(8192² でも 1024 bit)で行う。
+            let (grid_columns, grid_rows) = tile_grid(dimensions.0, dimensions.1);
+            let grid_cells = (grid_columns as usize) * (grid_rows as usize);
+            let mut seen_tiles = vec![0u64; grid_cells.div_ceil(64)];
             for _ in 0..region_count {
                 let rect = IRect {
                     x0: reader.i32()?,
@@ -1044,6 +1088,24 @@ fn decode_op(
                 {
                     return Err("パッチ矩形が不正です".to_owned());
                 }
+                let tile = TILE_SIZE as i32;
+                if rect.x0.rem_euclid(tile) != 0
+                    || rect.y0.rem_euclid(tile) != 0
+                    || rect.x1 != (rect.x0 + tile).min(dimensions.0 as i32)
+                    || rect.y1 != (rect.y0 + tile).min(dimensions.1 as i32)
+                {
+                    return Err("パッチ矩形がタイル格子に一致しません".to_owned());
+                }
+                let cell =
+                    (rect.y0 / tile) as usize * grid_columns as usize + (rect.x0 / tile) as usize;
+                let (word, bit) = (cell / 64, cell % 64);
+                let Some(slot) = seen_tiles.get_mut(word) else {
+                    return Err("パッチ矩形がタイル格子に一致しません".to_owned());
+                };
+                if *slot & (1u64 << bit) != 0 {
+                    return Err("パッチ領域が重複しています".to_owned());
+                }
+                *slot |= 1u64 << bit;
                 let expected_len = (rect.width() as usize)
                     .checked_mul(rect.height() as usize)
                     .and_then(|count| count.checked_mul(4))
@@ -1463,6 +1525,7 @@ fn unique_sibling(path: &Path, suffix: &str) -> Result<PathBuf, String> {
     Err("一時ファイル名を確保できませんでした".to_owned())
 }
 
+#[cfg(test)]
 fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let temp = unique_sibling(path, "tmp")?;
     let result = (|| -> Result<(), String> {
@@ -1502,15 +1565,99 @@ fn install_temp(path: &Path, temp: &Path, fail_before_replace: bool) -> Result<(
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = write_temp(path, bytes)?;
+/// v8 レビュー修正③: 原子的保存のストリーミング版。完成バイト列を
+/// メモリへ持たず、一時ファイルへ直接書き込む(`write` クロージャに
+/// `BufWriter<File>` を渡す)。成功時は flush→`sync_all`→単一 rename で
+/// 設置し、失敗時は一時ファイルを削除して既存ファイルを維持する
+/// (`atomic_write` と同じ安全性)。画像書き出し(io.rs — エンコーダを
+/// ここへ直接つなぐことで最大 8192² のエンコードバッファ自体を排除)と
+/// `.dpaint` の `save` が共有する。
+pub(crate) fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<File>) -> Result<(), String>,
+) -> Result<(), String> {
+    let temp = unique_sibling(path, "tmp")?;
+    let result = (|| -> Result<(), String> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| error.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        write(&mut writer)?;
+        let file = writer.into_inner().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     install_temp(path, &temp, false)
 }
 
+/// ストリーミング版の chunk 書き出し(`append_chunk` の `Write` 版)。書いた
+/// バイト数を返す(呼び出し側が予測全長との一致を検査する)。
+fn write_chunk_to(writer: &mut impl Write, tag: [u8; 4], payload: &[u8]) -> Result<usize, String> {
+    if payload.len() > MAX_CHUNK_BYTES {
+        return Err("プロジェクトchunkが大きすぎます".to_owned());
+    }
+    writer.write_all(&tag).map_err(|error| error.to_string())?;
+    let len = u64::try_from(payload.len()).map_err(|_| "chunk長が大きすぎます".to_owned())?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(&crc32(payload).to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(payload)
+        .map_err(|error| error.to_string())?;
+    4usize
+        .checked_add(8)
+        .and_then(|len| len.checked_add(4))
+        .and_then(|len| len.checked_add(payload.len()))
+        .ok_or_else(|| "chunk長が大きすぎます".to_owned())
+}
+
 /// 現在状態と undo/redo 全件を `.dpaint` へ原子的に保存する。
+/// v8 レビュー修正③: 完成ファイルをメモリへ組み立てず、一時ファイルへ
+/// chunk 単位でストリーム書き出しする(`EncodedPayloads` のコメント参照)。
+/// 書き出した合計長は `encode_project`(メモリ版)と同じ予測全長と一致する
+/// ことを検査する(両者のバイト同一性はテストで担保)。
 pub fn save(doc: &Document, history: &History, path: &Path) -> Result<(), String> {
-    let bytes = encode_project(doc, history)?;
-    atomic_write(path, &bytes)
+    let payloads = encode_project_payloads(doc, history)?;
+    if payloads.predicted_len as u64 > MAX_FILE_BYTES {
+        return Err("プロジェクトファイルが安全上限を超えています".to_owned());
+    }
+    atomic_write_with(path, |writer| {
+        let mut total = MAGIC.len();
+        writer.write_all(MAGIC).map_err(|error| error.to_string())?;
+        writer
+            .write_all(&VERSION.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_all(&[ENDIAN_LITTLE, HEADER_SIZE])
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_all(&0u32.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        total += 2 + 2 + 4;
+        for (tag, payload) in [
+            (CHUNK_META, &payloads.meta),
+            (CHUNK_TILES, &payloads.tiles),
+            (CHUNK_DOCUMENT, &payloads.document),
+            (CHUNK_REVISIONS, &payloads.revisions),
+        ] {
+            let written = write_chunk_to(writer, tag, payload)?;
+            total = total
+                .checked_add(written)
+                .ok_or_else(|| "プロジェクトファイルが大きすぎます".to_owned())?;
+        }
+        if total != payloads.predicted_len {
+            return Err("プロジェクトの符号化長が一致しません".to_owned());
+        }
+        Ok(())
+    })
 }
 
 /// `.dpaint` を検証し、現在状態と全 undo/redo を復元する。
@@ -1595,6 +1742,95 @@ mod tests {
         assert_snapshot_eq(&loaded.snapshot(), &before);
         assert!(loaded_history.redo(&mut loaded));
         assert_snapshot_eq(&loaded.snapshot(), &after);
+    }
+
+    // -- v8 レビュー修正③: ストリーム書き出し・Patch 領域検証 ----------------
+
+    #[test]
+    fn streamed_save_matches_in_memory_encoding() {
+        let mut doc = Document::new(300, 300, Background::White);
+        let mut history = History::new();
+        history.begin_stroke(doc.active);
+        history.ensure_tiles_saved(
+            &doc,
+            IRect {
+                x0: 10,
+                y0: 10,
+                x1: 280,
+                y1: 280,
+            },
+        );
+        doc.set_pixel(20, 20, [1, 2, 3, 255]);
+        doc.set_pixel(270, 270, [9, 8, 7, 255]);
+        history.commit_stroke(&mut doc, "ブラシ");
+
+        let dir = temp_dir("streamed_save");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("streamed.dpaint");
+        save(&doc, &history, &path).expect("streamed save");
+        let streamed = std::fs::read(&path).expect("read streamed file");
+        let in_memory = encode_project(&doc, &history).expect("in-memory encode");
+        assert_eq!(streamed, in_memory, "ストリーム版とメモリ版は同一バイト列");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decoding_rejects_a_patch_rect_off_the_tile_grid() {
+        // writer(StrokeRecorder)はタイル格子に整列した矩形しか書かない。
+        // CRC が正しくても格子に合わない外部ファイルは拒否する(SPEC §36)。
+        let doc = Document::new(300, 300, Background::White);
+        let mut history = History::new();
+        history.push(
+            HistoryOp::Patch {
+                layer: 0,
+                regions: vec![PatchRegion {
+                    rect: IRect {
+                        x0: 1,
+                        y0: 0,
+                        x1: 2,
+                        y1: 1,
+                    },
+                    before: vec![0; 4],
+                    after: vec![9; 4],
+                }],
+            },
+            "非整列パッチ",
+        );
+        let encoded = encode_project(&doc, &history).expect("encode");
+        let Err(error) = decode_project(&encoded, None) else {
+            panic!("a misaligned patch rect must be rejected");
+        };
+        assert!(error.contains("タイル格子"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn decoding_rejects_duplicate_patch_regions() {
+        // 同一タイルを 2 回持つ Patch は before/after の適用順で結果が変わる
+        // 曖昧な入力(writer は生成しない)。
+        let doc = Document::new(300, 300, Background::White);
+        let region = || PatchRegion {
+            rect: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 256,
+                y1: 256,
+            },
+            before: vec![0; 256 * 256 * 4],
+            after: vec![9; 256 * 256 * 4],
+        };
+        let mut history = History::new();
+        history.push(
+            HistoryOp::Patch {
+                layer: 0,
+                regions: vec![region(), region()],
+            },
+            "重複パッチ",
+        );
+        let encoded = encode_project(&doc, &history).expect("encode");
+        let Err(error) = decode_project(&encoded, None) else {
+            panic!("duplicate patch regions must be rejected");
+        };
+        assert!(error.contains("重複"), "unexpected error: {error}");
     }
 
     fn rebuild_with_revisions(encoded: &[u8], revisions: &[u8]) -> Vec<u8> {

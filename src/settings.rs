@@ -504,13 +504,33 @@ fn settings_file_path() -> Option<PathBuf> {
     )
 }
 
+/// v8 レビュー修正: 設定ファイルの読込サイズ上限。正常な settings.txt は
+/// 数百バイト〜数 KB(recent 8 件+palette 256 件でも遠く及ばない)なので、
+/// これを超えるファイルは破損・肥大化とみなして黙って既定値へフォール
+/// バックする(SPEC §26: 「破損・欠損時は黙って既定値」「起動を絶対に
+/// 妨げない」— 上限なしの `read_to_string` は巨大ファイルで起動遅延・
+/// メモリ浪費の穴になっていた)。
+const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
+
 /// テスト可能にするため、実際のパスを取る内部実装を分離する
 /// (`load`/`save` はこれの薄いラッパー)。
 fn load_from_path(path: &Path) -> Settings {
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text),
-        Err(_) => Settings::default(),
+    // v8 R2 レビュー修正: metadata 検査→開き直しの間にファイルが置換される
+    // 競合窓を作らないよう、開いた同じハンドルから上限+1 バイトまでしか
+    // 読まない(超えていたら破損とみなして既定値)。
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Settings::default();
+    };
+    let mut text = String::new();
+    let mut limited = file.take(MAX_SETTINGS_FILE_BYTES + 1);
+    if limited.read_to_string(&mut text).is_err() {
+        return Settings::default();
     }
+    if text.len() as u64 > MAX_SETTINGS_FILE_BYTES {
+        return Settings::default();
+    }
+    parse(&text)
 }
 
 fn save_to_path(path: &Path, settings: &Settings) -> std::io::Result<()> {
@@ -805,6 +825,19 @@ palette.0\t#FF0000
         let path = dir.join("settings.txt");
         // 有効な UTF-8 ではないバイト列(壊れたファイルの極端な例)。
         std::fs::write(&path, [0xFFu8, 0xFE, 0x00, 0x01, 0x02]).expect("write raw bytes");
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded, Settings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_path_oversized_file_falls_back_to_defaults() {
+        // v8 レビュー修正: 肥大化・破損した settings.txt を上限なしで
+        // 読み込まない(`MAX_SETTINGS_FILE_BYTES` のコメント参照)。
+        let dir = temp_dir_for("oversized");
+        let path = dir.join("settings.txt");
+        let oversized = vec![b'#'; (MAX_SETTINGS_FILE_BYTES + 1) as usize];
+        std::fs::write(&path, oversized).expect("write oversized file");
         let loaded = load_from_path(&path);
         assert_eq!(loaded, Settings::default());
         let _ = std::fs::remove_dir_all(&dir);

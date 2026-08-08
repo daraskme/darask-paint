@@ -613,6 +613,20 @@ pub fn paint_copy_icon(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(front, 1.0, st, egui::StrokeKind::Middle);
 }
 
+/// 編集 = 結合部分をコピー(v8 §38): コピーと同じ重なった 2 枚の矩形の、
+/// 前面の 1 枚に「結合されたレイヤー」を表す横線 2 本を入れた意匠
+/// (`paint_copy_icon` の派生であることが一目で分かるようにする)。
+pub fn paint_copy_merged_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let back = Rect::from_min_max(p(rect, 0.30, 0.16), p(rect, 0.78, 0.62));
+    let front = Rect::from_min_max(p(rect, 0.20, 0.36), p(rect, 0.68, 0.82));
+    painter.rect_stroke(back, 1.0, st, egui::StrokeKind::Middle);
+    painter.rect_stroke(front, 1.0, st, egui::StrokeKind::Middle);
+    for t in [0.52, 0.66] {
+        painter.line_segment([p(rect, 0.28, t), p(rect, 0.60, t)], st);
+    }
+}
+
 /// 編集 = 貼り付け: クリップボード(上部タブ+本体+中の横線)(SPEC §33)。
 pub fn paint_paste_icon(painter: &Painter, rect: Rect, color: Color32) {
     let st = line_stroke(rect, color);
@@ -623,6 +637,29 @@ pub fn paint_paste_icon(painter: &Painter, rect: Rect, color: Color32) {
     for t in [0.42, 0.56, 0.70] {
         painter.line_segment([p(rect, 0.32, t), p(rect, 0.68, t)], st);
     }
+}
+
+/// 編集 = ファイルから貼り付け(v9 §43): クリップボード+中に画像
+/// ピクトグラム(山と太陽 — `paint_paste_icon` の派生であることが一目で
+/// 分かる意匠)。
+pub fn paint_paste_file_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let body = Rect::from_min_max(p(rect, 0.22, 0.24), p(rect, 0.78, 0.84));
+    painter.rect_stroke(body, 1.5, st, egui::StrokeKind::Middle);
+    let tab = Rect::from_min_max(p(rect, 0.40, 0.16), p(rect, 0.60, 0.28));
+    painter.rect_stroke(tab, 1.0, st, egui::StrokeKind::Middle);
+    // 画像ピクトグラム: 山(折れ線)+太陽(小円)。
+    painter.add(Shape::line(
+        vec![
+            p(rect, 0.30, 0.72),
+            p(rect, 0.44, 0.52),
+            p(rect, 0.54, 0.64),
+            p(rect, 0.62, 0.54),
+            p(rect, 0.70, 0.66),
+        ],
+        st,
+    ));
+    painter.circle_stroke(p(rect, 0.62, 0.40), rect.width() * 0.05, st);
 }
 
 /// 編集 = 削除: ゴミ箱(SPEC §33)。
@@ -670,6 +707,18 @@ pub fn paint_deselect_icon(painter: &Painter, rect: Rect, color: Color32) {
     let st = line_stroke(rect, color);
     corner_brackets(painter, rect, st);
     painter.line_segment([p(rect, 0.20, 0.80), p(rect, 0.80, 0.20)], st);
+}
+
+/// 編集 = 選択範囲を反転(v8 §37): 四隅の角括弧(選択メニュー系の共通意匠)+
+/// 中央の半塗り矩形(`paint_invert_icon` の半塗り円と同じ「反転」のメタファー。
+/// 括弧=選択の文脈、半塗り=反転、の組み合わせで両者と区別する)。
+pub fn paint_select_inverse_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    corner_brackets(painter, rect, st);
+    let r = Rect::from_min_max(p(rect, 0.34, 0.36), p(rect, 0.66, 0.64));
+    painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Middle);
+    let left_half = Rect::from_min_max(r.min, egui::pos2(r.center().x, r.max.y));
+    painter.rect_filled(left_half, 0.0, color);
 }
 
 /// 編集 = 自由変形: 矩形+四隅のハンドル(SPEC §16 のスケールハンドルと同じ

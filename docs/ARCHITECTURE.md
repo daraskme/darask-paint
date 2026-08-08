@@ -734,3 +734,77 @@ pub struct History {
 - `SaveFormat::Project`を`.dpaint`へ割り当て、開く/保存ダイアログの先頭filterに追加する。無題の既定名は`無題.dpaint`。画像拡張子は既存のflatten export経路を維持する。
 - プロジェクト読込は`(Document, History)`を一体で新タブへ渡す。CLI、D&D、最近使ったファイルも拡張子判定後に同じ経路へ入る。保存前は進行中gestureを確定し、成功後だけpath/modified/recentを更新する。
 - `reset_active_tab_document`は`History::new()`後に現在の表示件数設定を必ず再適用する。
+
+---
+
+# v8 設計(選択範囲を反転・結合部分をコピー)
+
+SPEC.md「v8 拡張仕様」(§37〜§39)に対応。既存のマスク選択基盤(§16.3)とレイヤー合成(§14.1)の上の小さな追加であり、新しいデータ構造・依存・再描画経路は無い。
+
+## 20.1 純関数(tools/select.rs、テスト必須)
+
+- `invert_mask(mask, width, height) -> SelMask` — ドキュメント全域の全 255 マスクから、`clamp_to` 済みの選択画素を 0 にし、`tighten_mask`(非公開ヘルパー)で非ゼロ最小 bbox へ詰める。テスト: 中央矩形の反転(外周リング)、左半分→右半分のタイト bbox、全選択→empty、二重反転の往復一致、範囲外 bbox のクランプ、退化寸法の no-panic。
+- `extract_region_composite(doc, mask) -> Vec<u8>` — `extract_region` の合成(`Document::composite_pixel`)版。呼び出し側が `recompose_if_dirty()` で合成キャッシュを最新化してから呼ぶ(スポイトと同じ前提)。
+- `overlay_floating_onto_region(out, region, floating)` — 抽出済みバッファへ浮動片を source-over(`raster::blend_over`)で重ねる(マスク 0 はスキップ、region 外へのはみ出しはクリップ)。SPEC §38 の「ドキュメント非破壊のまま見えているとおりの画素を作る」ため、`composite_floating` と同じマスク・ブレンド規則で書き込み先だけをバッファに変えたもの。
+
+## 20.2 app.rs / keymap / menu の配線
+
+- `invert_selection()` — 浮動片の足跡(`floating_target_rect` + `mask`)を先に取り、`commit_open_gesture()` → 無条件の `flush_floating_keep_selection()`(commit-first 規則、§17.3 と同じ。後者はツール不変条件に依存しないための冪等な安全弁)後に `invert_mask` を適用。空なら選択解除。履歴に積まない。
+- `merged_selected_pixels()` / `copy_merged_selection_to_clipboard()` — `selected_pixels`/`copy_selection_to_clipboard` の合成版。浮動片は確定せずオーバーレイ合成(SPEC §38 の非破壊要件)。`&mut self` は `recompose_if_dirty` のためだけ。
+- keymap.rs: `Action::SelectInverse`(Ctrl+Shift+I)/`Action::CopyMerged`(Ctrl+Shift+C)。`poll` の specificity 降順消費(§15.4 ②)で素の Ctrl+I/Ctrl+C より先に判定される(テストで担保)。
+- menu.rs: 編集グループへ 2 タイル追加(「選択解除」の直後に選択反転、「コピー」の直後に結合コピー)。どちらも `has_selection` で有効化。スロット数の静的テストは 42→44(+区切り5=49)に追随。
+- icons.rs: `paint_select_inverse_icon`(角括弧+半塗り矩形)/`paint_copy_merged_icon`(コピー 2 枚+結合線)。既存の意匠ファミリー(`corner_brackets`/`paint_copy_icon`)から派生させ、一目で系統が分かるようにする。
+
+## 20.3 v8 の落とし穴
+
+1. 選択の変更は描画クリップ(`ToolCtx::clip`)を変えるため、反転は必ず commit-first ガードを通す(§17.3/§18.6-1 と同じクラスの罠)。
+2. 「結合部分をコピー」は**絶対にドキュメントを変更しない**(浮動片の確定・`doc.modified`・履歴 push のいずれも起こさない)。コピーのつもりが undo 単位を作ってしまうのは操作契約違反(§16.10-4 のライブプレビュー累積適用と同種の「読み取り操作が状態を汚す」バグ)。
+3. `composite` キャッシュは読み取り前に `recompose_if_dirty()` で最新化する(直前の同フレーム操作の dirty が未反映のまま古い合成を読まない)。
+4. 反転結果の bbox タイト化を忘れると、「選択範囲でトリミング」「浮動化」が見かけの選択より大きな範囲に働く(bbox 依存操作の意味論が崩れる)。
+
+## 20.4 v8 レビュー修正の設計(SPEC §40)
+
+外部レビュー(Codex、gpt-5.6-sol)の指摘に対応した修正の実装メモ。
+
+- **画像書き出しの原子化**(SPEC §40-1): `project.rs::atomic_write` を `pub(crate)` 化して io.rs の PNG/JPEG/BMP が共有する。エンコードはメモリ上のバッファへ行い(`image::write_buffer_with_format` は `Write + Seek` を要求するので `Cursor`)、完成したバイト列だけを設置する。ストリーム書きへの変更はしない(8192 上限下で最大 ~200MB の一時バッファは許容し、実績のある原子化コードの共有を優先)。
+- **寸法上限**(SPEC §40-2): 上限定数は `document::MAX_DIMENSION`(8192)に一本化し、project.rs の復元上限も同じ定数を参照する。「開く」は `image::image_dimensions`(ヘッダのみ読む)で**デコード前に**検査し、画素バッファを一切確保せず拒否する。クリップボードは取得後に検査し、`len == w*h*4` の防御も足す。
+- **clipped マスク**(SPEC §40-3): `rect_mask_clipped`/`ellipse_mask_clipped`/`polygon_mask_clipped` は「作ってから `clamp_to`」とバイト同値(同値性テストあり)で、確保だけを交差領域に限る。楕円は**クリップ前の矩形**から中心・半径を計算する(v4 レビューの楕円クランプ問題を再導入しない)。偶奇規則の走査はクリップ後の開始点までの交点を先に消費するので追加の状態は不要。
+- **Esc と `modified`**(SPEC §40-5): `Floating::prev_modified`(浮動化直前の値、既定は安全側の `true`)を浮動化経路が設定し、`cancel_floating` と「no-op 確定」(`flush_floating_keep_selection` で `undo_len` が変わらなかった場合)が書き戻す。浮動片保持中の履歴外の実変更(現状はレイヤー名確定のみ — 他の実変更経路はすべて commit-first で浮動片を先に確定する)は `prev_modified` を `true` に汚染して書き戻しを無効化する。
+- **undo 時のメタデータ刷新**(SPEC §40-7): `History::refresh_op_for_redo` が undo 直前に `AddLayer::name` と `DuplicateLayer::layer` を現在値で刷新する(バイト会計も追随)。`MergeDown::lower_before` は undo の復元対象と redo の再計算源を兼ねるため刷新できない — 完全対応は op へのフィールド追加= `.dpaint` v1 符号化の変更を伴うため、フォーマット互換を優先して残課題とした(SPEC §40-7 に明記)。
+- **保存パスの一意性**(SPEC §40-6): `finish_save` 成功後に `detach_other_tabs_with_path`(パスを正規化比較)が他タブの `path` を外し「無題N」+`modified = true` へ戻す。拒否やタブ切替ではなく「外す」を選んだのは、ユーザーの保存操作を妨げず、どのタブの内容も失わないため。
+- **CI サイズ検査**(SPEC §40-9): ヘッドレスランナーで実行不能な起動ベンチと違い、exe サイズは常時検査できるため必須ジョブへ入れる(ci.yml / release.yml)。
+
+---
+
+# v9 設計(保存状態の正確化・ナッジ・選択変形・ファイル貼り付け・テーマ)
+
+SPEC.md「v9 拡張仕様」(§41〜§45)に対応。
+
+## 21.1 保存状態マーカー(SPEC §45-1)
+
+- `History` に `saved_len: Option<usize>` を追加: `mark_saved()`(保存成功時)/`is_at_saved_state()`(現在位置一致)/`invalidate_saved()`(パスの紐付けを失ったタブ用)。**保存位置より手前での push だけ**が `None` へ無効化する(位置 L 以深の push は状態 0..=L を変えない)。`History::new()`/`.dpaint` 読込直後は「その時点」を基準に `Some(現在長)`。
+- `Tab::meta_dirty: bool`: 履歴に積まれない実変更(レイヤー名・表示・不透明度)の記録。保存成功でクリア。
+- `app.rs::refresh_modified_after_history_move()` を undo/redo/ジャンプの直後に呼び、`modified = meta_dirty || !is_at_saved_state()` で上書きする(`apply_before/after` が常に立てる値の精密化)。
+- 画像書き出し(SPEC §45-3 の export)は `mark_saved` を呼ばない。別名保存で他タブからパスを外すとき(§40-6)はそのタブの `invalidate_saved()` を呼ぶ(undo で「保存済み」表示へ戻って閉じる確認が消えると、ディスク上に存在しない内容が失われる)。
+
+## 21.2 レイヤーパネルの全アクション化(SPEC §45-2)
+
+- `layers_panel::show` は `&Document`(読み取り専用)になり、表示切替・不透明度・リネーム確定も `LayersPanelAction::{SetVisible, SetOpacity, CommitRename}` として返す。適用は app.rs が `commit_open_gesture()` を通してから行う(SPEC §13 最終項の全面適用。パネルが `Document` を直接変更する経路は無くなった)。
+
+## 21.3 ナッジ・浮動片変換・ファイル貼り付け(SPEC §41〜§43)
+
+- keymap に `Action::Nudge(i8, i8)`(矢印×4=±1、Shift+矢印×4=±10)。`app.rs::nudge_selection` は浮動片優先、無ければ選択 bbox を平行移動して `clamp_to`(境界で欠ける場合は欠けたまま — 単純さ優先)。
+- `select.rs::transform_floating(&mut Floating, FloatingTransform)`: 画素(4ch)とマスク(1ch)を同じ純関数(`flip_h_channels`/`flip_v_rows`/`rotate_*_channels`)で変換。回転は中心維持で幅高を入れ替え。呼び出し側(`app.rs::try_transform_floating`)が新 id 割り当てと `reset_resample_source()`(遅延複製の破棄→次の拡縮で変換後画素が元になる)を行う。選択のみの場合は `free_transform()` で浮動化してから変換。
+- `MenuAction::PasteFromFile` → `DialogRequest::PasteFile`(rfd は次フレーム冒頭、§12-9)→ `io::paste_file_dialog()`(画像のみ)→ `load_image`(8192 検査込み)→ `paste_pixels`(白紙置換/浮動片の既存規則)。
+
+## 21.4 テーマ(SPEC §44)
+
+- 新規 `ui/theme.rs`: `apply(ctx)` を `DaraskApp::new` で 1 回。egui 0.35 の `set_theme(Theme::Dark)` + `style_mut_of(Theme::Dark, ..)` でダーク固定・カスタム `Visuals`(背景 3 階調 + 単一アクセント + 角丸 4px)。ツールバー/メニューの自前タイルは `visuals.widgets`/`selection` を読むため自動追随。キャンバス作業領域色は `theme::CANVAS_WORKSPACE_FILL` 定数を `CentralPanel` が参照。
+- 階調の暗→明の順序とテキストコントラストをユニットテストで固定(リグレッション検知)。
+
+## 21.5 v9 の落とし穴
+
+1. 保存マーカーの無効化条件は「保存位置より**手前**での push」だけ。位置以深の push で無効化すると「保存→続けて描く→全部 undo」で未保存表示が消えなくなる(過剰無効化)。逆に無効化を忘れると偽の「保存済み」で閉じてデータを失う(過小無効化)— 双方向のテストを維持する。
+2. 浮動片変換後は必ず `reset_resample_source()` + 新 id。忘れると次の拡縮が変換**前**の画素から再サンプリングされ、変換が巻き戻って見える。
+3. ナッジは `wants_keyboard_input` ガード必須(テキスト編集・リネーム中に矢印でカーソル移動できなくなる)— 既存の `handle_shortcuts` 先頭ガードで足りる。
+4. 画像書き出しの export 判定(§45-3)は「保存 Ok の後」ではなく**保存前の状態**(パス・レイヤー数)で決める(保存後にパスを書き換えてから判定すると常に export でなくなる)。

@@ -16,7 +16,25 @@ use std::path::{Path, PathBuf};
 
 use image::ImageEncoder;
 
-use crate::document::Document;
+use crate::document::{Document, MAX_DIMENSION};
+
+/// v8 レビュー修正: 「開く」/クリップボード貼り付けの寸法上限エラー
+/// (`MAX_DIMENSION`、SPEC §7/§36 と同じ 8192)。上限なしに巨大画像を
+/// 読み込むと、レイヤー+合成バッファの確保だけで OOM 中断(release は
+/// `panic = "abort"`)に至りうる(CLAUDE.md 鉄則: I/O 経路でパニックしない)。
+fn dimension_error(width: u32, height: u32) -> String {
+    format!("画像が大きすぎます({width}×{height}。対応上限 {MAX_DIMENSION}×{MAX_DIMENSION})")
+}
+
+fn check_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("画像サイズが不正です".to_owned());
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(dimension_error(width, height));
+    }
+    Ok(())
+}
 
 /// 保存フォーマット(SPEC §8)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,9 +86,22 @@ pub fn ensure_extension(path: PathBuf) -> PathBuf {
 /// GIF は先頭フレームのみ(`image::open` の `DynamicImage` は単一フレーム)。
 /// SPEC §13: 開いた直後は「背景」レイヤー 1 枚。
 pub fn load_image(path: &Path) -> Result<Document, String> {
-    let img = image::open(path).map_err(|e| e.to_string())?;
+    // v8 レビュー修正: 本体をデコードする前にヘッダだけ読んで寸法を検査し、
+    // 上限超過のファイルは画素バッファを 1 バイトも確保せずに拒否する。
+    // v8 R2: 検査とデコードを**同じファイルハンドル**で行う(検査後に開き
+    // 直すと、その間の置換で上限検査をすり抜ける競合窓ができる)。
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    check_dimensions(width, height)?;
+    let img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
+    // デコード結果がヘッダと食い違う奇妙なファイルへの防御(二重検査)。
+    check_dimensions(width, height)?;
     Ok(Document::from_loaded(
         width,
         height,
@@ -94,23 +125,42 @@ pub fn save_image(doc: &mut Document, path: &Path, format: SaveFormat) -> Result
     }
 }
 
+/// v8 レビュー修正: 画像書き出しも `.dpaint` と同じ「一時ファイル→単一
+/// rename」で置換する。従来は保存先へ直接書いており(JPEG は `File::create`
+/// が既存ファイルを先に切り詰める)、エンコードやディスク書込が途中で失敗
+/// すると**既存の元ファイルが空・不完全なまま残る**危険があった(SPEC §8 の
+/// トーストでは原本を回復できない)。エンコーダは一時ファイルへ直接
+/// ストリームする(`project::atomic_write_with` — 最大 8192² でも完成バイト
+/// 列をメモリへ持たない)。
 fn save_rgba(doc: &Document, path: &Path, format: image::ImageFormat) -> Result<(), String> {
-    image::save_buffer_with_format(
-        path,
-        &doc.composite,
-        doc.width,
-        doc.height,
-        image::ColorType::Rgba8,
-        format,
-    )
-    .map_err(|e| e.to_string())
+    crate::project::atomic_write_with(path, |writer| {
+        image::write_buffer_with_format(
+            writer,
+            &doc.composite,
+            doc.width,
+            doc.height,
+            image::ColorType::Rgba8,
+            format,
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 /// SPEC §13: 「JPEG/BMP は白に合成」。アルファチャンネルを持てない形式向けに
 /// straight-alpha の合成結果を白背景へ source-over 合成した RGB バッファを作る
 /// (`save_jpeg`/`save_bmp` で共有)。
-fn composite_over_white_rgb(doc: &Document) -> Vec<u8> {
-    let mut rgb = vec![0u8; doc.width as usize * doc.height as usize * 3];
+fn composite_over_white_rgb(doc: &Document) -> Result<Vec<u8>, String> {
+    // v8 レビュー修正: 8192² では約 192MiB になるバッファなので、失敗を
+    // トーストへ返せる fallible な確保にする(CLAUDE.md 鉄則: I/O 経路で
+    // パニックしない)。
+    let len = (doc.width as usize)
+        .checked_mul(doc.height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| "画像が大きすぎます".to_owned())?;
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(len)
+        .map_err(|_| "保存用メモリを確保できません".to_owned())?;
+    rgb.resize(len, 0);
     for (src, dst) in doc.composite.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
         let a = src[3] as f32 / 255.0;
         for c in 0..3 {
@@ -118,19 +168,22 @@ fn composite_over_white_rgb(doc: &Document) -> Vec<u8> {
             dst[c] = v.round().clamp(0.0, 255.0) as u8;
         }
     }
-    rgb
+    Ok(rgb)
 }
 
 /// JPEG はアルファチャンネルを持てないため、白背景に source-over 合成してから
 /// 保存する(SPEC §13: 「JPEG 保存時は…アルファは白に合成してから保存」)。
 fn save_jpeg(doc: &Document, path: &Path, quality: u8) -> Result<(), String> {
-    let rgb = composite_over_white_rgb(doc);
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let writer = std::io::BufWriter::new(file);
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
-    encoder
-        .write_image(&rgb, doc.width, doc.height, image::ExtendedColorType::Rgb8)
-        .map_err(|e| e.to_string())
+    let rgb = composite_over_white_rgb(doc)?;
+    // v8 レビュー修正: `File::create`(既存ファイルの即時切り詰め)をやめ、
+    // 一時ファイルへ直接エンコードしてから原子的に設置する(`save_rgba` と
+    // 同じ理由)。
+    crate::project::atomic_write_with(path, |writer| {
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut *writer, quality);
+        encoder
+            .write_image(&rgb, doc.width, doc.height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// v2 で SPEC §13 に追加された規則(「JPEG/BMP は白に合成」)。
@@ -140,16 +193,20 @@ fn save_jpeg(doc: &Document, path: &Path, quality: u8) -> Result<(), String> {
 /// 透明部が黒や不定色に見えていた。JPEG と同じ白合成を経てから、アルファ
 /// チャンネルを持たない RGB8(24bpp)として書き出す。
 fn save_bmp(doc: &Document, path: &Path) -> Result<(), String> {
-    let rgb = composite_over_white_rgb(doc);
-    image::save_buffer_with_format(
-        path,
-        &rgb,
-        doc.width,
-        doc.height,
-        image::ColorType::Rgb8,
-        image::ImageFormat::Bmp,
-    )
-    .map_err(|e| e.to_string())
+    let rgb = composite_over_white_rgb(doc)?;
+    // v8 レビュー修正: `save_rgba` と同じく一時ファイルへ直接エンコード→
+    // 原子的設置。
+    crate::project::atomic_write_with(path, |writer| {
+        image::write_buffer_with_format(
+            writer,
+            &rgb,
+            doc.width,
+            doc.height,
+            image::ColorType::Rgb8,
+            image::ImageFormat::Bmp,
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 /// 「開く」ダイアログ(SPEC §8、フィルタ必須、ARCHITECTURE.md §8)。
@@ -163,6 +220,19 @@ pub fn open_dialog() -> Option<PathBuf> {
             &["png", "jpg", "jpeg", "bmp", "gif", "webp"],
         )
         .add_filter("すべてのファイル", &["*"])
+        .pick_file()
+}
+
+/// v9 §43: 「ファイルから貼り付け」ダイアログ(画像形式のみ — `.dpaint` は
+/// レイヤー構成を持つため貼り付け元にしない。開きたい場合は「開く」で
+/// 別タブに開く)。
+pub fn paste_file_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("ファイルから貼り付け")
+        .add_filter(
+            "画像ファイル",
+            &["png", "jpg", "jpeg", "bmp", "gif", "webp"],
+        )
         .pick_file()
 }
 
@@ -203,11 +273,21 @@ pub fn read_clipboard_image() -> Result<(u32, u32, Vec<u8>), String> {
     if image.width == 0 || image.height == 0 {
         return Err("クリップボードの画像サイズが不正です".to_owned());
     }
-    Ok((
-        image.width as u32,
-        image.height as u32,
-        image.bytes.into_owned(),
-    ))
+    // v8 レビュー修正: 貼り付けも「開く」と同じ寸法上限(8192)を通す。
+    // ここで拒否すればレイヤー/浮動片/履歴のバッファ群を確保せずに済む。
+    let width = u32::try_from(image.width).map_err(|_| "クリップボードの画像サイズが不正です")?;
+    let height = u32::try_from(image.height).map_err(|_| "クリップボードの画像サイズが不正です")?;
+    check_dimensions(width, height)?;
+    let bytes = image.bytes.into_owned();
+    // arboard は RGBA8 を保証するが、長さの食い違いには防御的に対処する
+    // (以降の経路は `len == w*h*4` を前提に組み立てるため)。
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4));
+    if expected != Some(bytes.len()) {
+        return Err("クリップボードの画像データが不正です".to_owned());
+    }
+    Ok((width, height, bytes))
 }
 
 #[cfg(test)]
@@ -387,6 +467,95 @@ mod tests {
     fn load_missing_file_returns_error_not_panic() {
         let result = load_image(Path::new("__darask_paint_definitely_missing__.png"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_image_rejects_dimensions_over_the_limit_before_decoding() {
+        // v8 レビュー修正: 上限(8192)超の画像はヘッダ検査で拒否する
+        // (`check_dimensions` のコメント参照)。9000×1 なら生成コストは
+        // 36KB 程度で、テストとして安全に作れる。
+        let dir = std::env::temp_dir().join(format!(
+            "darask_paint_test_too_big_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("too_wide.png");
+        let pixels = vec![0u8; 9000 * 4];
+        image::save_buffer_with_format(
+            &path,
+            &pixels,
+            9000,
+            1,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("seed oversized png");
+
+        let Err(message) = load_image(&path) else {
+            panic!("oversized image must be rejected");
+        };
+        assert!(
+            message.contains("大きすぎます"),
+            "上限超過の明確なエラーメッセージを返す: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_image_atomically_replaces_an_existing_file() {
+        // v8 レビュー修正: 画像書き出しは一時ファイル→rename 置換
+        // (`save_rgba` のコメント参照)。上書き保存後に (1) 内容が新しい
+        // 画像になり、(2) 一時ファイルが残らないことを確認する。
+        let dir = std::env::temp_dir().join(format!(
+            "darask_paint_test_atomic_img_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("overwrite.png");
+
+        let mut first = Document::new(2, 2, Background::White);
+        save_image(&mut first, &path, SaveFormat::Png).expect("first save");
+        let mut second = Document::new(2, 2, Background::Transparent);
+        second.set_pixel(0, 0, [1, 2, 3, 255]);
+        save_image(&mut second, &path, SaveFormat::Png).expect("overwrite save");
+
+        let loaded = load_image(&path).expect("load overwritten file");
+        assert_eq!(loaded.get_pixel(0, 0), Some([1, 2, 3, 255]));
+        let stray: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "一時ファイルが残ってはならない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_image_refuses_a_directory_target_and_keeps_it() {
+        // 保存先がディレクトリ(`install_temp` の防御)でもパニックせず、
+        // ディレクトリを壊さない。
+        let dir = std::env::temp_dir().join(format!(
+            "darask_paint_test_dir_target_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = dir.join("i_am_a_directory.png");
+        std::fs::create_dir_all(&target).expect("create dir target");
+        let mut doc = Document::new(2, 2, Background::White);
+        assert!(save_image(&mut doc, &target, SaveFormat::Png).is_err());
+        assert!(target.is_dir(), "既存ディレクトリは壊れない");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

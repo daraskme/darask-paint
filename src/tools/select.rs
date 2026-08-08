@@ -75,16 +75,18 @@ pub struct Floating {
     /// 呼び出し側が新しい id を割り当てること — `canvas_view::draw_floating`
     /// は id が変わったときだけテクスチャを作り直す。
     pub id: u64,
-    /// 浮動化した瞬間の元ピクセル(ARCHITECTURE.md §14.6: 「拡縮は浮動化時の
+    /// 拡縮の再サンプリング元(ARCHITECTURE.md §14.6: 「拡縮は浮動化時の
     /// 元ピクセルから毎回バイリニアで再サンプリングする(累積劣化させない)」)。
-    /// `pixels`/`w`/`h` がハンドルドラッグで何度変わっても、この 3 フィールド
-    /// (`original`/`orig_w`/`orig_h`)は生成後不変。
+    ///
+    /// v8 レビュー修正③: 生成時には複製を持たず**空**にしておき、最初の
+    /// 拡縮の直前に `ensure_resample_source` が現在の `pixels`/`mask`
+    /// (生成後、拡縮以外では不変)を写して確定する。大半の浮動片は一度も
+    /// 拡縮されないため、全画素の二重保持(選択の移動のたびに pixels+mask の
+    /// 2 セット)を払わずに済む。一度確定した後は従来どおり不変。
     pub original: Vec<u8>,
     pub orig_w: u32,
     pub orig_h: u32,
-    /// 浮動化した瞬間の元マスク(`original` と同じく不変。ハンドルでリサイズ
-    /// するたびに `mask` はここから `resample_mask_nearest` で作り直す
-    /// (累積劣化させない、`original`/`orig_w`/`orig_h` と対になる)。
+    /// `original` と対になる元マスク(同じく最初の拡縮時に確定、不変)。
     pub orig_mask: Vec<u8>,
     /// v6 §33〜35(ARCHITECTURE.md §18.3 対応表): この浮動片が最終的に
     /// 合成される(`app.rs::flush_floating_keep_selection`)ときに History
@@ -96,12 +98,23 @@ pub struct Floating {
     /// する別経路(`commit_pending_text_edit_and_composite`)を使うため、
     /// そちらではこのフィールドは参照されない。
     pub label: &'static str,
+    /// v8 レビュー修正(SPEC §18: 「完全復元」): 浮動化した瞬間の
+    /// `Document::modified`。浮動化は未保存ガードのため即座に
+    /// `modified = true` を立てる(`place_new_floating` のコメント参照)が、
+    /// Esc キャンセル(`app.rs::cancel_floating`)や before==after で履歴に
+    /// 何も積まれなかった確定は文書を一切変えないので、この値へ戻す —
+    /// 戻さないと「保存済み文書で貼り付け→Esc」しただけで未保存表示
+    /// (`*`)と終了確認が残り続ける。既定は安全側の `true`(戻さない)。
+    /// 浮動片の保持中に履歴外の実変更(レイヤー名の確定など)が起きた
+    /// 場合、その経路がここを `true` に汚染して復元を無効化する
+    /// (`app.rs::commit_pending_layer_rename` 参照)。
+    pub prev_modified: bool,
 }
 
 impl Floating {
-    /// `pixels`/`mask` をそれぞれ `original`/`orig_mask` としても保持する形で
-    /// `Floating` を作る(通常の生成経路はすべてこれを通し、`original`系の
-    /// フィールドを手で書き忘れることを防ぐ)。
+    /// `Floating` を作る(通常の生成経路はすべてこれを通す)。
+    /// `original`/`orig_mask` は空のまま(v8 レビュー修正③: 最初の拡縮時に
+    /// `ensure_resample_source` が確定する遅延複製、フィールドコメント参照)。
     pub fn new(
         pixels: Vec<u8>,
         w: u32,
@@ -111,8 +124,6 @@ impl Floating {
         cut_from: Option<SelMask>,
         id: u64,
     ) -> Self {
-        let original = pixels.clone();
-        let orig_mask = mask.clone();
         Self {
             pixels,
             w,
@@ -121,14 +132,17 @@ impl Floating {
             pos,
             cut_from,
             id,
-            original,
+            original: Vec::new(),
             orig_w: w,
             orig_h: h,
-            orig_mask,
+            orig_mask: Vec::new(),
             // ARCHITECTURE.md §18.3: 選択ドラッグ・移動ツール・自由変形の
             // 浮動化はいずれもこの既定ラベルのまま(`with_label` で上書き
             // されるのは貼り付け/テキストの生成経路だけ)。
             label: "選択の移動",
+            // 安全側の既定(キャンセルしても `modified` を戻さない)。実際の
+            // 浮動化経路(`app.rs`)が浮動化直前の値で上書きする。
+            prev_modified: true,
         }
     }
 
@@ -138,6 +152,31 @@ impl Floating {
     pub fn with_label(mut self, label: &'static str) -> Self {
         self.label = label;
         self
+    }
+
+    /// v8 レビュー修正③: 最初の拡縮の直前に呼び、再サンプリング元
+    /// (`original`/`orig_mask`)を現在の `pixels`/`mask` で確定する
+    /// (フィールドコメント参照)。2 回目以降は何もしない(累積劣化させない
+    /// 意味論は不変 — 元は常に「浮動化時点」の画素)。
+    ///
+    /// 浮動片の画素そのものを変える操作(v9 の反転/回転など)を行った場合は
+    /// 呼び出し側が `reset_resample_source` で無効化し、次の拡縮が変換後の
+    /// 画素を新しい元として確定し直す。
+    pub fn ensure_resample_source(&mut self) {
+        if self.original.is_empty() {
+            self.original = self.pixels.clone();
+            self.orig_mask = self.mask.clone();
+            self.orig_w = self.w;
+            self.orig_h = self.h;
+        }
+    }
+
+    /// 再サンプリング元を破棄する(`ensure_resample_source` のコメント参照)。
+    pub fn reset_resample_source(&mut self) {
+        self.original = Vec::new();
+        self.orig_mask = Vec::new();
+        self.orig_w = self.w;
+        self.orig_h = self.h;
     }
 
     /// 全画素選択済み(矩形)の浮動片を作る便利コンストラクタ。v4 時点でも
@@ -154,6 +193,126 @@ impl Floating {
     ) -> Self {
         let mask = vec![255u8; (w as usize) * (h as usize)];
         Self::new(pixels, w, h, mask, pos, cut_from, id)
+    }
+}
+
+/// チャンネル数 `ch` の行優先バッファを左右反転する(v9 §42 の浮動片変換用。
+/// 画素=4ch とマスク=1ch を同じコードで扱う)。
+fn flip_h_channels(buf: &mut [u8], w: usize, ch: usize) {
+    if w == 0 || ch == 0 {
+        return;
+    }
+    for row in buf.chunks_mut(w * ch) {
+        let mut l = 0usize;
+        let mut r = w - 1;
+        while l < r {
+            for c in 0..ch {
+                row.swap(l * ch + c, r * ch + c);
+            }
+            l += 1;
+            r -= 1;
+        }
+    }
+}
+
+/// 行優先バッファを上下反転する(行バイト数 `row_bytes` 単位のスワップ)。
+fn flip_v_rows(buf: &mut [u8], row_bytes: usize, h: usize) {
+    if row_bytes == 0 || h == 0 {
+        return;
+    }
+    let mut top = 0usize;
+    let mut bottom = h - 1;
+    while top < bottom {
+        let (a, b) = buf.split_at_mut(bottom * row_bytes);
+        a[top * row_bytes..top * row_bytes + row_bytes].swap_with_slice(&mut b[0..row_bytes]);
+        top += 1;
+        bottom -= 1;
+    }
+}
+
+/// チャンネル数 `ch` のバッファを右に 90° 回転する
+/// (`document.rs::rotate_cw_buffer` と同じ写像 new(col,row)=old(row,h-1-col))。
+fn rotate_cw_channels(w: usize, h: usize, buf: &[u8], ch: usize) -> Vec<u8> {
+    let (new_w, new_h) = (h, w);
+    let mut out = vec![0u8; buf.len()];
+    for row in 0..new_h {
+        for col in 0..new_w {
+            let (x, y) = (row, h - 1 - col);
+            let src = (y * w + x) * ch;
+            let dst = (row * new_w + col) * ch;
+            if let (Some(s), Some(d)) = (buf.get(src..src + ch), out.get_mut(dst..dst + ch)) {
+                d.copy_from_slice(s);
+            }
+        }
+    }
+    out
+}
+
+/// 左に 90° 回転(`rotate_cw_channels` の逆写像 new(col,row)=old(w-1-row,col))。
+fn rotate_ccw_channels(w: usize, h: usize, buf: &[u8], ch: usize) -> Vec<u8> {
+    let (new_w, new_h) = (h, w);
+    let mut out = vec![0u8; buf.len()];
+    for row in 0..new_h {
+        for col in 0..new_w {
+            let (x, y) = (w - 1 - row, col);
+            let src = (y * w + x) * ch;
+            let dst = (row * new_w + col) * ch;
+            if let (Some(s), Some(d)) = (buf.get(src..src + ch), out.get_mut(dst..dst + ch)) {
+                d.copy_from_slice(s);
+            }
+        }
+    }
+    out
+}
+
+/// v9 §42: 浮動片の変換の種類(画像メニューの反転/回転を、浮動片がある
+/// ときはその対象だけへ適用する — MS ペイント準拠)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingTransform {
+    FlipHorizontal,
+    FlipVertical,
+    RotateCw,
+    RotateCcw,
+}
+
+/// v9 §42: 浮動片へ変換を適用する(画素+マスクを同時に、純関数的)。
+/// 回転は見た目の中心を維持したまま幅高を入れ替える。呼び出し側は適用後に
+/// 新しいテクスチャ `id` の割り当てと `reset_resample_source`(拡縮の
+/// 再サンプリング元の破棄 — 変換後の画素が新しい元になる)を行うこと
+/// (`app.rs::try_transform_floating` 参照)。
+pub fn transform_floating(floating: &mut Floating, transform: FloatingTransform) {
+    let (w, h) = (floating.w as usize, floating.h as usize);
+    match transform {
+        FloatingTransform::FlipHorizontal => {
+            flip_h_channels(&mut floating.pixels, w, 4);
+            flip_h_channels(&mut floating.mask, w, 1);
+        }
+        FloatingTransform::FlipVertical => {
+            flip_v_rows(&mut floating.pixels, w * 4, h);
+            flip_v_rows(&mut floating.mask, w, h);
+        }
+        FloatingTransform::RotateCw | FloatingTransform::RotateCcw => {
+            let cw = transform == FloatingTransform::RotateCw;
+            floating.pixels = if cw {
+                rotate_cw_channels(w, h, &floating.pixels, 4)
+            } else {
+                rotate_ccw_channels(w, h, &floating.pixels, 4)
+            };
+            floating.mask = if cw {
+                rotate_cw_channels(w, h, &floating.mask, 1)
+            } else {
+                rotate_ccw_channels(w, h, &floating.mask, 1)
+            };
+            // 見た目の中心を維持して幅高を入れ替える(SPEC §16 のハンドル
+            // 拡縮と同じ「中心基準」の感覚)。
+            let center_x = floating.pos.x + floating.w as f32 / 2.0;
+            let center_y = floating.pos.y + floating.h as f32 / 2.0;
+            std::mem::swap(&mut floating.w, &mut floating.h);
+            floating.pos = pos2(
+                center_x - floating.w as f32 / 2.0,
+                center_y - floating.h as f32 / 2.0,
+            );
+        }
     }
 }
 
@@ -210,11 +369,143 @@ pub fn rect_mask(rect: IRect) -> SelMask {
     }
 }
 
+/// v8 レビュー修正: `rect_mask(rect).clamp_to(..)` と同値だが、**クリップ後の
+/// 領域ぶんしか確保しない**。従来はドラッグの外接矩形全体(低ズームで
+/// キャンバス外まで引くと文書サイズを大きく超えうる)をまず `Vec` で確保して
+/// からクランプしていたため、極端なドラッグで巨大確保→OOM 中断(release は
+/// `panic = "abort"`)を起こしえた(CLAUDE.md 鉄則「ユーザー入力経路で
+/// パニックしない」違反)。選択の新規作成経路はすべてこの clipped 系を使う。
+pub fn rect_mask_clipped(rect: IRect, clip: IRect) -> SelMask {
+    let clipped = IRect {
+        x0: rect.x0.max(clip.x0),
+        y0: rect.y0.max(clip.y0),
+        x1: rect.x1.min(clip.x1),
+        y1: rect.y1.min(clip.y1),
+    };
+    rect_mask(clipped)
+}
+
+/// v8 レビュー修正: `ellipse_mask(rect).clamp_to(..)` と同値の clipped 版
+/// (`rect_mask_clipped` のコメント参照)。楕円の中心・半径は**クリップ前の
+/// `rect`**から計算する(クリップ後の矩形へ内接させ直すと別の楕円になって
+/// しまう — `app.rs::select_up` の v4 レビュー修正コメントが説明する既知の
+/// 罠。この関数はその「先に作ってからクリップ」の意味論を、確保だけ
+/// クリップ後に行う形で維持する)。
+pub fn ellipse_mask_clipped(rect: IRect, clip: IRect) -> SelMask {
+    if rect.is_empty() {
+        return SelMask::empty();
+    }
+    let bbox = IRect {
+        x0: rect.x0.max(clip.x0),
+        y0: rect.y0.max(clip.y0),
+        x1: rect.x1.min(clip.x1),
+        y1: rect.y1.min(clip.y1),
+    };
+    if bbox.is_empty() {
+        return SelMask::empty();
+    }
+    let w = bbox.width() as usize;
+    let h = bbox.height() as usize;
+    let mut mask = vec![0u8; w * h];
+    let cx = (rect.x0 + rect.x1) as f32 / 2.0;
+    let cy = (rect.y0 + rect.y1) as f32 / 2.0;
+    let rx = rect.width() as f32 / 2.0;
+    let ry = rect.height() as f32 / 2.0;
+    if rx > 0.0 && ry > 0.0 {
+        for y in 0..h {
+            let ny = (bbox.y0 + y as i32) as f32 + 0.5 - cy;
+            let ny = ny / ry;
+            if ny.abs() > 1.0 {
+                continue;
+            }
+            let row = y * w;
+            for x in 0..w {
+                let nx = ((bbox.x0 + x as i32) as f32 + 0.5 - cx) / rx;
+                if nx * nx + ny * ny <= 1.0 {
+                    mask[row + x] = 255;
+                }
+            }
+        }
+    }
+    SelMask { bbox, mask }
+}
+
+/// v8 レビュー修正: `polygon_mask(points).clamp_to(..)` と同値の clipped 版
+/// (`rect_mask_clipped` のコメント参照)。偶奇規則の交点リストは行ごとに
+/// 全頂点から作るため、クリップで左側の交点が bbox 外になっても、走査開始時の
+/// `while` が先にそれらを消費して正しい内外状態から始まる(`polygon_mask` と
+/// 同じ走査コード)。
+pub fn polygon_mask_clipped(points: &[Pos2], clip: IRect) -> SelMask {
+    if points.len() < 3 {
+        return SelMask::empty();
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for p in points {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let bbox = IRect {
+        x0: (min_x.floor() as i32).max(clip.x0),
+        y0: (min_y.floor() as i32).max(clip.y0),
+        x1: (max_x.ceil() as i32).min(clip.x1),
+        y1: (max_y.ceil() as i32).min(clip.y1),
+    };
+    if bbox.is_empty() {
+        return SelMask::empty();
+    }
+    let w = bbox.width() as usize;
+    let h = bbox.height() as usize;
+    let mut mask = vec![0u8; w * h];
+    let n = points.len();
+    let mut xs: Vec<f32> = Vec::new();
+    for y in 0..h {
+        let py = bbox.y0 as f32 + y as f32 + 0.5;
+        xs.clear();
+        for i in 0..n {
+            let a = points[i];
+            let b = points[(i + 1) % n];
+            if (a.y <= py) != (b.y <= py) {
+                let t = (py - a.y) / (b.y - a.y);
+                xs.push(a.x + t * (b.x - a.x));
+            }
+        }
+        xs.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+        let row = y * w;
+        let mut inside = false;
+        let mut xi = 0;
+        for x in 0..w {
+            let px = bbox.x0 as f32 + x as f32 + 0.5;
+            while xi < xs.len() && xs[xi] <= px {
+                inside = !inside;
+                xi += 1;
+            }
+            if inside {
+                mask[row + x] = 255;
+            }
+        }
+    }
+    SelMask { bbox, mask }
+}
+
 /// `rect` に内接する楕円のマスク(SPEC §22: 「楕円選択」)。
 /// `raster::fill_ellipse` と全く同じ判定式(`(x+0.5-cx)^2/rx^2 +
 /// (y+0.5-cy)^2/ry^2 <= 1`)を使うため、同じ外接矩形の楕円図形と選択で
 /// 見た目が一致する。`rx`/`ry` のどちらかが 0 以下(矩形が退化している)
 /// なら空マスクを返す(パニックしない)。
+///
+/// v8 レビュー修正後、本体コードは確保をクリップ後に限定する
+/// `ellipse_mask_clipped` を使う。こちらは「作ってから `clamp_to`」との
+/// バイト同値性を担保するテストの参照実装として残す
+/// (`clipped_masks_match_build_then_clamp_for_all_shapes`。
+/// `Document::active_pixels` と同じ「テスト専用に残す」流儀)。
+#[allow(dead_code)]
 pub fn ellipse_mask(rect: IRect) -> SelMask {
     if rect.is_empty() {
         return SelMask::empty();
@@ -256,6 +547,10 @@ pub fn ellipse_mask(rect: IRect) -> SelMask {
 /// 偶奇規則ポリゴン塗りつぶし。頂点をちょうど通る水平線での二重カウントを
 /// 避けるため、辺の判定条件は `(a.y <= py) != (b.y <= py)` という片側閉区間
 /// にしてある)。
+///
+/// v8 レビュー修正後、本体コードは `polygon_mask_clipped` を使う。こちらは
+/// 同値性テストの参照実装として残す(`ellipse_mask` と同じ理由)。
+#[allow(dead_code)]
 pub fn polygon_mask(points: &[Pos2]) -> SelMask {
     if points.len() < 3 {
         return SelMask::empty();
@@ -418,6 +713,165 @@ pub fn composite_floating(doc: &mut Document, floating: &Floating) -> IRect {
     }
     doc.mark_dirty(clipped);
     clipped
+}
+
+/// v8 §37: 選択マスクの補集合(ドキュメント範囲内)。`width`×`height` の
+/// 全画素のうち `mask` で選択されていない画素だけを選択した新しいマスクを
+/// 返す。結果の bbox は非ゼロ画素を含む最小矩形へ詰める(`tighten_mask`) —
+/// 「選択範囲でトリミング」「浮動化」等の bbox 依存の操作が、反転後の選択
+/// (例: 左半分の反転=右半分)に対しても自然に働くようにするため。
+/// 全画素が選択済みなら `SelMask::empty()`(SPEC §37: 「全選択の反転は
+/// 選択解除と同じ」)。`mask` は先に `clamp_to` で範囲内へ切り詰めてから
+/// 使うので、範囲外へはみ出した bbox を渡してもパニックしない。
+pub fn invert_mask(mask: &SelMask, width: u32, height: u32) -> SelMask {
+    if width == 0 || height == 0 {
+        return SelMask::empty();
+    }
+    let full = IRect {
+        x0: 0,
+        y0: 0,
+        x1: width as i32,
+        y1: height as i32,
+    };
+    let clamped = mask.clamp_to(width, height);
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![255u8; w * h];
+    if !clamped.is_empty() {
+        let mw = clamped.bbox.width() as usize;
+        for y in clamped.bbox.y0..clamped.bbox.y1 {
+            let my = (y - clamped.bbox.y0) as usize;
+            let row = &clamped.mask[my * mw..(my + 1) * mw];
+            let out_start = y as usize * w + clamped.bbox.x0 as usize;
+            let out_row = &mut out[out_start..out_start + mw];
+            for (dst, &src) in out_row.iter_mut().zip(row) {
+                if src != 0 {
+                    *dst = 0;
+                }
+            }
+        }
+    }
+    tighten_mask(SelMask {
+        bbox: full,
+        mask: out,
+    })
+}
+
+/// 非ゼロ画素を含む最小の bbox へ詰め直す(全ゼロなら `SelMask::empty()`)。
+/// `invert_mask` 専用のヘルパー(既存の選択生成経路 — 矩形/楕円/多角形/
+/// flood — は生成時点で bbox がタイトなので不要)。
+fn tighten_mask(mask: SelMask) -> SelMask {
+    if mask.is_empty() {
+        return SelMask::empty();
+    }
+    let w = mask.bbox.width() as usize;
+    let h = mask.bbox.height() as usize;
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = h;
+    let mut max_y = 0usize;
+    for y in 0..h {
+        let row = &mask.mask[y * w..(y + 1) * w];
+        let Some(first) = row.iter().position(|&v| v != 0) else {
+            continue;
+        };
+        // `first` が存在する行では `rposition` も必ず見つかる(同じ行を逆順に
+        // 走査するだけ)が、不変条件に頼らず `first` へフォールバックする。
+        let last = row.iter().rposition(|&v| v != 0).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = y;
+    }
+    if min_y > max_y || min_x > max_x {
+        return SelMask::empty();
+    }
+    if min_x == 0 && min_y == 0 && max_x + 1 == w && max_y + 1 == h {
+        return mask;
+    }
+    let nw = max_x - min_x + 1;
+    let nh = max_y - min_y + 1;
+    let mut out = vec![0u8; nw * nh];
+    for y in 0..nh {
+        let start = (min_y + y) * w + min_x;
+        out[y * nw..(y + 1) * nw].copy_from_slice(&mask.mask[start..start + nw]);
+    }
+    SelMask {
+        bbox: IRect {
+            x0: mask.bbox.x0 + min_x as i32,
+            y0: mask.bbox.y0 + min_y as i32,
+            x1: mask.bbox.x0 + (max_x + 1) as i32,
+            y1: mask.bbox.y0 + (max_y + 1) as i32,
+        },
+        mask: out,
+    }
+}
+
+/// v8 §38: `extract_region` の**合成結果**(可視レイヤー合成、
+/// `Document::composite_pixel`)版。「結合部分をコピー」がスポイト
+/// (SPEC §13: 「スポイトは合成結果から色を取る」)と同じ意味論で画素を
+/// 読むために使う。呼び出し側は `Document::recompose_if_dirty` 等で
+/// `composite` を最新化してから呼ぶこと。
+pub fn extract_region_composite(doc: &Document, mask: &SelMask) -> Vec<u8> {
+    let rect = mask.bbox;
+    let w = rect.width() as usize;
+    let h = rect.height() as usize;
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            if mask.mask.get(y * w + x).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let px = doc
+                .composite_pixel(rect.x0 + x as i32, rect.y0 + y as i32)
+                .unwrap_or([0, 0, 0, 0]);
+            let idx = (y * w + x) * 4;
+            out[idx..idx + 4].copy_from_slice(&px);
+        }
+    }
+    out
+}
+
+/// v8 §38: 抽出済みバッファ `out`(`region` = 抽出元の bbox、RGBA8・行優先)の
+/// 上へ、浮動片を画面表示と同じ見た目(合成結果の上に source-over)で重ねる。
+/// 「結合部分をコピー」中に浮動片がある場合、ドキュメントを一切変更せずに
+/// 「見えているとおり」の画素を作るために使う(`composite_floating` と同じ
+/// マスク・ブレンド規則だが、書き込み先が `Document` ではなくこのバッファ)。
+pub fn overlay_floating_onto_region(out: &mut [u8], region: IRect, floating: &Floating) {
+    let target = floating_target_rect(floating);
+    let overlap = IRect {
+        x0: region.x0.max(target.x0),
+        y0: region.y0.max(target.y0),
+        x1: region.x1.min(target.x1),
+        y1: region.y1.min(target.y1),
+    };
+    if overlap.is_empty() {
+        return;
+    }
+    let region_w = region.width() as usize;
+    let src_w = floating.w as usize;
+    for y in overlap.y0..overlap.y1 {
+        let sy = (y - target.y0) as usize;
+        let oy = (y - region.y0) as usize;
+        for x in overlap.x0..overlap.x1 {
+            let sx = (x - target.x0) as usize;
+            let midx = sy * src_w + sx;
+            if floating.mask.get(midx).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let sidx = midx * 4;
+            let Some(src) = floating.pixels.get(sidx..sidx + 4) else {
+                continue;
+            };
+            let src_px = [src[0], src[1], src[2], src[3]];
+            let oidx = (oy * region_w + (x - region.x0) as usize) * 4;
+            let Some(dst) = out.get_mut(oidx..oidx + 4) else {
+                continue;
+            };
+            let dst_px = [dst[0], dst[1], dst[2], dst[3]];
+            dst.copy_from_slice(&raster::blend_over(dst_px, src_px));
+        }
+    }
 }
 
 /// 選択枠の描画用境界線分(v4 §16.3: 「選択画素と非選択画素の境界」)。
@@ -877,6 +1331,306 @@ mod tests {
         let _ = &mut doc; // 未使用警告回避(get_pixel を経由しないため)。
     }
 
+    // -- v8 レビュー修正: clipped マスク(確保をクリップ後に限定) ------------
+
+    /// clipped 版は「作ってから `clamp_to`」の従来経路とバイト同値であること
+    /// (`app.rs::select_up` の v4 レビュー修正が要求する楕円の意味論
+    /// — クリップ前の外接矩形から方程式を評価する — を含む)。
+    #[test]
+    fn clipped_masks_match_build_then_clamp_for_all_shapes() {
+        let doc_rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 20,
+            y1: 15,
+        };
+        // キャンバスを大きくはみ出すドラッグ矩形。
+        let drag = IRect {
+            x0: -30,
+            y0: -10,
+            x1: 45,
+            y1: 40,
+        };
+        let old_rect = rect_mask(drag).clamp_to(20, 15);
+        let new_rect = rect_mask_clipped(drag, doc_rect);
+        assert_eq!(old_rect.bbox, new_rect.bbox);
+        assert_eq!(old_rect.mask, new_rect.mask);
+
+        let old_ellipse = ellipse_mask(drag).clamp_to(20, 15);
+        let new_ellipse = ellipse_mask_clipped(drag, doc_rect);
+        assert_eq!(old_ellipse.bbox, new_ellipse.bbox);
+        assert_eq!(old_ellipse.mask, new_ellipse.mask);
+
+        let poly = [
+            pos2(-25.0, -5.0),
+            pos2(40.0, 2.0),
+            pos2(30.0, 35.0),
+            pos2(-10.0, 20.0),
+        ];
+        let old_poly = polygon_mask(&poly).clamp_to(20, 15);
+        let new_poly = polygon_mask_clipped(&poly, doc_rect);
+        assert_eq!(old_poly.bbox, new_poly.bbox);
+        assert_eq!(old_poly.mask, new_poly.mask);
+    }
+
+    #[test]
+    fn clipped_masks_allocate_only_the_intersection_for_huge_drags() {
+        // v8 レビュー修正の本題: 途方もないドラッグ座標でも確保はクリップ
+        // 後の寸法(ここでは 8×8)に留まり、OOM しない。
+        let doc_rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 8,
+            y1: 8,
+        };
+        let huge = IRect {
+            x0: -2_000_000,
+            y0: -2_000_000,
+            x1: 2_000_000,
+            y1: 2_000_000,
+        };
+        let mask = rect_mask_clipped(huge, doc_rect);
+        assert_eq!(mask.mask.len(), 64);
+        let ellipse = ellipse_mask_clipped(huge, doc_rect);
+        assert_eq!(ellipse.mask.len(), 64);
+        let poly = [
+            pos2(-2_000_000.0, -2_000_000.0),
+            pos2(2_000_000.0, -2_000_000.0),
+            pos2(0.0, 2_000_000.0),
+        ];
+        let mask = polygon_mask_clipped(&poly, doc_rect);
+        assert_eq!(mask.mask.len(), 64);
+    }
+
+    #[test]
+    fn clipped_masks_entirely_outside_the_clip_are_empty() {
+        let doc_rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 8,
+            y1: 8,
+        };
+        let outside = IRect {
+            x0: 10,
+            y0: 10,
+            x1: 20,
+            y1: 20,
+        };
+        assert!(rect_mask_clipped(outside, doc_rect).is_empty());
+        assert!(ellipse_mask_clipped(outside, doc_rect).is_empty());
+        let poly = [pos2(10.0, 10.0), pos2(20.0, 10.0), pos2(15.0, 20.0)];
+        assert!(polygon_mask_clipped(&poly, doc_rect).is_empty());
+    }
+
+    // -- v8 §37: 選択範囲を反転(invert_mask / tighten_mask) -----------------
+
+    #[test]
+    fn invert_mask_of_a_centered_rect_selects_the_complement_ring() {
+        let rect = IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        };
+        let inverted = invert_mask(&rect_mask(rect), 10, 10);
+        // 反転結果は 4 辺すべてに接するのでドキュメント全域が bbox のまま。
+        assert_eq!((inverted.bbox.x0, inverted.bbox.y0), (0, 0));
+        assert_eq!((inverted.bbox.x1, inverted.bbox.y1), (10, 10));
+        // 元の選択内は非選択、外は選択。
+        assert!(!inverted.contains(3, 3));
+        assert!(!inverted.contains(2, 2));
+        assert!(!inverted.contains(5, 5));
+        assert!(inverted.contains(6, 6));
+        assert!(inverted.contains(0, 0));
+        assert!(inverted.contains(9, 9));
+        assert!(inverted.contains(1, 4));
+    }
+
+    #[test]
+    fn invert_mask_of_the_left_half_is_the_tight_right_half() {
+        // bbox のタイト化: 左半分の反転は「右半分ちょうど」の bbox になる
+        // (SPEC §37: 「選択範囲でトリミング」等の bbox 依存操作のため)。
+        let left = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 10,
+        });
+        let inverted = invert_mask(&left, 10, 10);
+        assert_eq!(
+            (
+                inverted.bbox.x0,
+                inverted.bbox.y0,
+                inverted.bbox.x1,
+                inverted.bbox.y1
+            ),
+            (5, 0, 10, 10)
+        );
+        assert!(inverted.contains(5, 0));
+        assert!(inverted.contains(9, 9));
+        assert!(!inverted.contains(4, 5));
+    }
+
+    #[test]
+    fn invert_mask_of_a_full_selection_is_empty() {
+        let full = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 8,
+            y1: 8,
+        });
+        assert!(invert_mask(&full, 8, 8).is_empty());
+    }
+
+    #[test]
+    fn invert_mask_twice_round_trips_to_the_original_selection() {
+        // 楕円のような非矩形マスクでも二重反転で元に戻る(クランプ済み範囲)。
+        let ellipse = ellipse_mask(IRect {
+            x0: 1,
+            y0: 2,
+            x1: 9,
+            y1: 8,
+        });
+        let once = invert_mask(&ellipse, 10, 10);
+        let twice = invert_mask(&once, 10, 10);
+        for y in 0..10 {
+            for x in 0..10 {
+                assert_eq!(
+                    twice.contains(x, y),
+                    ellipse.contains(x, y),
+                    "mismatch at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invert_mask_clamps_an_out_of_bounds_selection_before_inverting() {
+        // ドキュメント外へはみ出した bbox を渡してもパニックせず、範囲内の
+        // 補集合になる。
+        let mask = rect_mask(IRect {
+            x0: -3,
+            y0: -3,
+            x1: 4,
+            y1: 4,
+        });
+        let inverted = invert_mask(&mask, 8, 8);
+        assert!(!inverted.contains(0, 0));
+        assert!(!inverted.contains(3, 3));
+        assert!(inverted.contains(4, 4));
+        assert!(inverted.contains(7, 0));
+    }
+
+    #[test]
+    fn invert_mask_of_an_empty_or_degenerate_document_does_not_panic() {
+        let sel = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        });
+        assert!(invert_mask(&sel, 0, 0).is_empty());
+        assert!(invert_mask(&SelMask::empty(), 0, 5).is_empty());
+        // 選択なしの反転=全選択(呼び出し側はこの経路を使わないが純関数の
+        // 意味論として)。
+        let all = invert_mask(&SelMask::empty(), 4, 4);
+        assert_eq!((all.bbox.x1, all.bbox.y1), (4, 4));
+        assert!(all.contains(0, 0) && all.contains(3, 3));
+    }
+
+    // -- v8 §38: 結合部分をコピー(extract_region_composite /
+    // overlay_floating_onto_region) ------------------------------------------
+
+    #[test]
+    fn extract_region_composite_reads_the_merged_result_not_the_active_layer() {
+        let mut doc = Document::new(4, 4, Background::Transparent);
+        doc.set_pixel(1, 1, [255, 0, 0, 255]); // 背景レイヤーに赤
+        assert!(doc.add_layer("上".to_owned()));
+        doc.set_pixel(1, 1, [0, 0, 255, 255]); // 上のレイヤーに青
+        doc.active = 0; // アクティブを背景(赤)に戻す
+        doc.recomposite_full();
+        let mask = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        });
+        let active = extract_region(&doc, &mask);
+        let merged = extract_region_composite(&doc, &mask);
+        // (1,1) は幅 4 の行優先で index 5、RGBA なので byte offset 20。
+        let idx = 5 * 4;
+        assert_eq!(&active[idx..idx + 4], &[255, 0, 0, 255], "active = 赤");
+        assert_eq!(&merged[idx..idx + 4], &[0, 0, 255, 255], "合成 = 上の青");
+    }
+
+    #[test]
+    fn extract_region_composite_respects_the_selection_mask() {
+        let mut doc = Document::new(2, 1, Background::White);
+        doc.recomposite_full();
+        let sel = SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 1,
+            },
+            mask: vec![255, 0],
+        };
+        let merged = extract_region_composite(&doc, &sel);
+        assert_eq!(&merged[0..4], &[255, 255, 255, 255], "選択画素は合成値");
+        assert_eq!(&merged[4..8], &[0, 0, 0, 0], "非選択画素は透明");
+    }
+
+    #[test]
+    fn overlay_floating_onto_region_blends_like_the_screen() {
+        // 抽出済みの白い 2x1 バッファへ、半透明赤の浮動片(左画素のみ選択)を
+        // 重ねる: 左は blend_over(白, 半透明赤)、右は白のまま。
+        let region = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        };
+        let mut out = vec![255u8; 2 * 4];
+        let floating = Floating::new(
+            vec![255, 0, 0, 128, 255, 0, 0, 128],
+            2,
+            1,
+            vec![255, 0],
+            pos2(0.0, 0.0),
+            None,
+            1,
+        );
+        overlay_floating_onto_region(&mut out, region, &floating);
+        let expected = raster::blend_over([255, 255, 255, 255], [255, 0, 0, 128]);
+        assert_eq!(&out[0..4], &expected);
+        assert_eq!(&out[4..8], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn overlay_floating_onto_region_clips_a_partially_overlapping_floating() {
+        // region(0..2, 0..1)の右端 1 画素にだけ浮動片(pos=(1,0)、2x1)が
+        // 重なるケース。はみ出し分は無視され、パニックしない。
+        let region = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        };
+        let mut out = vec![0u8; 2 * 4];
+        let floating = Floating::new_rect(
+            vec![9, 9, 9, 255, 8, 8, 8, 255],
+            2,
+            1,
+            pos2(1.0, 0.0),
+            None,
+            1,
+        );
+        overlay_floating_onto_region(&mut out, region, &floating);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0], "浮動片の外は不変");
+        assert_eq!(&out[4..8], &[9, 9, 9, 255], "浮動片の 1 画素目だけ重なる");
+    }
+
     // -- v5 §31(ARCHITECTURE.md §17.5): 選択範囲を新規タブに複製・浮動片 -----
 
     #[test]
@@ -1208,12 +1962,30 @@ mod tests {
     }
 
     #[test]
-    fn floating_new_captures_original_pixels_at_construction_time() {
-        let floating = Floating::new_rect(vec![1, 2, 3, 4], 1, 1, pos2(0.0, 0.0), None, 9);
+    fn floating_defers_the_resample_source_until_the_first_resize() {
+        // v8 レビュー修正③: 生成時には original を複製しない(大半の浮動片は
+        // 一度も拡縮されないため)。最初の拡縮の直前に
+        // `ensure_resample_source` が現在の画素を確定し、以後は不変。
+        let mut floating = Floating::new_rect(vec![1, 2, 3, 4], 1, 1, pos2(0.0, 0.0), None, 9);
+        assert!(floating.original.is_empty(), "生成時は複製を持たない");
+        assert!(floating.orig_mask.is_empty());
+        assert_eq!(floating.mask, vec![255u8]);
+
+        floating.ensure_resample_source();
         assert_eq!(floating.original, floating.pixels);
         assert_eq!((floating.orig_w, floating.orig_h), (1, 1));
         assert_eq!(floating.orig_mask, floating.mask);
-        assert_eq!(floating.mask, vec![255u8]);
+
+        // 2 回目の呼び出しは何もしない(元は「浮動化時点」のまま)。
+        floating.pixels = vec![9, 9, 9, 9];
+        floating.ensure_resample_source();
+        assert_eq!(floating.original, vec![1, 2, 3, 4]);
+
+        // 明示的に破棄すれば次の確定で新しい画素が元になる(v9 の浮動片
+        // 反転/回転向け)。
+        floating.reset_resample_source();
+        floating.ensure_resample_source();
+        assert_eq!(floating.original, vec![9, 9, 9, 9]);
     }
 
     // -- v4 §16.3/§21: マスク選択の純関数(ARCHITECTURE.md §16.3) -------------

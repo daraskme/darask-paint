@@ -415,9 +415,17 @@ impl CanvasView {
             None => true,
         };
         if needs_rebuild {
+            // v8 レビュー修正: `floating.pixels` を生のまま描くと、リサイズの
+            // 再サンプリング(画素=bilinear、マスク=nearest)でマスク外に
+            // 残った半透明画素まで見えてしまい、確定・コピー時(マスク適用)
+            // と画面表示が食い違う。合成と同じ意味論(`floating_layer_pixels`
+            // — マスク外は透明)でテクスチャを作る。テクスチャは
+            // `floating.id` が変わったときしか作り直さないため、移動だけの
+            // フレームには追加コストが無い。
+            let masked = select::floating_layer_pixels(floating);
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [floating.w as usize, floating.h as usize],
-                &floating.pixels,
+                &masked,
             );
             let tex = painter
                 .ctx()
