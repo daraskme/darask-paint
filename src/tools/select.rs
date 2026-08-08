@@ -715,6 +715,53 @@ pub fn composite_floating(doc: &mut Document, floating: &Floating) -> IRect {
     clipped
 }
 
+/// v10 §46: 「透明な選択」(MS ペイント準拠)。`key`(セカンダリ色の RGB)と
+/// **RGB が完全一致**する画素を選択マスクから除外する(アルファは比較しない
+/// — 完全透明画素の RGB は不定のことが多く、除外されても見た目に影響しない)。
+/// アクティブレイヤーの画素で判定する(浮動化・塗りつぶしと同じ基準)。
+pub fn color_key_mask(mask: &mut SelMask, doc: &Document, key: [u8; 3]) {
+    if mask.is_empty() {
+        return;
+    }
+    let w = mask.bbox.width() as usize;
+    for y in mask.bbox.y0..mask.bbox.y1 {
+        let my = (y - mask.bbox.y0) as usize;
+        for x in mask.bbox.x0..mask.bbox.x1 {
+            let mx = (x - mask.bbox.x0) as usize;
+            let idx = my * w + mx;
+            if mask.mask.get(idx).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let Some(px) = doc.get_pixel(x, y) else {
+                continue;
+            };
+            if [px[0], px[1], px[2]] == key {
+                if let Some(slot) = mask.mask.get_mut(idx) {
+                    *slot = 0;
+                }
+            }
+        }
+    }
+}
+
+/// `color_key_mask` の浮動片ローカル版(貼り付け直後の `Floating::mask` /
+/// `pixels` 用。`mask.len() == pixels.len() / 4` 前提だが、食い違っても
+/// パニックしない)。
+pub fn color_key_buffer(mask: &mut [u8], pixels: &[u8], key: [u8; 3]) {
+    for (i, slot) in mask.iter_mut().enumerate() {
+        if *slot == 0 {
+            continue;
+        }
+        let idx = i * 4;
+        let Some(px) = pixels.get(idx..idx + 3) else {
+            continue;
+        };
+        if px == key {
+            *slot = 0;
+        }
+    }
+}
+
 /// v8 §37: 選択マスクの補集合(ドキュメント範囲内)。`width`×`height` の
 /// 全画素のうち `mask` で選択されていない画素だけを選択した新しいマスクを
 /// 返す。結果の bbox は非ゼロ画素を含む最小矩形へ詰める(`tighten_mask`) —
@@ -1420,6 +1467,46 @@ mod tests {
         assert!(ellipse_mask_clipped(outside, doc_rect).is_empty());
         let poly = [pos2(10.0, 10.0), pos2(20.0, 10.0), pos2(15.0, 20.0)];
         assert!(polygon_mask_clipped(&poly, doc_rect).is_empty());
+    }
+
+    // -- v10 §46: 透明な選択(color_key_mask / color_key_buffer) --------------
+
+    #[test]
+    fn color_key_mask_removes_only_matching_pixels() {
+        let mut doc = Document::new(2, 1, Background::White);
+        doc.set_pixel(1, 0, [255, 0, 0, 255]);
+        let mut mask = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        });
+        color_key_mask(&mut mask, &doc, [255, 255, 255]);
+        assert_eq!(mask.mask, vec![0, 255], "白だけが選択から除外される");
+    }
+
+    #[test]
+    fn color_key_mask_compares_rgb_ignoring_alpha() {
+        let mut doc = Document::new(2, 1, Background::Transparent);
+        doc.set_pixel(0, 0, [10, 20, 30, 128]); // 半透明でも RGB 一致なら除外
+        doc.set_pixel(1, 0, [10, 20, 31, 255]);
+        let mut mask = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        });
+        color_key_mask(&mut mask, &doc, [10, 20, 30]);
+        assert_eq!(mask.mask, vec![0, 255]);
+    }
+
+    #[test]
+    fn color_key_buffer_handles_short_pixel_buffers_without_panicking() {
+        let mut mask = vec![255u8, 255, 255];
+        // 画素 2 個ぶんしかない(3 個目は範囲外 → そのまま残る)。
+        let pixels = [9u8, 9, 9, 255, 1, 1, 1, 255];
+        color_key_buffer(&mut mask, &pixels, [9, 9, 9]);
+        assert_eq!(mask, vec![0, 255, 255]);
     }
 
     // -- v8 §37: 選択範囲を反転(invert_mask / tighten_mask) -----------------

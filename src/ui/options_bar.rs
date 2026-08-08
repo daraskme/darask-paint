@@ -51,6 +51,9 @@ pub struct OptionsBarCtx<'a> {
     pub lasso_mode: LassoMode,
     /// v4 §22: 自動選択の許容値(0–255、塗りつぶしと同じ意味)。
     pub magic_wand_tolerance: &'a mut u8,
+    /// v10 §46: 「透明な選択」(選択系・移動ツールのチェックボックス。
+    /// ON のとき浮動化・貼り付けでセカンダリ色の画素を選択から除外する)。
+    pub transparent_selection: &'a mut bool,
 }
 
 pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
@@ -68,6 +71,7 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
         text_font_size,
         lasso_mode,
         magic_wand_tolerance,
+        transparent_selection,
     } = state;
 
     egui::Panel::top("options_bar")
@@ -92,6 +96,7 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
                     text_font_size,
                     lasso_mode,
                     magic_wand_tolerance,
+                    transparent_selection,
                 );
             });
         });
@@ -113,6 +118,7 @@ fn show_tool_specific(
     text_font_size: &mut f32,
     lasso_mode: LassoMode,
     magic_wand_tolerance: &mut u8,
+    transparent_selection: &mut bool,
 ) {
     match tool {
         ToolKind::Pen | ToolKind::Eraser => {
@@ -178,6 +184,8 @@ fn show_tool_specific(
         // エラーにもテスト失敗にもならず取り残される)。
         ToolKind::Lasso => {
             ui.label(lasso_mode_label(lasso_mode));
+            ui.separator();
+            transparent_selection_checkbox(ui, transparent_selection);
         }
         // v4 §22: 自動選択は塗りつぶしと同じ許容値スライダー。
         ToolKind::MagicWand => {
@@ -186,17 +194,24 @@ fn show_tool_specific(
             if ui.add(egui::Slider::new(&mut tol, 0..=255)).changed() {
                 *magic_wand_tolerance = tol.clamp(0, 255) as u8;
             }
+            ui.separator();
+            transparent_selection_checkbox(ui, transparent_selection);
         }
-        ToolKind::Line
-        | ToolKind::Picker
-        | ToolKind::Select
-        | ToolKind::EllipseSelect
-        | ToolKind::Pan
-        | ToolKind::Move
-        | ToolKind::Zoom => {
+        // v10 §46: 選択系・移動ツールは「透明な選択」トグルを持つ。
+        ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move => {
+            transparent_selection_checkbox(ui, transparent_selection);
+        }
+        ToolKind::Line | ToolKind::Picker | ToolKind::Pan | ToolKind::Zoom => {
             ui.weak("(ツール固有オプションなし)");
         }
     }
+}
+
+/// v10 §46: 「透明な選択」チェックボックス(MS ペイント準拠 — ON のとき
+/// 浮動化・貼り付けでセカンダリ色と RGB 一致する画素を選択から除外する)。
+fn transparent_selection_checkbox(ui: &mut egui::Ui, value: &mut bool) {
+    ui.checkbox(value, "透明な選択")
+        .on_hover_text("ON: セカンダリ色と一致する画素を持ち上げない(貼り付けにも適用)");
 }
 
 /// なげなわのオプションバー表示文字列(SPEC §22)。ショートカット表記を

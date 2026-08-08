@@ -63,12 +63,19 @@ pub enum HistoryOp {
         regions: Vec<PatchRegion>,
     },
     /// 新規の空(透明)レイヤー追加(`layer_add`)。undo=`index` の削除、
-    /// redo=`name` から空レイヤーを再構築(常に透明なので画素データは持たない)。
+    /// redo=`name`/`visible`/`opacity` から空レイヤーを再構築(常に透明なので
+    /// 画素データは持たない)。
+    ///
+    /// v10 §47(`.dpaint` v2): `visible`/`opacity` を追加した。undo 時に
+    /// `refresh_op_for_redo` が現在値へ刷新するため、追加後に変更した
+    /// 表示・不透明度・名前が redo で失われない(SPEC §40-7 の残課題解消)。
     AddLayer {
         index: usize,
         name: String,
         /// 追加前にアクティブだったレイヤー添字(undo で復元する)。
         before_active: usize,
+        visible: bool,
+        opacity: u8,
     },
     /// アクティブレイヤーの複製(`layer_duplicate`)。undo=`index` の削除、
     /// redo=保持している `layer`(複製結果そのもの)を再挿入する。
@@ -90,12 +97,22 @@ pub enum HistoryOp {
     /// 下と結合(`layer_merge_down`)。undo=結合前の 2 レイヤーへ復元、
     /// redo=`lower_before`/`upper` から結合結果を再計算する(結合結果自体は
     /// 保持せず、必要になったときに再合成することでメモリを節約する)。
+    ///
+    /// v10 §47(`.dpaint` v2): 結合結果レイヤーのメタデータ
+    /// (`merged_name`/`merged_visible`/`merged_opacity`)を追加した。
+    /// `lower_before` は「undo が復元すべき結合前の下レイヤー」そのもので
+    /// あり redo 用に刷新できない(SPEC §40-7 が残課題とした理由)ため、
+    /// redo 用のメタは独立フィールドに持ち、undo 時に `refresh_op_for_redo`
+    /// が現在値へ刷新する。
     MergeDown {
         /// 結合前のアクティブ(上)レイヤーの添字。結合後の下レイヤーは
         /// `index - 1`。
         index: usize,
         upper: Layer,
         lower_before: Layer,
+        merged_name: String,
+        merged_visible: bool,
+        merged_opacity: u8,
     },
     /// サイズ・レイヤー構成が丸ごと変わりうる操作(resize/crop/rotate/
     /// canvas resize/貼り付けによるドキュメント全体置き換え/画像の統合等)。
@@ -128,8 +145,9 @@ impl HistoryOp {
             HistoryOp::MergeDown {
                 upper,
                 lower_before,
+                merged_name,
                 ..
-            } => upper.pixels.len() + lower_before.pixels.len(),
+            } => upper.pixels.len() + lower_before.pixels.len() + merged_name.len(),
             HistoryOp::ReplaceAll { before, after } => {
                 snapshot_bytes(before) + snapshot_bytes(after)
             }
@@ -637,25 +655,31 @@ impl History {
     /// そのまま復元するようにする(`.dpaint` へ保存される redo 側 op も刷新後の
     /// 値になる、SPEC §36 の全履歴保存とも整合)。
     ///
-    /// - `AddLayer`: `name` だけを刷新する(表示・不透明度のフィールドを
-    ///   持たないため、追加後に変更した表示/不透明度は redo で既定値に戻る
-    ///   — 既知の残課題。フィールド追加は `.dpaint` v1 の符号化変更を伴う
-    ///   ため見送り、`project.rs` の互換性を優先した)。
+    /// - `AddLayer`: 名前・表示・不透明度を刷新する(v10 §47 でフィールドを
+    ///   追加し、`.dpaint` v2 として保存されるようになった)。
     /// - `DuplicateLayer`: 保持レイヤーを丸ごと刷新する(画素は「複製 op の
     ///   undo 時点 = 後続 Patch がすべて undo 済み」の不変条件により複製時と
     ///   一致するので、メタデータ刷新と同時に写しても状態は変わらない)。
     /// - `MergeDown`: `lower_before` は「undo が復元すべき結合前の下レイヤー」
-    ///   そのものなので刷新できない(redo 用と undo 用を兼ねる)。結合後の
-    ///   メタデータ変更は redo で既定値に戻る — `AddLayer` と同じ残課題。
+    ///   そのものなので刷新できず、redo 用の結合結果メタは独立フィールド
+    ///   (`merged_*`、v10 §47)を刷新する。
     fn refresh_op_for_redo(&mut self, doc: &Document, op: &mut HistoryOp) {
         match op {
-            HistoryOp::AddLayer { index, name, .. } => {
+            HistoryOp::AddLayer {
+                index,
+                name,
+                visible,
+                opacity,
+                ..
+            } => {
                 if let Some(layer) = doc.layers.get(*index) {
                     self.bytes_used = self
                         .bytes_used
                         .saturating_sub(name.len())
                         .saturating_add(layer.name.len());
                     name.clone_from(&layer.name);
+                    *visible = layer.visible;
+                    *opacity = layer.opacity;
                 }
             }
             HistoryOp::DuplicateLayer { index, layer, .. } => {
@@ -664,6 +688,25 @@ impl History {
                     // その undo の間に寸法が変わる操作(`ReplaceAll`)は先に undo
                     // されるため長さは一致し、会計の補正は不要。
                     layer.clone_from(current);
+                }
+            }
+            HistoryOp::MergeDown {
+                index,
+                merged_name,
+                merged_visible,
+                merged_opacity,
+                ..
+            } => {
+                // undo で分割される直前の「結合結果レイヤー」(index-1)の
+                // 現在メタを redo 用に控える。
+                if let Some(merged) = doc.layers.get(index.saturating_sub(1)) {
+                    self.bytes_used = self
+                        .bytes_used
+                        .saturating_sub(merged_name.len())
+                        .saturating_add(merged.name.len());
+                    merged_name.clone_from(&merged.name);
+                    *merged_visible = merged.visible;
+                    *merged_opacity = merged.opacity;
                 }
             }
             _ => {}
@@ -800,6 +843,7 @@ fn apply_before(doc: &mut Document, op: &HistoryOp) {
             index,
             upper,
             lower_before,
+            ..
         } => {
             // 結合の undo=結合前の 2 レイヤー(下は元の状態、上を再挿入)へ戻す。
             let lower_idx = index.saturating_sub(1);
@@ -829,15 +873,23 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
                 doc.mark_dirty(region.rect);
             }
         }
-        HistoryOp::AddLayer { index, name, .. } => {
+        HistoryOp::AddLayer {
+            index,
+            name,
+            visible,
+            opacity,
+            ..
+        } => {
             let (width, height) = (doc.width, doc.height);
             let idx = (*index).min(doc.layers.len());
             doc.layers.insert(
                 idx,
                 Layer {
                     name: name.clone(),
-                    visible: true,
-                    opacity: 255,
+                    // v10 §47: 追加後に変更されたメタも redo で復元する
+                    // (`refresh_op_for_redo` が undo 時に刷新した値)。
+                    visible: *visible,
+                    opacity: *opacity,
                     pixels: vec![0u8; width as usize * height as usize * 4],
                 },
             );
@@ -866,17 +918,23 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             index,
             upper,
             lower_before,
+            merged_name,
+            merged_visible,
+            merged_opacity,
         } => {
             // 結合の redo=保持している 2 レイヤーから結合結果を再計算する
-            // (結合済みの画素そのものは保持しない、メモリ節約)。
+            // (結合済みの画素そのものは保持しない、メモリ節約)。メタは
+            // v10 §47 の `merged_*`(結合直後は `Document::merge_active_down`
+            // が作る値と同一。結合後にユーザーが変更していれば
+            // `refresh_op_for_redo` が undo 時に刷新した値)。
             let lower_idx = index.saturating_sub(1);
             let (width, height) = (doc.width, doc.height);
             if lower_idx < doc.layers.len() {
                 let merged = composite_two(lower_before, upper, width, height);
                 doc.layers[lower_idx] = Layer {
-                    name: lower_before.name.clone(),
-                    visible: true,
-                    opacity: 255,
+                    name: merged_name.clone(),
+                    visible: *merged_visible,
+                    opacity: *merged_opacity,
                     pixels: merged,
                 };
             }
@@ -1031,6 +1089,8 @@ mod tests {
                 index: 1,
                 name: "レイヤー 1".to_owned(),
                 before_active: 0,
+                visible: true,
+                opacity: 255,
             },
             "レイヤーを追加",
         );
@@ -1091,6 +1151,8 @@ mod tests {
                 index: 1,
                 name: "A".to_owned(),
                 before_active: 0,
+                visible: true,
+                opacity: 255,
             },
             "レイヤーを追加",
         );
@@ -1711,6 +1773,8 @@ mod tests {
                 index,
                 name: "レイヤー 1".to_owned(),
                 before_active,
+                visible: true,
+                opacity: 255,
             },
             "レイヤーを追加",
         );
@@ -1838,6 +1902,9 @@ mod tests {
                 index: 1,
                 upper,
                 lower_before: lower_before.clone(),
+                merged_name: "背景".to_owned(),
+                merged_visible: true,
+                merged_opacity: 255,
             },
             "レイヤーの結合",
         );

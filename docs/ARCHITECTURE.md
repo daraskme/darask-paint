@@ -802,7 +802,13 @@ SPEC.md「v9 拡張仕様」(§41〜§45)に対応。
 - 新規 `ui/theme.rs`: `apply(ctx)` を `DaraskApp::new` で 1 回。egui 0.35 の `set_theme(Theme::Dark)` + `style_mut_of(Theme::Dark, ..)` でダーク固定・カスタム `Visuals`(背景 3 階調 + 単一アクセント + 角丸 4px)。ツールバー/メニューの自前タイルは `visuals.widgets`/`selection` を読むため自動追随。キャンバス作業領域色は `theme::CANVAS_WORKSPACE_FILL` 定数を `CentralPanel` が参照。
 - 階調の暗→明の順序とテキストコントラストをユニットテストで固定(リグレッション検知)。
 
-## 21.5 v9 の落とし穴
+## 21.5 v10 設計(SPEC §46〜§47)
+
+- **透明な選択**(§46): 純関数 `select::color_key_mask(&mut SelMask, &Document, [u8;3])`(浮動化用 — アクティブレイヤーの画素で判定)と `color_key_buffer(&mut [u8], &[u8], [u8;3])`(貼り付け直後の `Floating::mask` 用)。適用点は `begin_floating_from_selection`(extract/clear の**前**にマスクを削る — 除外画素は持ち上げも透明化もされず、キャンセル/確定/undo の全経路が既存マスク機構のまま整合する)と `begin_paste_floating`(配置直後にマスクを削る。`place_new_floating` のもう 1 つの呼び出し元=テキスト確定には適用しない)。状態は `DaraskApp::transparent_selection: bool`(既定 OFF・非永続)。
+- **`.dpaint` v2**(§47): `HistoryOp::AddLayer` に `visible`/`opacity`、`MergeDown` に `merged_name`/`merged_visible`/`merged_opacity` を追加。`refresh_op_for_redo` が undo 時に全メタを刷新し、`apply_after` はハードコードではなく op のメタで再構築する。project.rs は `parse_chunks` が version(1..=2)を返し、`decode_op` が分岐(v1 は旧既定で補い、導出 clone を復元メモリ会計へ手動算入 — loader の budget 等値検査と対称にする)。writer は常に v2。テスト専用 `encode_project_with_version` が v1 バイト列を生成し後方互換を実バイトで担保する。
+- v10 の落とし穴: (1) v1 互換読込で導出した `merged_name` clone の budget 算入を忘れると「復元メモリ会計が一致しません」で全 v1 ファイルが開けなくなる。(2) `refresh_op_for_redo` の `bytes_used` 補正は名前長の変わるフィールド(`name`/`merged_name`)にだけ必要。(3) 透明な選択の除外で全画素が消えたマスク(全部セカンダリ色)も既存機構で安全(合成・復元とも no-op)— 特別扱いを足さない。
+
+## 21.6 v9 の落とし穴
 
 1. 保存マーカーの無効化条件は「保存位置より**手前**での push」だけ。位置以深の push で無効化すると「保存→続けて描く→全部 undo」で未保存表示が消えなくなる(過剰無効化)。逆に無効化を忘れると偽の「保存済み」で閉じてデータを失う(過小無効化)— 双方向のテストを維持する。
 2. 浮動片変換後は必ず `reset_resample_source()` + 新 id。忘れると次の拡縮が変換**前**の画素から再サンプリングされ、変換が巻き戻って見える。

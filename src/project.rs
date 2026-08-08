@@ -15,7 +15,10 @@ use crate::document::{DocSnapshot, Document, IRect, Layer, MAX_LAYERS};
 use crate::history::{History, HistoryEntry, HistoryOp, PatchRegion};
 
 const MAGIC: &[u8; 8] = b"DPAINT\x1a\0";
-const VERSION: u16 = 1;
+/// v10 §47: v2 = AddLayer に visible/opacity、MergeDown に結合結果メタ
+/// (`merged_*`)を追加した符号化。読み込みは v1(v0.7〜v0.9)も受け付ける
+/// (`parse_chunks`/`decode_op` の分岐参照)。
+const VERSION: u16 = 2;
 const ENDIAN_LITTLE: u8 = 1;
 const HEADER_SIZE: u8 = 16;
 const TILE_SIZE: u32 = 256;
@@ -457,6 +460,7 @@ fn encode_op(
     width: u32,
     height: u32,
     tiles: &mut TileStore,
+    version: u16,
 ) -> Result<(), String> {
     match op {
         HistoryOp::Patch { layer, regions } => {
@@ -481,14 +485,22 @@ fn encode_op(
             index,
             name,
             before_active,
+            visible,
+            opacity,
         } => {
-            let encoded_len = 12usize
+            let encoded_len = 14usize
                 .checked_add(name.len())
                 .ok_or_else(|| "レイヤー追加情報が大きすぎます".to_owned())?;
             try_reserve_exact(out, encoded_len, "レイヤー追加情報")?;
             put_len(out, *index, "レイヤー番号")?;
             put_len(out, *before_active, "レイヤー番号")?;
             put_string(out, name)?;
+            // v10 §47(v2): 追加レイヤーの表示/不透明度。v1 で書く場合
+            // (テストの互換検証用のみ)は省略する。
+            if version >= 2 {
+                put_u8(out, u8::from(*visible));
+                put_u8(out, *opacity);
+            }
         }
         HistoryOp::DuplicateLayer {
             index,
@@ -514,9 +526,18 @@ fn encode_op(
             index,
             upper,
             lower_before,
+            merged_name,
+            merged_visible,
+            merged_opacity,
         } => {
-            try_reserve_exact(out, 4, "レイヤー結合情報")?;
+            try_reserve_exact(out, 6, "レイヤー結合情報")?;
             put_len(out, *index, "レイヤー番号")?;
+            // v10 §47(v2): 結合結果レイヤーのメタを upper/lower の前に置く。
+            if version >= 2 {
+                put_string(out, merged_name)?;
+                put_u8(out, u8::from(*merged_visible));
+                put_u8(out, *merged_opacity);
+            }
             encode_layer(out, upper, width, height, tiles)?;
             encode_layer(out, lower_before, width, height, tiles)?;
         }
@@ -535,6 +556,7 @@ fn encode_entry(
     width: u32,
     height: u32,
     tiles: &mut TileStore,
+    version: u16,
 ) -> Result<(), String> {
     let revision = u64::try_from(sequence.saturating_add(1))
         .map_err(|_| "履歴番号が大きすぎます".to_owned())?;
@@ -554,7 +576,7 @@ fn encode_entry(
     put_u32(out, width);
     put_u32(out, height);
     put_string(out, &entry.label)?;
-    encode_op(out, &entry.op, width, height, tiles)
+    encode_op(out, &entry.op, width, height, tiles, version)
 }
 
 /// v8 レビュー修正③以降、メモリ組み立ては `encode_project`(テスト専用)しか
@@ -649,10 +671,14 @@ fn loaded_project_memory_bytes(
             HistoryOp::MergeDown {
                 upper,
                 lower_before,
+                merged_name,
                 ..
             } => {
                 budget_layer_heap(&mut budget, upper)?;
                 budget_layer_heap(&mut budget, lower_before)?;
+                // v10 §47: 結合結果メタの名前(v2 はファイルから読み、v1 は
+                // 導出 clone を decode 側が手動算入する — どちらも常駐する)。
+                budget.add_heap_buffer(merged_name.len())?;
             }
             HistoryOp::ReplaceAll { before, after } => {
                 budget_snapshot_allocations(&mut budget, before)?;
@@ -676,7 +702,11 @@ struct EncodedPayloads {
     predicted_len: usize,
 }
 
-fn encode_project_payloads(doc: &Document, history: &History) -> Result<EncodedPayloads, String> {
+fn encode_project_payloads(
+    doc: &Document,
+    history: &History,
+    version: u16,
+) -> Result<EncodedPayloads, String> {
     let (undo, redo) = history.project_entries();
     let display_step_limit = history.display_step_limit();
     if !(1..=MAX_DISPLAY_STEPS).contains(&display_step_limit) {
@@ -712,6 +742,7 @@ fn encode_project_payloads(doc: &Document, history: &History) -> Result<EncodedP
             dimensions.0,
             dimensions.1,
             &mut tiles,
+            version,
         )?;
         if let HistoryOp::ReplaceAll { after, .. } = &entry.op {
             dimensions = (after.width, after.height);
@@ -775,11 +806,23 @@ fn encode_project_payloads(doc: &Document, history: &History) -> Result<EncodedP
 /// `streamed_save_matches_in_memory_encoding` が担保する)。
 #[cfg(test)]
 fn encode_project(doc: &Document, history: &History) -> Result<Vec<u8>, String> {
-    let payloads = encode_project_payloads(doc, history)?;
+    encode_project_with_version(doc, history, VERSION)
+}
+
+/// v10 §47: 旧バージョンのファイルを生成できるテスト専用エンコーダ
+/// (後方互換の検証 — v0.7〜v0.9 が書いた v1 ファイルを現行 loader が
+/// 読めることを、実際の v1 バイト列で担保する)。
+#[cfg(test)]
+fn encode_project_with_version(
+    doc: &Document,
+    history: &History,
+    version: u16,
+) -> Result<Vec<u8>, String> {
+    let payloads = encode_project_payloads(doc, history, version)?;
     let mut out = Vec::new();
     try_reserve_exact(&mut out, payloads.predicted_len, "プロジェクトファイル")?;
     out.extend_from_slice(MAGIC);
-    put_u16(&mut out, VERSION);
+    put_u16(&mut out, version);
     put_u8(&mut out, ENDIAN_LITTLE);
     put_u8(&mut out, HEADER_SIZE);
     put_u32(&mut out, 0);
@@ -797,6 +840,9 @@ fn encode_project(doc: &Document, history: &History) -> Result<Vec<u8>, String> 
 }
 
 struct ChunkSet<'a> {
+    /// v10 §47: ヘッダのバージョン(1 または 2)。REVS chunk 内の一部 op の
+    /// 符号化(AddLayer/MergeDown のメタフィールド)がこれで分岐する。
+    version: u16,
     meta: &'a [u8],
     tiles: &'a [u8],
     document: &'a [u8],
@@ -811,7 +857,10 @@ fn parse_chunks(bytes: &[u8]) -> Result<ChunkSet<'_>, String> {
     if reader.take(MAGIC.len())? != MAGIC {
         return Err("Darask Paint プロジェクトではありません".to_owned());
     }
-    if reader.u16()? != VERSION {
+    // v10 §47: v1(v0.7〜v0.9 が書いた形式)と v2(現行)を受け付ける。
+    // 書き込みは常に v2(`VERSION`)。
+    let version = reader.u16()?;
+    if !(1..=VERSION).contains(&version) {
         return Err("未対応の .dpaint バージョンです".to_owned());
     }
     if reader.u8()? != ENDIAN_LITTLE {
@@ -857,6 +906,7 @@ fn parse_chunks(bytes: &[u8]) -> Result<ChunkSet<'_>, String> {
         }
     }
     Ok(ChunkSet {
+        version,
         meta: meta.ok_or_else(|| "META chunkがありません".to_owned())?,
         tiles: tiles.ok_or_else(|| "TILS chunkがありません".to_owned())?,
         document: document.ok_or_else(|| "DOCS chunkがありません".to_owned())?,
@@ -1041,9 +1091,20 @@ fn decode_index(reader: &mut Reader<'_>) -> Result<usize, String> {
     Ok(reader.u32()? as usize)
 }
 
+/// v10 §47: `version >= 2` のとき 0/1 のフラグバイトを読む(それ以外の値は
+/// 不正入力として拒否)。
+fn decode_bool(reader: &mut Reader<'_>) -> Result<bool, String> {
+    match reader.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err("真偽フラグが不正です".to_owned()),
+    }
+}
+
 fn decode_op(
     reader: &mut Reader<'_>,
     kind: u8,
+    version: u16,
     dimensions: (u32, u32),
     tiles: &[&[u8]],
     budget: &mut ProjectMemoryBudget,
@@ -1125,11 +1186,25 @@ fn decode_op(
             }
             Ok(HistoryOp::Patch { layer, regions })
         }
-        2 => Ok(HistoryOp::AddLayer {
-            index: decode_index(reader)?,
-            before_active: decode_index(reader)?,
-            name: reader.string(budget)?,
-        }),
+        2 => {
+            let index = decode_index(reader)?;
+            let before_active = decode_index(reader)?;
+            let name = reader.string(budget)?;
+            // v10 §47: v2 は追加レイヤーの表示/不透明度を持つ。v1 は生成時の
+            // 既定(`Document::add_layer` と同じ)で補う。
+            let (visible, opacity) = if version >= 2 {
+                (decode_bool(reader)?, reader.u8()?)
+            } else {
+                (true, 255)
+            };
+            Ok(HistoryOp::AddLayer {
+                index,
+                before_active,
+                name,
+                visible,
+                opacity,
+            })
+        }
         3 | 4 => {
             let index = decode_index(reader)?;
             let before_active = decode_index(reader)?;
@@ -1157,6 +1232,16 @@ fn decode_op(
         }),
         6 => {
             let index = decode_index(reader)?;
+            // v10 §47: v2 は結合結果レイヤーのメタ(名前/表示/不透明度)を
+            // upper/lower の前に持つ。
+            let v2_meta = if version >= 2 {
+                let merged_name = reader.string(budget)?;
+                let merged_visible = decode_bool(reader)?;
+                let merged_opacity = reader.u8()?;
+                Some((merged_name, merged_visible, merged_opacity))
+            } else {
+                None
+            };
             let (upper, upper_width, upper_height) = decode_layer(reader, tiles, budget)?;
             let (lower_before, lower_width, lower_height) = decode_layer(reader, tiles, budget)?;
             if (upper_width, upper_height) != dimensions
@@ -1164,10 +1249,26 @@ fn decode_op(
             {
                 return Err("結合履歴のレイヤー寸法が一致しません".to_owned());
             }
+            let (merged_name, merged_visible, merged_opacity) = match v2_meta {
+                Some(meta) => meta,
+                None => {
+                    // v1 互換: 旧 redo 実装(`apply_after` の旧ハードコード)と
+                    // 同じ「下レイヤーの名前・表示 ON・不透明度 255」を導出
+                    // する。導出した clone はファイルから読んだ文字列ではない
+                    // ため、復元メモリ会計へ手動で算入する
+                    // (`loaded_project_memory_bytes` 側と対称)。
+                    let derived = lower_before.name.clone();
+                    budget.add_heap_buffer(derived.len())?;
+                    (derived, true, 255)
+                }
+            };
             Ok(HistoryOp::MergeDown {
                 index,
                 upper,
                 lower_before,
+                merged_name,
+                merged_visible,
+                merged_opacity,
             })
         }
         7 => Ok(HistoryOp::ReplaceAll {
@@ -1412,6 +1513,7 @@ fn validate_revision_states(
 
 fn decode_revisions(
     bytes: &[u8],
+    version: u16,
     meta: &Meta,
     current: RevisionState,
     tiles: &[&[u8]],
@@ -1460,7 +1562,7 @@ fn decode_revisions(
             return Err("リビジョングラフが不正です".to_owned());
         }
         let label = reader.string(budget)?;
-        let op = decode_op(&mut reader, kind, (width, height), tiles, budget)?;
+        let op = decode_op(&mut reader, kind, version, (width, height), tiles, budget)?;
         revisions.push(DecodedRevision {
             entry: HistoryEntry { op, label },
             dimensions: (width, height),
@@ -1496,7 +1598,14 @@ fn decode_project(bytes: &[u8], path: Option<PathBuf>) -> Result<(Document, Hist
     // `Document::try_from_snapshot_owned` が作る合成画像バッファも予算へ含める。
     budget.add_heap_buffer(pixel_len(snapshot.width, snapshot.height)?)?;
     let current = RevisionState::from_snapshot(&snapshot);
-    let (undo, redo) = decode_revisions(chunks.revisions, &meta, current, &tiles, &mut budget)?;
+    let (undo, redo) = decode_revisions(
+        chunks.revisions,
+        chunks.version,
+        &meta,
+        current,
+        &tiles,
+        &mut budget,
+    )?;
     budget.add_vec::<&Layer>(snapshot.layers.len())?;
     let doc = Document::try_from_snapshot_owned(snapshot, path, false)?;
     let history = History::from_project_entries(undo, redo, meta.display_step_limit);
@@ -1625,7 +1734,7 @@ fn write_chunk_to(writer: &mut impl Write, tag: [u8; 4], payload: &[u8]) -> Resu
 /// 書き出した合計長は `encode_project`(メモリ版)と同じ予測全長と一致する
 /// ことを検査する(両者のバイト同一性はテストで担保)。
 pub fn save(doc: &Document, history: &History, path: &Path) -> Result<(), String> {
-    let payloads = encode_project_payloads(doc, history)?;
+    let payloads = encode_project_payloads(doc, history, VERSION)?;
     if payloads.predicted_len as u64 > MAX_FILE_BYTES {
         return Err("プロジェクトファイルが安全上限を超えています".to_owned());
     }
@@ -1742,6 +1851,165 @@ mod tests {
         assert_snapshot_eq(&loaded.snapshot(), &before);
         assert!(loaded_history.redo(&mut loaded));
         assert_snapshot_eq(&loaded.snapshot(), &after);
+    }
+
+    // -- v10 §47: `.dpaint` v2(レイヤーメタの完全復元)と v1 後方互換 --------
+
+    /// 追加→リネーム/非表示/不透明度変更→undo(op 刷新)→保存→読込→redo で
+    /// メタが完全復元されること(v2 の本題)。
+    #[test]
+    fn v2_round_trip_preserves_meta_edits_across_save_and_redo() {
+        let mut doc = Document::new(2, 2, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("レイヤー 1".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "レイヤー 1".to_owned(),
+                before_active: 0,
+                visible: true,
+                opacity: 255,
+            },
+            "レイヤーを追加",
+        );
+        // 追加後のメタ変更(履歴に積まれない、SPEC §13)。
+        doc.layers[1].name = "夜空".to_owned();
+        doc.layers[1].visible = false;
+        doc.layers[1].opacity = 96;
+        // undo で op が現在メタへ刷新され、redo 側スタックに載る。
+        assert!(history.undo(&mut doc));
+
+        let encoded = encode_project(&doc, &history).expect("encode v2");
+        let (mut loaded, mut loaded_history) = decode_project(&encoded, None).expect("decode v2");
+        assert!(loaded_history.redo(&mut loaded), "redo the AddLayer");
+        let layer = &loaded.layers[1];
+        assert_eq!(layer.name, "夜空");
+        assert!(!layer.visible);
+        assert_eq!(layer.opacity, 96);
+    }
+
+    /// 結合→結合結果のメタ変更→undo(刷新)→保存→読込→redo(v2 の
+    /// MergeDown 版)。
+    #[test]
+    fn v2_round_trip_preserves_merged_layer_meta() {
+        let mut doc = Document::new(2, 2, Background::White);
+        doc.layers
+            .push(Layer::filled("上", 2, 2, [10, 20, 30, 255]));
+        doc.active = 1;
+        let upper = doc.layers[1].clone();
+        let lower_before = doc.layers[0].clone();
+        let mut history = History::new();
+        assert!(doc.merge_active_down());
+        history.push(
+            HistoryOp::MergeDown {
+                index: 1,
+                upper,
+                lower_before,
+                merged_name: doc.layers[0].name.clone(),
+                merged_visible: doc.layers[0].visible,
+                merged_opacity: doc.layers[0].opacity,
+            },
+            "レイヤーの結合",
+        );
+        // 結合後のメタ変更。
+        doc.layers[0].name = "統合済み".to_owned();
+        doc.layers[0].opacity = 128;
+        assert!(history.undo(&mut doc));
+
+        let encoded = encode_project(&doc, &history).expect("encode v2");
+        let (mut loaded, mut loaded_history) = decode_project(&encoded, None).expect("decode v2");
+        assert!(loaded_history.redo(&mut loaded), "redo the MergeDown");
+        assert_eq!(loaded.layers[0].name, "統合済み");
+        assert_eq!(loaded.layers[0].opacity, 128);
+    }
+
+    /// v0.7〜v0.9 が書いた v1 ファイル(旧符号化そのもの)を現行 loader が
+    /// 読めること。AddLayer/MergeDown のメタは旧実装と同じ既定へ補われる。
+    #[test]
+    fn v1_files_still_load_with_default_meta() {
+        let mut doc = Document::new(2, 2, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("レイヤー 1".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "レイヤー 1".to_owned(),
+                before_active: 0,
+                visible: true,
+                opacity: 255,
+            },
+            "レイヤーを追加",
+        );
+        let upper = doc.layers[1].clone();
+        let lower_before = doc.layers[0].clone();
+        assert!(doc.merge_active_down());
+        history.push(
+            HistoryOp::MergeDown {
+                index: 1,
+                upper,
+                lower_before,
+                merged_name: doc.layers[0].name.clone(),
+                merged_visible: true,
+                merged_opacity: 255,
+            },
+            "レイヤーの結合",
+        );
+
+        let encoded_v1 =
+            encode_project_with_version(&doc, &history, 1).expect("encode as legacy v1");
+        // v1 ヘッダであること(バイトレベルの確認)。
+        assert_eq!(&encoded_v1[8..10], &1u16.to_le_bytes());
+
+        let (mut loaded, mut loaded_history) =
+            decode_project(&encoded_v1, None).expect("current loader must accept v1");
+        // undo 2 回 → redo 2 回が旧来どおり往復する。
+        assert!(loaded_history.undo(&mut loaded));
+        assert!(loaded_history.undo(&mut loaded));
+        assert_eq!(loaded.layers.len(), 1);
+        assert!(loaded_history.redo(&mut loaded));
+        assert!(loaded_history.redo(&mut loaded));
+        assert_eq!(loaded.layers.len(), 1, "結合まで再適用");
+        assert_eq!(loaded.layers[0].name, "背景", "v1 既定=下レイヤー名");
+    }
+
+    #[test]
+    fn decoding_rejects_an_invalid_bool_flag_in_v2() {
+        let mut doc = Document::new(2, 2, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("追加".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "追加".to_owned(),
+                before_active: 0,
+                visible: true,
+                opacity: 255,
+            },
+            "追加",
+        );
+        let encoded = encode_project(&doc, &history).expect("encode");
+        // REVS payload 内の visible フラグ(name の直後)を 2 に書き換え、
+        // chunk を再構成する(CRC も引き直す)。
+        let chunks = parse_chunks(&encoded).expect("parse");
+        let mut revisions = chunks.revisions.to_vec();
+        let needle = "追加".as_bytes();
+        // 2 回目の出現が op 内の name(1 回目はラベル)。その直後が visible。
+        let first = revisions
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("label occurrence");
+        let second_rel = revisions[first + needle.len()..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("op name occurrence");
+        let flag_at = first + needle.len() + second_rel + needle.len();
+        assert_eq!(revisions[flag_at], 1, "visible=true の位置を特定できた");
+        revisions[flag_at] = 2;
+        let rebuilt = rebuild_with_revisions(&encoded, &revisions);
+        let Err(error) = decode_project(&rebuilt, None) else {
+            panic!("visible=2 は拒否されなければならない");
+        };
+        assert!(error.contains("真偽"), "unexpected error: {error}");
     }
 
     // -- v8 レビュー修正③: ストリーム書き出し・Patch 領域検証 ----------------
@@ -1969,6 +2237,8 @@ mod tests {
                 index: 1,
                 name: "追加".to_owned(),
                 before_active: 0,
+                visible: true,
+                opacity: 255,
             },
             "追加",
         );
@@ -2028,8 +2298,9 @@ mod tests {
         let lower_before = doc.layers[0].clone();
         let upper = doc.layers[1].clone();
         let merged = crate::document::composite_two(&lower_before, &upper, 2, 2);
+        let merged_name = lower_before.name.clone();
         doc.layers[0] = Layer {
-            name: lower_before.name.clone(),
+            name: merged_name.clone(),
             visible: true,
             opacity: 255,
             pixels: merged,
@@ -2043,6 +2314,9 @@ mod tests {
                 index: 1,
                 upper,
                 lower_before,
+                merged_name,
+                merged_visible: true,
+                merged_opacity: 255,
             },
             "結合",
         );
@@ -2072,6 +2346,8 @@ mod tests {
                 index: 1,
                 name: "追加".to_owned(),
                 before_active: 0,
+                visible: true,
+                opacity: 255,
             },
             "追加",
         );
@@ -2146,7 +2422,9 @@ mod tests {
         };
         let mut budget =
             ProjectMemoryBudget::with_encoded_len(revision_payload.len()).expect("budget");
-        assert!(decode_revisions(&revision_payload, &meta, current, &[], &mut budget).is_err());
+        assert!(
+            decode_revisions(&revision_payload, VERSION, &meta, current, &[], &mut budget).is_err()
+        );
 
         let mut patch_payload = Vec::new();
         put_u32(&mut patch_payload, 0);
@@ -2154,7 +2432,7 @@ mod tests {
         let mut reader = Reader::new(&patch_payload);
         let mut budget =
             ProjectMemoryBudget::with_encoded_len(patch_payload.len()).expect("budget");
-        assert!(decode_op(&mut reader, 1, (1, 1), &[], &mut budget).is_err());
+        assert!(decode_op(&mut reader, 1, VERSION, (1, 1), &[], &mut budget).is_err());
     }
 
     #[test]

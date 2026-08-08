@@ -603,6 +603,10 @@ pub struct DaraskApp {
     /// v4 §22: 自動選択の許容値(SPEC §22: 「クリック画素から許容値
     /// (0–255、オプションバー)の連結領域」)。
     magic_wand_tolerance: u8,
+    /// v10 §46: 「透明な選択」(MS ペイント準拠、既定 OFF・非永続)。ON の
+    /// とき、浮動化・貼り付けでセカンダリ色(RGB 完全一致)の画素を選択から
+    /// 除外する(`select::color_key_mask` 参照)。
+    transparent_selection: bool,
     primary: Color32,
     secondary: Color32,
     brush_size: f32,
@@ -880,6 +884,8 @@ impl DaraskApp {
             lasso_freehand_points: Vec::new(),
             lasso_polygon: None,
             magic_wand_tolerance: settings.magic_wand_tolerance,
+            // v10 §46: 既定 OFF・非永続(なげなわのモードと同じ扱い)。
+            transparent_selection: false,
             primary: settings.primary,
             secondary: settings.secondary,
             brush_size: startup.brush_size,
@@ -2182,7 +2188,14 @@ impl DaraskApp {
     /// にしておき、確定時(`commit_selection`)に「切り出し元の透明化+合成先」
     /// をまとめて 1 つの `Patch` にする(ARCHITECTURE.md §7)。
     fn begin_floating_from_selection(&mut self, mask: crate::document::SelMask, img: Pos2) {
-        let mask = mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        let mut mask = mask.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        // v10 §46: 「透明な選択」— セカンダリ色の画素は持ち上げない(除外
+        // した画素は切り出し元でも透明化されず、キャンセル復元・確定合成の
+        // 全経路が既存のマスク機構でそのまま整合する)。
+        if self.transparent_selection {
+            let key = [self.secondary.r(), self.secondary.g(), self.secondary.b()];
+            select::color_key_mask(&mut mask, &self.active_tab().doc, key);
+        }
         let rect = mask.bbox;
         if rect.is_empty() {
             self.active_tab_mut().selection = None;
@@ -2704,6 +2717,16 @@ impl DaraskApp {
         let pos = pos2(center.x - w as f32 / 2.0, center.y - h as f32 / 2.0);
         // ARCHITECTURE.md §18.3 の対応表: 「貼り付け」。
         self.place_new_floating(pos, w, h, pixels, "貼り付け");
+        // v10 §46: 「透明な選択」は貼り付けにも効く(MS ペイント準拠)。
+        // テキスト確定の浮動片(`place_new_floating` のもう 1 つの呼び出し元)
+        // には適用しない — 文字の色をセカンダリにしていた場合に文字自体が
+        // 消えてしまうため、貼り付け経路だけで色キーを適用する。
+        if self.transparent_selection {
+            let key = [self.secondary.r(), self.secondary.g(), self.secondary.b()];
+            if let Some(floating) = self.active_tab_mut().floating.as_mut() {
+                select::color_key_buffer(&mut floating.mask, &floating.pixels, key);
+            }
+        }
     }
 
     /// 新規コンテンツ(クリップボード貼り付け・v3 §19 のテキストラスタライズ)
@@ -4393,6 +4416,11 @@ impl DaraskApp {
                     index,
                     name,
                     before_active,
+                    // v10 §47: 生成時の既定(`Document::add_layer` と同じ)。
+                    // 追加後に変更されたら undo 時に刷新される
+                    // (`History::refresh_op_for_redo`)。
+                    visible: true,
+                    opacity: 255,
                 },
                 "レイヤーを追加",
             );
@@ -4467,11 +4495,19 @@ impl DaraskApp {
         let upper = self.active_tab().doc.layers[index].clone();
         let lower_before = self.active_tab().doc.layers[index - 1].clone();
         if self.active_tab_mut().doc.merge_active_down() {
+            // v10 §47: 結合結果レイヤーのメタ(結合直後の実値を読む —
+            // `merge_active_down` の生成規則が変わってもここは追随する)。
+            let merged = &self.active_tab().doc.layers[index - 1];
+            let (merged_name, merged_visible, merged_opacity) =
+                (merged.name.clone(), merged.visible, merged.opacity);
             self.push_layer_history(
                 HistoryOp::MergeDown {
                     index,
                     upper,
                     lower_before,
+                    merged_name,
+                    merged_visible,
+                    merged_opacity,
                 },
                 "レイヤーの結合",
             );
@@ -5123,6 +5159,7 @@ impl eframe::App for DaraskApp {
                     text_font_size: &mut self.text_font_size,
                     lasso_mode: self.lasso_mode,
                     magic_wand_tolerance: &mut self.magic_wand_tolerance,
+                    transparent_selection: &mut self.transparent_selection,
                 },
             );
         }
@@ -5412,6 +5449,7 @@ mod tests {
             lasso_freehand_points: Vec::new(),
             lasso_polygon: None,
             magic_wand_tolerance: 0,
+            transparent_selection: false,
             primary: Color32::BLACK,
             secondary: Color32::WHITE,
             brush_size: settings::DEFAULT_BRUSH_SIZE,
@@ -6284,6 +6322,82 @@ mod tests {
             "外されたタブは「無題N」の採番を受ける"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v10 §46: 透明な選択 --------------------------------------------------
+
+    #[test]
+    fn transparent_selection_excludes_secondary_colored_pixels_when_floating() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Select;
+        app.transparent_selection = true;
+        app.secondary = Color32::WHITE;
+        app.active_tab_mut().doc.set_pixel(1, 1, [255, 0, 0, 255]);
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        })));
+
+        app.free_transform();
+
+        let floating = app.active_tab().floating.as_ref().expect("floats");
+        // 赤 (1,1) = ローカル (1,1) だけが選択され、白は除外される。
+        let idx = 4 + 1; // 幅 4 の (1,1)
+        assert_eq!(floating.mask[idx], 255, "赤は選択");
+        assert_eq!(floating.mask[0], 0, "白は除外");
+        // 除外された画素は切り出し元でも透明化されない(白のまま)。
+        assert_eq!(
+            app.active_tab().doc.get_pixel(0, 0),
+            Some([255, 255, 255, 255]),
+            "白は持ち上げられず残る"
+        );
+        assert_eq!(
+            app.active_tab().doc.get_pixel(1, 1),
+            Some([0, 0, 0, 0]),
+            "赤は持ち上げられて元位置は透明"
+        );
+
+        // Esc キャンセルで完全復元(既存機構がマスク経由でそのまま働く)。
+        app.cancel_floating();
+        assert_eq!(app.active_tab().doc.get_pixel(1, 1), Some([255, 0, 0, 255]));
+        assert!(!app.active_tab().doc.modified);
+    }
+
+    #[test]
+    fn transparent_selection_applies_to_clipboard_paste() {
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.active_tab_mut().doc.modified = true; // 白紙置換パスを避ける
+        app.transparent_selection = true;
+        app.secondary = Color32::WHITE;
+
+        let pixels = vec![
+            255, 255, 255, 255, // 白 → 除外
+            255, 0, 0, 255, // 赤 → 残る
+        ];
+        app.begin_paste_floating(2, 1, pixels);
+        let floating = app.active_tab().floating.as_ref().expect("pasted");
+        assert_eq!(floating.mask, vec![0, 255]);
+    }
+
+    #[test]
+    fn transparent_selection_off_lifts_everything_as_before() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tool = ToolKind::Select;
+        app.secondary = Color32::WHITE;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        })));
+        app.free_transform();
+        let floating = app.active_tab().floating.as_ref().expect("floats");
+        assert!(
+            floating.mask.iter().all(|&m| m == 255),
+            "既定 OFF では全選択"
+        );
     }
 
     // -- v9 §45-3: 画像形式への保存は「書き出し」 -----------------------------
