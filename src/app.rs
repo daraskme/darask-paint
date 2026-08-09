@@ -1476,9 +1476,15 @@ impl DaraskApp {
         if let Some(SelectDrag::ResizeFloating { handle, .. }) = &self.select_drag {
             return select::handle_cursor(*handle);
         }
-        if let Some(hover) = self.active_tab().view.hover_img() {
-            if let Some(handle) = self.hit_resize_handle(hover) {
-                return select::handle_cursor(handle);
+        // v11 §49 の追随修正: プレーン選択のハンドルは移動ツール(と浮動片)
+        // でしか機能しないため、リサイズカーソルもそのときだけ出す。選択系
+        // ツールではどこから掴んでも「選択のやり直し」なので、ハンドル上でも
+        // Default のまま(機能しない操作を予告するカーソルを出さない)。
+        if self.active_tab().floating.is_some() || self.tool == ToolKind::Move {
+            if let Some(hover) = self.active_tab().view.hover_img() {
+                if let Some(handle) = self.hit_resize_handle(hover) {
+                    return select::handle_cursor(handle);
+                }
             }
         }
         egui::CursorIcon::Default
@@ -2593,18 +2599,27 @@ impl DaraskApp {
         };
         if let Some(selection) = self.active_tab_mut().selection.take() {
             let mut mask = selection.mask;
+            // v11 R3 レビュー修正: 端では移動量をクランプする(以前は bbox を
+            // 動かしてから文書境界で切り詰めていたため、端へのナッジで選択が
+            // 不可逆に欠け、1px 幅なら消えてしまった)。選択そのものは一切
+            // 変形せず、動ける余地の分だけ平行移動する(PS と同じ「端で
+            // 止まる」挙動)。
+            // `.min(0)`/`.max(0)` は「選択が万一境界外にあっても clamp の
+            // 上下限が逆転してパニックしない」ための防御(CLAUDE.md 鉄則。
+            // 選択は生成時に文書へクリップ済みなので通常は発動しない)。
+            let dx =
+                (dx as i32).clamp((-mask.bbox.x0).min(0), (width as i32 - mask.bbox.x1).max(0));
+            let dy = (dy as i32).clamp(
+                (-mask.bbox.y0).min(0),
+                (height as i32 - mask.bbox.y1).max(0),
+            );
             mask.bbox = crate::document::IRect {
-                x0: mask.bbox.x0 + dx as i32,
-                y0: mask.bbox.y0 + dy as i32,
-                x1: mask.bbox.x1 + dx as i32,
-                y1: mask.bbox.y1 + dy as i32,
+                x0: mask.bbox.x0 + dx,
+                y0: mask.bbox.y0 + dy,
+                x1: mask.bbox.x1 + dx,
+                y1: mask.bbox.y1 + dy,
             };
-            let mask = mask.clamp_to(width, height);
-            self.active_tab_mut().selection = if mask.is_empty() {
-                None
-            } else {
-                Some(Selection::new(mask))
-            };
+            self.active_tab_mut().selection = Some(Selection::new(mask));
         }
     }
 
@@ -2721,7 +2736,7 @@ impl DaraskApp {
         if self.transparent_selection {
             let key = [self.secondary.r(), self.secondary.g(), self.secondary.b()];
             if let Some(floating) = self.active_tab_mut().floating.as_mut() {
-                select::color_key_buffer(&mut floating.mask, &floating.pixels, key);
+                select::color_key_buffer(&mut floating.mask, &mut floating.pixels, key);
             }
         }
     }
@@ -2857,9 +2872,15 @@ impl DaraskApp {
             self.active_tab()
                 .view
                 .draw_selection_mask_outline(painter, &selection.boundary);
-            self.active_tab()
-                .view
-                .draw_resize_handles(painter, selection.mask.bbox);
+            // v11 §49 の追随修正: プレーン選択のハンドルは、それを実際に
+            // 掴める移動ツールのときだけ描く(選択系ツールではドラッグ=
+            // 選択のやり直しなので、機能しないハンドルを見せない。浮動片の
+            // ハンドルは従来どおり常に上の分岐で描かれる)。
+            if self.tool == ToolKind::Move {
+                self.active_tab()
+                    .view
+                    .draw_resize_handles(painter, selection.mask.bbox);
+            }
         }
     }
 
@@ -3909,6 +3930,15 @@ impl DaraskApp {
             .push(HistoryOp::ReplaceAll { before, after }, label);
         self.active_tab_mut().doc.mark_all_dirty();
         self.active_tab_mut().doc.modified = true;
+        // v11 R3 レビュー修正: `ReplaceAll` を積む操作(反転/回転/サイズ
+        // 変更/キャンバスサイズ/トリミング/統合/白紙置換)は文書の座標系や
+        // 構成を丸ごと変えうる。進行中の多角形なげなわ・自由なげなわの
+        // 軌跡は旧座標のまま残ると、閉じた瞬間に無意味な(または空の)
+        // 選択になるため、ここで一括して中止する(Esc と同じ扱い。
+        // ARCHITECTURE.md §17.3 の「進行中状態を別操作へ持ち越さない」
+        // 規則の適用漏れだった)。
+        self.lasso_polygon = None;
+        self.lasso_freehand_points.clear();
     }
 
     /// v9 §42(MS ペイント準拠): 反転/回転は、浮動片(または選択 — 先に
@@ -6617,6 +6647,61 @@ mod tests {
         app.begin_paste_floating(2, 1, pixels);
         let floating = app.active_tab().floating.as_ref().expect("pasted");
         assert_eq!(floating.mask, vec![0, 255]);
+        // v11 R3: 除外画素は画素自体も透明化される(拡縮でにじみ戻らない)。
+        assert_eq!(&floating.pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&floating.pixels[4..8], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn nudging_a_selection_into_the_edge_stops_without_shrinking_it() {
+        // v11 R3: 端へのナッジは移動量をクランプし、選択は 1px も欠けない
+        // (以前は bbox を動かしてから文書境界で切り詰めていたため不可逆に
+        // 縮み、1px 幅の選択は消えていた)。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 18,
+            y0: 5,
+            x1: 20,
+            y1: 9,
+        })));
+
+        app.nudge_selection(1.0, 0.0); // 右端: 動けない
+        let bbox = app.active_tab().selection.as_ref().map(|s| s.mask.bbox);
+        assert_eq!(
+            bbox.map(|b| (b.x0, b.x1)),
+            Some((18, 20)),
+            "端では止まり、幅 2px のまま"
+        );
+
+        app.nudge_selection(-1.0, 0.0); // 左へは普通に動く
+        let bbox = app.active_tab().selection.as_ref().map(|s| s.mask.bbox);
+        assert_eq!(bbox.map(|b| (b.x0, b.x1)), Some((17, 19)));
+
+        // Shift+右(+10)は残り 1px ぶんだけ動いて端で止まる。
+        app.nudge_selection(10.0, 0.0);
+        let bbox = app.active_tab().selection.as_ref().map(|s| s.mask.bbox);
+        assert_eq!(bbox.map(|b| (b.x0, b.x1)), Some((18, 20)));
+    }
+
+    #[test]
+    fn whole_image_rotation_aborts_an_in_progress_polygon_lasso() {
+        // v11 R3: 進行中の多角形なげなわは、座標系が変わる全画像操作で
+        // 旧座標のまま持ち越さない(Esc と同じ中止扱い)。
+        let mut app = new_for_test(Document::new(100, 20, Background::White));
+        app.tool = ToolKind::Lasso;
+        app.lasso_mode = LassoMode::Polygon;
+        app.lasso_polygon = Some(LassoPolygonState {
+            points: vec![pos2(90.0, 5.0), pos2(95.0, 5.0), pos2(92.0, 15.0)],
+            last_click: None,
+        });
+
+        app.apply_rotate_cw(); // 選択なし → 全画像回転(20x100 になる)
+
+        assert_eq!(app.active_tab().doc.width, 20);
+        assert!(
+            app.lasso_polygon.is_none(),
+            "旧座標の頂点列は中止される(閉じても無意味な選択になるため)"
+        );
     }
 
     #[test]

@@ -305,12 +305,20 @@ pub fn transform_floating(floating: &mut Floating, transform: FloatingTransform)
             };
             // 見た目の中心を維持して幅高を入れ替える(SPEC §16 のハンドル
             // 拡縮と同じ「中心基準」の感覚)。
+            //
+            // v11 R3 レビュー修正: 縦横の偶奇が異なる浮動片では中心維持の
+            // 位置が .5 端数になる。本体は小数位置に描かれる一方、枠・
+            // ハンドル・確定合成は `floating_target_rect` で丸めるため、
+            // 高倍率で 0.5px のずれ+確定時の見た目移動が起きていた。回転
+            // 後の位置は整数座標へ丸めて全経路を一致させる(中心の誤差は
+            // 最大 0.5px — SPEC §42 の「見た目の中心を維持」の精度として
+            // 許容し、プレビューと確定の一致を優先する)。
             let center_x = floating.pos.x + floating.w as f32 / 2.0;
             let center_y = floating.pos.y + floating.h as f32 / 2.0;
             std::mem::swap(&mut floating.w, &mut floating.h);
             floating.pos = pos2(
-                center_x - floating.w as f32 / 2.0,
-                center_y - floating.h as f32 / 2.0,
+                (center_x - floating.w as f32 / 2.0).round(),
+                (center_y - floating.h as f32 / 2.0).round(),
             );
         }
     }
@@ -743,17 +751,25 @@ pub fn color_key_mask(mask: &mut SelMask, doc: &Document, key: [u8; 3]) {
 /// `color_key_mask` の浮動片ローカル版(貼り付け直後の `Floating::mask` /
 /// `pixels` 用。`mask.len() == pixels.len() / 4` 前提だが、食い違っても
 /// パニックしない)。
-pub fn color_key_buffer(mask: &mut [u8], pixels: &[u8], key: [u8; 3]) {
+///
+/// v11 R3 レビュー修正: マスクを 0 にするだけでなく**画素自体も透明化**する。
+/// 浮動化(`color_key_mask` 経由)では `extract_region` が除外画素を透明の
+/// まま複写するので問題ないが、貼り付けでは生の色キー画素(例: 白)が
+/// `pixels` に残るため、ハンドル拡縮の再サンプリング(画素=bilinear、
+/// マスク=nearest)でキー色が選択内へにじみ戻っていた(SPEC §46 違反)。
+/// 画素を透明化しておけば浮動化経路と同一の意味論になる。
+pub fn color_key_buffer(mask: &mut [u8], pixels: &mut [u8], key: [u8; 3]) {
     for (i, slot) in mask.iter_mut().enumerate() {
         if *slot == 0 {
             continue;
         }
         let idx = i * 4;
-        let Some(px) = pixels.get(idx..idx + 3) else {
+        let Some(px) = pixels.get_mut(idx..idx + 4) else {
             continue;
         };
-        if px == key {
+        if px[0..3] == key {
             *slot = 0;
+            px.copy_from_slice(&[0, 0, 0, 0]);
         }
     }
 }
@@ -1474,12 +1490,35 @@ mod tests {
     }
 
     #[test]
-    fn color_key_buffer_handles_short_pixel_buffers_without_panicking() {
+    fn color_key_buffer_zeroes_mask_and_pixels_and_handles_short_buffers() {
         let mut mask = vec![255u8, 255, 255];
         // 画素 2 個ぶんしかない(3 個目は範囲外 → そのまま残る)。
-        let pixels = [9u8, 9, 9, 255, 1, 1, 1, 255];
-        color_key_buffer(&mut mask, &pixels, [9, 9, 9]);
+        let mut pixels = vec![9u8, 9, 9, 255, 1, 1, 1, 255];
+        color_key_buffer(&mut mask, &mut pixels, [9, 9, 9]);
         assert_eq!(mask, vec![0, 255, 255]);
+        // v11 R3: 除外画素は画素自体も透明化される(拡縮の bilinear 再サン
+        // プリングでキー色が選択内へにじみ戻らないように)。
+        assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&pixels[4..8], &[1, 1, 1, 255], "非キー画素は不変");
+    }
+
+    #[test]
+    fn rotating_an_odd_by_even_floating_keeps_an_integer_position() {
+        // v11 R3: 縦横の偶奇が異なる回転でも位置は整数座標(本体・枠・確定が
+        // 一致する)。中心の誤差は最大 0.5px。
+        let mut floating =
+            Floating::new_rect(vec![0u8; 2 * 3 * 4], 2, 3, pos2(10.0, 10.0), None, 1);
+        transform_floating(&mut floating, FloatingTransform::RotateCw);
+        assert_eq!((floating.w, floating.h), (3, 2));
+        assert_eq!(floating.pos.x.fract(), 0.0, "x は整数");
+        assert_eq!(floating.pos.y.fract(), 0.0, "y は整数");
+        // 元の中心 (11.0, 11.5) から高々 0.5px。
+        let center = (
+            floating.pos.x + floating.w as f32 / 2.0,
+            floating.pos.y + floating.h as f32 / 2.0,
+        );
+        assert!((center.0 - 11.0).abs() <= 0.5);
+        assert!((center.1 - 11.5).abs() <= 0.5);
     }
 
     // -- v8 §37: 選択範囲を反転(invert_mask / tighten_mask) -----------------
