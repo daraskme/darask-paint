@@ -817,6 +817,35 @@ pub fn paint_duplicate_to_tab_icon(painter: &Painter, rect: Rect, color: Color32
     painter.rect_stroke(tab, 1.0, st, egui::StrokeKind::Middle);
 }
 
+/// 画像 = 選択範囲を切り取って新規タブへ(v11 §48):
+/// `paint_duplicate_to_tab_icon` の派生 — 破線選択の代わりに**はさみ**を
+/// 置き、「切り取って」タブへ移すことを表す。
+pub fn paint_cut_to_tab_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    // はさみ(`paint_cut_icon` の縮小版、左側)。
+    let apex = p(rect, 0.10, 0.36);
+    let handle_a = p(rect, 0.40, 0.30);
+    let handle_b = p(rect, 0.40, 0.66);
+    painter.line_segment([apex, handle_a], st);
+    painter.line_segment([apex, handle_b], st);
+    let r = rect.width() * 0.05;
+    painter.circle_stroke(handle_a, r, st);
+    painter.circle_stroke(handle_b, r, st);
+    // 矢印 → タブ(`paint_duplicate_to_tab_icon` と同じ意匠)。
+    let arrow_from = p(rect, 0.46, 0.5);
+    let arrow_to = p(rect, 0.62, 0.5);
+    painter.line_segment([arrow_from, arrow_to], st);
+    arrow_head(
+        painter,
+        arrow_to,
+        vec2(1.0, 0.0),
+        rect.width() * 0.07,
+        color,
+    );
+    let tab = Rect::from_min_max(p(rect, 0.68, 0.30), p(rect, 0.94, 0.70));
+    painter.rect_stroke(tab, 1.0, st, egui::StrokeKind::Middle);
+}
+
 /// 画像 = 左右反転: 中央の破線+左右を向く矢じり(SPEC §33)。
 pub fn paint_flip_horizontal_icon(painter: &Painter, rect: Rect, color: Color32) {
     let st = line_stroke(rect, color);

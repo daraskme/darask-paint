@@ -808,6 +808,12 @@ SPEC.md「v9 拡張仕様」(§41〜§45)に対応。
 - **`.dpaint` v2**(§47): `HistoryOp::AddLayer` に `visible`/`opacity`、`MergeDown` に `merged_name`/`merged_visible`/`merged_opacity` を追加。`refresh_op_for_redo` が undo 時に全メタを刷新し、`apply_after` はハードコードではなく op のメタで再構築する。project.rs は `parse_chunks` が version(1..=2)を返し、`decode_op` が分岐(v1 は旧既定で補い、導出 clone を復元メモリ会計へ手動算入 — loader の budget 等値検査と対称にする)。writer は常に v2。テスト専用 `encode_project_with_version` が v1 バイト列を生成し後方互換を実バイトで担保する。
 - v10 の落とし穴: (1) v1 互換読込で導出した `merged_name` clone の budget 算入を忘れると「復元メモリ会計が一致しません」で全 v1 ファイルが開けなくなる。(2) `refresh_op_for_redo` の `bytes_used` 補正は名前長の変わるフィールド(`name`/`merged_name`)にだけ必要。(3) 透明な選択の除外で全画素が消えたマスク(全部セカンダリ色)も既存機構で安全(合成・復元とも no-op)— 特別扱いを足さない。
 
+## 21.5b v11 設計(SPEC §48〜§49)
+
+- **切り出し**(§48): `app.rs::cut_selection_to_new_tab`。ジェスチャ終了規則・タブ挿入(`insert_duplicated_tab`)・上限チェックは `duplicate_selection_to_new_tab` と共通。浮動片ケースは `floating.take()` → 開いているストロークを「切り出し」で commit(貼り付け由来なら no-op → `prev_modified` 復元)→ `floating_layer_pixels` を新規タブへ。静的選択ケースは `extract_region`(アクティブレイヤー)→ `clear_region_transparent` → commit の Ctrl+X 型 1 undo 単位。
+- **選択ツールの再設定優先**(§49): `select_down` を「`floating.is_some()` のときだけハンドル/内側移動を判定し、それ以外は常に `NewSelection`」へ変更。`hit_resize_handle`/`begin_resize_handle` の未浮動フォールバック(選択→浮動化)は移動ツール(`move_down`)と Ctrl+T 専用として存続。`SelectDrag::PendingFloating` も移動ツール専用になった。
+- v11 の落とし穴: (1) 浮動片が**ある**ときのハンドル・移動・外側クリック確定は選択ツールでも従来どおり(貼り付け・テキスト・Ctrl+T 直後の操作性を壊さない)。(2) 切り出しの浮動片ケースで `flush_floating_keep_selection` を使ってはならない(元タブへ合成されてしまう — §17.5 の複製と同じ罠)。
+
 ## 21.6 v9 の落とし穴
 
 1. 保存マーカーの無効化条件は「保存位置より**手前**での push」だけ。位置以深の push で無効化すると「保存→続けて描く→全部 undo」で未保存表示が消えなくなる(過剰無効化)。逆に無効化を忘れると偽の「保存済み」で閉じてデータを失う(過小無効化)— 双方向のテストを維持する。

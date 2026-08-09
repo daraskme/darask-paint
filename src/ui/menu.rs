@@ -83,6 +83,9 @@ pub enum MenuAction {
     Crop,
     /// v5 §31(ARCHITECTURE.md §17.5): 「選択範囲を新規タブに複製」。
     DuplicateSelectionToTab,
+    /// v11 §48: 「選択範囲を切り取って新規タブへ」(複製の破壊的な対。
+    /// アクティブレイヤー基準で切り取り、元領域は透明になる)。
+    CutSelectionToTab,
     FlipHorizontal,
     FlipVertical,
     RotateCw,
@@ -143,6 +146,7 @@ impl MenuAction {
             Self::CanvasResize => "キャンバス",
             Self::Crop => "トリミング",
             Self::DuplicateSelectionToTab => "選択複製",
+            Self::CutSelectionToTab => "切り出し",
             Self::FlipHorizontal => "左右反転",
             Self::FlipVertical => "上下反転",
             Self::RotateCw => "右回転",
@@ -544,6 +548,13 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             "選択範囲を新規タブに複製",
             icons::paint_duplicate_to_tab_icon,
             MenuAction::DuplicateSelectionToTab,
+        ),
+        // v11 §48: 複製の直後に「切り取って新規タブへ」(破壊的な対)。
+        mi(
+            state.has_selection,
+            "選択範囲を切り取って新規タブへ",
+            icons::paint_cut_to_tab_icon,
+            MenuAction::CutSelectionToTab,
         ),
         mi(
             true,
@@ -996,9 +1007,10 @@ mod tests {
         let slots = build_slots(&state);
         let item_count = slots.iter().filter(|s| !matches!(s, Slot::Sep)).count();
         let sep_count = slots.iter().filter(|s| matches!(s, Slot::Sep)).count();
-        assert_eq!(item_count, 45);
+        // v11 §48 で「切り出し」が加わり 46(+区切り 5 = 51)。
+        assert_eq!(item_count, 46);
         assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 50);
+        assert_eq!(slots.len(), 51);
     }
 
     /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を

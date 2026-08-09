@@ -331,14 +331,10 @@ pub fn rect_contains(rect: IRect, p: Pos2) -> bool {
     p.x >= rect.x0 as f32 && p.x < rect.x1 as f32 && p.y >= rect.y0 as f32 && p.y < rect.y1 as f32
 }
 
-/// 画像座標の点 `p` が `mask` で選択されている画素に含まれるか(v4 §16.3:
-/// 「選択内部をドラッグ→浮動化」の判定を bbox だけでなく実際のマスク形状で
-/// 行うための、`rect_contains` のマスク版)。矩形選択(全 1 マスク)では
-/// `rect_contains(mask.bbox, p)` と完全に一致する(浮動小数の画素境界丸めは
-/// どちらも同じ `floor` 相当になる)。
-pub fn point_in_mask(mask: &SelMask, p: Pos2) -> bool {
-    mask.contains(p.x.floor() as i32, p.y.floor() as i32)
-}
+// 補足: かつてここにあった `point_in_mask`(選択内部ドラッグ→浮動化の
+// 判定、v4 §16.3)は、v11 §49 で選択ツールが「常に選択のやり直し」になり
+// 呼び出し元が消えたため削除した(移動ツールはクリック位置に関係なく
+// 浮動化するので判定自体が不要)。
 
 /// 浮動片が現在合成される先の矩形(`pos`/`w`/`h` から算出、画像境界への
 /// クランプ前)。
@@ -1298,29 +1294,6 @@ mod tests {
     fn irect_from_points_normalizes_and_rounds_outward() {
         let r = irect_from_points(pos2(5.4, 5.9), pos2(1.1, 1.6));
         assert_eq!((r.x0, r.y0, r.x1, r.y1), (1, 1, 6, 6));
-    }
-
-    #[test]
-    fn point_in_mask_matches_rect_contains_for_a_rect_mask() {
-        let rect = IRect {
-            x0: 0,
-            y0: 0,
-            x1: 10,
-            y1: 10,
-        };
-        let mask = rect_mask(rect);
-        for p in [
-            pos2(0.0, 0.0),
-            pos2(9.9, 9.9),
-            pos2(10.0, 5.0),
-            pos2(-0.1, 5.0),
-        ] {
-            assert_eq!(
-                point_in_mask(&mask, p),
-                rect_contains(rect, p),
-                "mismatch at {p:?}"
-            );
-        }
     }
 
     #[test]

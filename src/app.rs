@@ -1995,12 +1995,25 @@ impl DaraskApp {
         floating.pos = new_pos;
     }
 
+    /// v11 §49(v1 §6・§16 の選択ツール部分を上書き): 選択ツールでの Down は
+    /// **浮動片があるときだけ**移動/ハンドル拡縮として扱い、未浮動の選択
+    /// しか無い(または何も無い)ときは常に「新しい選択のやり直し」を始める。
+    ///
+    /// 以前は未浮動の選択の内側ドラッグ=浮動化、ハンドル=浮動化して拡縮
+    /// だったため、一度選択すると「選択し直したい」ドラッグが既存選択の
+    /// 移動・拡縮に化けてしまい、選択のやり直しには外側の遠い位置から
+    /// ドラッグし直すしかなかった(ユーザー指摘)。選択済み範囲の移動・
+    /// 拡縮は移動ツール(V)と自由変形(Ctrl+T)が従来どおり担う
+    /// (PS のマリキー系ツールと同じ役割分担)。
     fn select_down(&mut self, img: Pos2) {
-        if let Some(handle) = self.hit_resize_handle(img) {
-            self.begin_resize_handle(handle, img);
-            return;
-        }
-        if let Some(floating) = &self.active_tab().floating {
+        if self.active_tab().floating.is_some() {
+            if let Some(handle) = self.hit_resize_handle(img) {
+                self.begin_resize_handle(handle, img);
+                return;
+            }
+            let Some(floating) = &self.active_tab().floating else {
+                return;
+            };
             let bounds = select::floating_target_rect(floating);
             if select::rect_contains(bounds, img) {
                 let offset = img - floating.pos;
@@ -2010,22 +2023,6 @@ impl DaraskApp {
             // 浮動片の外をクリック: 現在位置で確定してから、新規選択として
             // 扱う(SPEC §6: 「選択外クリック」で確定)。
             self.commit_selection();
-        }
-        if let Some(selection) = &self.active_tab().selection {
-            if select::point_in_mask(&selection.mask, img) {
-                // M4 で発見・修正したバグ: ここで即座に `begin_floating_from_
-                // selection` を呼んでいたため、ドラッグせずに離すだけの
-                // 単クリックでも浮動化(元領域の透明化+同位置への再合成)が
-                // 起き、before==after の無意味な undo エントリが積まれて
-                // いた。実際に動いた場合(`select_drag_move`)にのみ浮動化
-                // するよう、まずは「保留」状態を記録するだけにする
-                // (SPEC §6: 「選択内部をドラッグ→浮動化」)。
-                self.select_drag = Some(SelectDrag::PendingFloating {
-                    mask: selection.mask.clone(),
-                    down_img: img,
-                });
-                return;
-            }
         }
         self.active_tab_mut().selection = None;
         self.select_drag = Some(SelectDrag::NewSelection {
@@ -4111,6 +4108,94 @@ impl DaraskApp {
         self.insert_duplicated_tab(new_doc);
     }
 
+    /// v11 §48: 画像メニュー「選択範囲を切り取って新規タブへ」(「複製」の
+    /// 破壊的な対。切り取り=Ctrl+X と同じくアクティブレイヤー基準)。
+    ///
+    /// - **浮動片がある場合**: 浮動片そのもの(mask 込み)を新規タブの唯一の
+    ///   レイヤーへ**移動**する。切り出し元の透明化(浮動化時に開いた
+    ///   ストローク)はここで「切り出し」1 undo 単位として確定する。
+    ///   貼り付け由来の浮動片(切り出し元なし)は履歴に何も積まず、
+    ///   `modified` も浮動化前の値へ戻す(no-op 確定と同じ規則)。
+    /// - **静的な選択のみの場合**: アクティブレイヤーの選択画素を新規タブへ
+    ///   移し、元領域を透明化する(Ctrl+X+新規タブ+貼り付けの一括操作。
+    ///   「複製」の全レイヤー方針とは意図的に異なる — 切り取り系の操作は
+    ///   一貫してアクティブレイヤーのみに作用する、SPEC §13)。
+    fn cut_selection_to_new_tab(&mut self) {
+        if self.active_tab().selection.is_none() && self.active_tab().floating.is_none() {
+            return;
+        }
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
+        // ジェスチャの終了規則は `duplicate_selection_to_new_tab` と同一
+        // (浮動片を合成せずに保つため、選択/移動系はドラッグ状態だけを
+        // 終了させる。ドキュメントコメント参照)。
+        if matches!(
+            self.tool,
+            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move
+        ) {
+            self.select_drag = None;
+        } else {
+            self.end_active_gesture();
+        }
+
+        let (width, height, pixels) = if let Some(floating) = self.active_tab_mut().floating.take()
+        {
+            // 浮動片を新規タブへ「移動」: 切り出し元の透明化(浮動化時の
+            // クリア)を 1 undo 単位として確定する。貼り付け由来
+            // (切り出し元なし)ならレコーダは空で何も積まれない。
+            let tab = &mut self.tabs[self.active_tab];
+            let undo_before = tab.history.undo_len();
+            tab.history.commit_stroke(&mut tab.doc, "切り出し");
+            if tab.history.undo_len() == undo_before {
+                tab.doc.modified = floating.prev_modified;
+            }
+            tab.selection = None;
+            (
+                floating.w,
+                floating.h,
+                select::floating_layer_pixels(&floating),
+            )
+        } else {
+            let Some(selection) = self.active_tab_mut().selection.take() else {
+                return;
+            };
+            let mask = selection
+                .mask
+                .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+            let rect = mask.bbox;
+            if rect.is_empty() {
+                return;
+            }
+            let tab = &mut self.tabs[self.active_tab];
+            let pixels = select::extract_region(&tab.doc, &mask);
+            // Ctrl+X の削除と同じ 1 undo 単位(`delete_selection_labeled` と
+            // 同じ手順、ラベルだけ「切り出し」)。
+            tab.history.begin_stroke(tab.doc.active);
+            tab.history.ensure_tiles_saved(&tab.doc, rect);
+            select::clear_region_transparent(&mut tab.doc, &mask);
+            tab.history.commit_stroke(&mut tab.doc, "切り出し");
+            (rect.width() as u32, rect.height() as u32, pixels)
+        };
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let new_doc = Document::from_duplicated_layers(
+            width,
+            height,
+            vec![Layer {
+                name: "背景".to_owned(),
+                visible: true,
+                opacity: 255,
+                pixels,
+            }],
+            0,
+        );
+        self.insert_duplicated_tab(new_doc);
+    }
+
     /// `duplicate_selection_to_new_tab` 専用のタブ挿入。`open_new_tab`
     /// (末尾に追加)と違い、SPEC §31: 「新規タブは元タブの直後に挿入され
     /// アクティブになる」ため挿入位置が異なる。また `open_new_tab` は内部で
@@ -4695,6 +4780,8 @@ impl DaraskApp {
             }
             MenuAction::Crop => self.apply_crop_to_selection(),
             MenuAction::DuplicateSelectionToTab => self.duplicate_selection_to_new_tab(),
+            // v11 §48: 切り取って新規タブへ(複製の破壊版)。
+            MenuAction::CutSelectionToTab => self.cut_selection_to_new_tab(),
             MenuAction::FlipHorizontal => self.apply_flip_horizontal(),
             MenuAction::FlipVertical => self.apply_flip_vertical(),
             MenuAction::RotateCw => self.apply_rotate_cw(),
@@ -6033,16 +6120,15 @@ mod tests {
         );
     }
 
-    // -- 選択内部の単クリックが無意味な undo エントリを積むバグ(修正済み) --
+    // -- v11 §49: 選択ツールは「選択のやり直し」を最優先する ------------------
 
     #[test]
-    fn clicking_inside_selection_without_dragging_does_not_float_or_push_undo() {
+    fn clicking_inside_a_plain_selection_deselects_without_floating_or_undo() {
+        // v11 §49 で挙動変更: 選択ツールでの単クリックは(内側でも)選択の
+        // やり直しの開始であり、ドラッグしなければ選択解除になる(PS の
+        // マリキー系と同じ)。浮動化も undo エントリも発生しない。
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Select;
-        // v2 §16: 選択の外周には約 7pt 角のスケールハンドルが乗るため、
-        // 「内部クリック」を検証するにはハンドルの当たり判定(中心から
-        // ±3.5pt)から十分離れた点でクリックする必要がある(16x16 の選択で
-        // 中心 (10,10) を使えば、どの辺・角ハンドルからも 8pt 以上離れる)。
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
@@ -6057,7 +6143,7 @@ mod tests {
         });
         assert!(
             app.active_tab().floating.is_none(),
-            "a plain click must not float the selection yet"
+            "クリックでは浮動化しない"
         );
 
         app.handle_select_event(ToolEvent::Up {
@@ -6066,8 +6152,8 @@ mod tests {
         });
         assert!(app.active_tab().floating.is_none());
         assert!(
-            app.active_tab().selection.is_some(),
-            "selection should remain after a no-op click"
+            app.active_tab().selection.is_none(),
+            "単クリック=選択解除(v11 §49)"
         );
         assert!(
             !app.active_tab().history.can_undo(),
@@ -6076,12 +6162,12 @@ mod tests {
     }
 
     #[test]
-    fn dragging_inside_selection_floats_it_and_tracks_the_pointer() {
+    fn dragging_inside_a_plain_selection_restarts_the_selection_instead_of_floating() {
+        // v11 §49(ユーザー指摘の修正): 未浮動の選択の内側からドラッグを
+        // 始めても、既存選択の移動/拡縮ではなく**新しい選択のやり直し**に
+        // なる。移動は移動ツール(V)・自由変形(Ctrl+T)の役割。
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.tool = ToolKind::Select;
-        // v2 §16: 上のテストと同じ理由で、ハンドルの当たり判定を避けた中心
-        // 付近でドラッグする(rect 原点 (2,2) からの down オフセットは (8,8)
-        // で、旧テストの (3,3) と役割は同じ)。
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
@@ -6095,17 +6181,72 @@ mod tests {
             mods: Modifiers::NONE,
         });
         app.handle_select_event(ToolEvent::Drag {
-            img: pos2(13.0, 10.0),
+            img: pos2(14.0, 13.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
+        app.handle_select_event(ToolEvent::Up {
+            img: pos2(14.0, 13.0),
+            button: PointerButton::Primary,
+        });
 
-        let floating = app
+        assert!(
+            app.active_tab().floating.is_none(),
+            "選択ツールのドラッグはもう浮動化しない(v11 §49)"
+        );
+        let selection = app
             .active_tab()
-            .floating
+            .selection
             .as_ref()
-            .expect("an actual drag must float the selection");
-        assert_eq!(floating.pos, pos2(5.0, 2.0));
+            .expect("the drag must have created a fresh selection");
+        assert_eq!(
+            (
+                selection.mask.bbox.x0,
+                selection.mask.bbox.y0,
+                selection.mask.bbox.x1,
+                selection.mask.bbox.y1
+            ),
+            (10, 10, 14, 13),
+            "新しいドラッグ矩形で選択が作り直される"
+        );
+        assert!(!app.active_tab().history.can_undo());
+    }
+
+    #[test]
+    fn grabbing_a_selection_edge_with_the_select_tool_also_restarts_the_selection() {
+        // v11 §49: ハンドル位置(選択の角)から始めたドラッグも拡縮ではなく
+        // 選択のやり直しになる(拡縮は移動ツール/Ctrl+T の役割)。
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 15,
+            y1: 15,
+        })));
+
+        app.handle_select_event(ToolEvent::Down {
+            img: pos2(15.0, 15.0), // 旧仕様なら右下ハンドル
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Drag {
+            img: pos2(25.0, 25.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        });
+        app.handle_select_event(ToolEvent::Up {
+            img: pos2(25.0, 25.0),
+            button: PointerButton::Primary,
+        });
+
+        assert!(app.active_tab().floating.is_none());
+        let selection = app.active_tab().selection.as_ref().expect("re-selected");
+        assert_eq!(
+            (selection.mask.bbox.x0, selection.mask.bbox.y0),
+            (15, 15),
+            "ハンドル位置からでも新規選択"
+        );
     }
 
     // -- v8 レビュー修正の回帰テスト -----------------------------------------
@@ -6322,6 +6463,103 @@ mod tests {
             "外されたタブは「無題N」の採番を受ける"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- v11 §48: 選択範囲を切り取って新規タブへ ------------------------------
+
+    #[test]
+    fn cut_selection_to_new_tab_moves_pixels_and_clears_the_source() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.active_tab_mut().doc.set_pixel(3, 3, [255, 0, 0, 255]);
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+
+        app.cut_selection_to_new_tab();
+
+        // 新規タブ: 4x4、切り取った画素(赤はローカル (1,1))。
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1, "新規タブがアクティブになる");
+        assert_eq!(app.active_tab().doc.width, 4);
+        assert_eq!(app.active_tab().doc.height, 4);
+        assert_eq!(app.active_tab().doc.get_pixel(1, 1), Some([255, 0, 0, 255]));
+        assert!(app.active_tab().doc.modified);
+        assert!(app.active_tab().doc.path.is_none());
+
+        // 元タブ: 選択領域が透明化され、1 undo 単位で戻せる。
+        let source = &mut app.tabs[0];
+        assert_eq!(source.doc.get_pixel(3, 3), Some([0, 0, 0, 0]));
+        assert_eq!(
+            source.doc.get_pixel(0, 0),
+            Some([255, 255, 255, 255]),
+            "選択外は不変"
+        );
+        assert!(source.selection.is_none());
+        assert!(
+            source.history.undo(&mut source.doc),
+            "「切り出し」1 undo 単位"
+        );
+        assert_eq!(source.doc.get_pixel(3, 3), Some([255, 0, 0, 255]));
+        assert!(!source.history.can_undo());
+    }
+
+    #[test]
+    fn cut_selection_to_new_tab_with_a_floating_moves_it_and_keeps_the_hole() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.tool = ToolKind::Select;
+        app.active_tab_mut().doc.set_pixel(3, 3, [255, 0, 0, 255]);
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 2,
+            y0: 2,
+            x1: 6,
+            y1: 6,
+        })));
+        app.free_transform(); // 浮動化(元領域は透明化・ストロークが開く)
+        assert!(app.active_tab().floating.is_some());
+
+        app.cut_selection_to_new_tab();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().doc.get_pixel(1, 1), Some([255, 0, 0, 255]));
+        let source = &mut app.tabs[0];
+        assert!(source.floating.is_none(), "浮動片は新規タブへ移動した");
+        assert_eq!(
+            source.doc.get_pixel(3, 3),
+            Some([0, 0, 0, 0]),
+            "切り出し元の穴は確定して残る"
+        );
+        assert!(!source.history.has_open_stroke());
+        assert!(source.history.undo(&mut source.doc));
+        assert_eq!(source.doc.get_pixel(3, 3), Some([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn cut_selection_to_new_tab_with_a_pasted_floating_leaves_the_source_untouched() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.active_tab_mut().doc.modified = true; // 白紙置換パスを避ける
+        app.begin_paste_floating(2, 2, [255u8, 0, 0, 255].repeat(4));
+        assert!(app.active_tab().floating.is_some());
+
+        app.cut_selection_to_new_tab();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().doc.width, 2);
+        let source = &mut app.tabs[0];
+        assert!(
+            !source.history.can_undo(),
+            "貼り付け由来の浮動片は元タブに何も積まない"
+        );
+        assert_eq!(source.doc.get_pixel(0, 0), Some([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn cut_selection_to_new_tab_without_a_selection_is_a_no_op() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.cut_selection_to_new_tab();
+        assert_eq!(app.tabs.len(), 1);
     }
 
     // -- v10 §46: 透明な選択 --------------------------------------------------
@@ -7345,22 +7583,21 @@ mod tests {
     #[test]
     fn layer_add_commits_an_open_floating_selection_first() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
-        app.tool = ToolKind::Select;
-        // v2 §16: ハンドルの当たり判定を避けて内部ドラッグを起こす
-        // (上の `dragging_inside_selection_floats_it_and_tracks_the_pointer`
-        // と同じ理由)。
+        // v11 §49: 選択ツールのドラッグは再設定になったため、浮動化は
+        // 移動ツール(従来どおり選択範囲を浮動化して動かす)で起こす。
+        app.tool = ToolKind::Move;
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
             y1: 18,
         })));
-        app.handle_select_event(ToolEvent::Down {
+        app.handle_move_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        app.handle_select_event(ToolEvent::Drag {
+        app.handle_move_event(ToolEvent::Drag {
             img: pos2(13.0, 10.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
@@ -7385,20 +7622,21 @@ mod tests {
         app.layer_add();
         assert_eq!(app.active_tab().doc.active, 1);
 
-        app.tool = ToolKind::Select;
-        // v2 §16: 同上、ハンドルの当たり判定を避ける。
+        // v11 §49: 選択ツールのドラッグは再設定になったため、浮動化は
+        // 移動ツール(従来どおり選択範囲を浮動化して動かす)で起こす。
+        app.tool = ToolKind::Move;
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 2,
             y0: 2,
             x1: 18,
             y1: 18,
         })));
-        app.handle_select_event(ToolEvent::Down {
+        app.handle_move_event(ToolEvent::Down {
             img: pos2(10.0, 10.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        app.handle_select_event(ToolEvent::Drag {
+        app.handle_move_event(ToolEvent::Drag {
             img: pos2(13.0, 10.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
@@ -7918,10 +8156,13 @@ mod tests {
 
     #[test]
     fn grabbing_a_handle_on_an_unfloated_selection_floats_it_first_then_resizes() {
-        // SPEC §16: 「未浮動の選択でハンドルを掴んだ場合は、内部ドラッグと
-        // 同様にまず浮動化してから拡縮する」。
+        // SPEC §16 の「未浮動の選択でハンドルを掴んだら浮動化して拡縮」は、
+        // v11 §49 以降は**移動ツール(V)**の挙動(選択ツールは常に選択の
+        // やり直し —
+        // `grabbing_a_selection_edge_with_the_select_tool_also_restarts_the_selection`
+        // 参照)。
         let mut app = new_for_test(Document::new(40, 40, Background::White));
-        app.tool = ToolKind::Select;
+        app.tool = ToolKind::Move;
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
             x0: 5,
             y0: 5,
@@ -7929,7 +8170,7 @@ mod tests {
             y1: 15,
         })));
 
-        app.handle_select_event(ToolEvent::Down {
+        app.handle_move_event(ToolEvent::Down {
             img: pos2(15.0, 15.0), // BottomRight ハンドル。
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
@@ -7948,7 +8189,7 @@ mod tests {
             })
         ));
 
-        app.handle_select_event(ToolEvent::Drag {
+        app.handle_move_event(ToolEvent::Drag {
             img: pos2(25.0, 25.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
@@ -8174,8 +8415,10 @@ mod tests {
 
     #[test]
     fn cancel_floating_after_dragging_a_selection_restores_original_bytes_exactly() {
+        // v11 §49: 選択範囲の浮動化ドラッグは移動ツールの役割になった
+        // (選択ツールは選択のやり直し)。
         let mut app = new_for_test(Document::new(20, 20, Background::White));
-        app.tool = ToolKind::Select;
+        app.tool = ToolKind::Move;
         app.active_tab_mut().doc.set_pixel(7, 7, [10, 20, 30, 255]);
         let original = app.active_tab().doc.active_pixels().to_vec();
         app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
@@ -8185,12 +8428,12 @@ mod tests {
             y1: 12,
         })));
 
-        app.handle_select_event(ToolEvent::Down {
+        app.handle_move_event(ToolEvent::Down {
             img: pos2(5.0, 5.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
         });
-        app.handle_select_event(ToolEvent::Drag {
+        app.handle_move_event(ToolEvent::Drag {
             img: pos2(9.0, 5.0),
             button: PointerButton::Primary,
             mods: Modifiers::NONE,
