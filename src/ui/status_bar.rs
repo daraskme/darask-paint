@@ -11,6 +11,10 @@ use crate::document::Document;
 /// `cursor_img` はキャンバス上のカーソル位置(画像ピクセル座標)。
 /// キャンバス外なら `None`。`zoom` は 1.0 = 100%。`selection_size` は
 /// 選択または浮動片があるときの `(幅, 高さ)`。`toast` は表示中のトースト文言。
+/// v12 §53: 実行中の非同期ジョブ(修復)の表示。`Some(ラベル)` のとき
+/// ステータスバーに文言と「キャンセル」ボタンを出す。押されたら `true` を
+/// 返す(実際のキャンセルは `app.rs` が行う。スピナーやアニメーションは
+/// 出さない — アイドル CPU 0% のため)。
 pub fn show(
     ui: &mut egui::Ui,
     doc: &Document,
@@ -18,7 +22,9 @@ pub fn show(
     zoom: f32,
     selection_size: Option<(u32, u32)>,
     toast: Option<&str>,
-) {
+    background_job: Option<&str>,
+) -> bool {
+    let mut cancel_clicked = false;
     egui::Panel::bottom("status_bar")
         .exact_size(24.0)
         .show(ui, |ui| {
@@ -42,6 +48,15 @@ pub fn show(
                     ui.separator();
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), text);
                 }
+                // v12 §53: 実行中ジョブ(修復)の表示 + キャンセル。
+                if let Some(label) = background_job {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(120, 180, 240), label);
+                    if ui.button("キャンセル").clicked() {
+                        cancel_clicked = true;
+                    }
+                }
             });
         });
+    cancel_clicked
 }

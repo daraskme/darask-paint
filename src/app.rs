@@ -42,7 +42,10 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -50,8 +53,11 @@ use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{pos2, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2};
 
 use crate::canvas_view::CanvasView;
-use crate::document::{Background, BlendMode, Document, Interpolation, Layer, MAX_LAYERS};
+use crate::document::{
+    Background, BlendMode, Document, IdAllocator, Interpolation, Layer, INVALID_ID, MAX_LAYERS,
+};
 use crate::history::{History, HistoryOp};
+use crate::inpaint::{self, InpaintError, InpaintInput, InpaintOutput};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
 use crate::raster;
@@ -399,6 +405,168 @@ struct SelectBrushStroke {
     erase: bool,
 }
 
+/// `Tab::uid` の採番(`document::IdAllocator` = checked。枯渇したら
+/// `INVALID_ID` になり、世代ガードは常に不一致 = 安全側に倒れる)。
+static NEXT_TAB_UID: IdAllocator = IdAllocator::new();
+
+/// `BackgroundJob::job_id` の採番(同上。こちらは枯渇時にジョブ発行自体を
+/// 断る = トーストで拒否する)。
+static NEXT_JOB_ID: IdAllocator = IdAllocator::new();
+
+/// v12 §53(ARCHITECTURE.md §22.4): 非同期ジョブの種類。P4 では内蔵修復
+/// だけだが、P6 の外部プラグイン(IOpaint / Diffusion)も同じ基盤に載る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundJobKind {
+    /// SPEC §53: 内蔵の「選択範囲を修復」(Telea/FMM)。
+    BuiltinInpaint,
+}
+
+impl BackgroundJobKind {
+    /// ステータスバーに出す実行中の表示。
+    fn status_label(self) -> &'static str {
+        match self {
+            BackgroundJobKind::BuiltinInpaint => "選択範囲を修復中…",
+        }
+    }
+
+    /// 履歴(undo)のラベル。
+    fn history_label(self) -> &'static str {
+        match self {
+            BackgroundJobKind::BuiltinInpaint => "選択範囲を修復",
+        }
+    }
+}
+
+/// 非同期ジョブが失敗した理由(すべてトースト文言を持つ = パニックしない)。
+/// P6 の外部プラグインもこの型でユーザーへ返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundJobError {
+    /// 計算そのものが実行できなかった(`inpaint.rs` の判定)。
+    Inpaint(InpaintError),
+    /// ワーカーが panic した(`catch_unwind` で捕まえた)。single-flight の
+    /// 枠を永久占有しないよう、**panic も 1 つの結果として**返す。
+    WorkerPanicked,
+    /// ワーカーが結果を返さないまま終わった(送信端が落ちた)。
+    WorkerDisappeared,
+    /// 返ってきたバッファが宣言された寸法と食い違う(内蔵処理では起きないが、
+    /// P6 の外部応答を同じ基盤へ載せたときの防御)。
+    InvalidOutput,
+}
+
+impl BackgroundJobError {
+    fn message(self) -> &'static str {
+        match self {
+            BackgroundJobError::Inpaint(error) => error.message(),
+            BackgroundJobError::WorkerPanicked => "処理が異常終了しました(結果は適用していません)",
+            BackgroundJobError::WorkerDisappeared => {
+                "処理が結果を返さずに終了しました(結果は適用していません)"
+            }
+            BackgroundJobError::InvalidOutput => {
+                "処理の結果が壊れていました(結果は適用していません)"
+            }
+        }
+    }
+}
+
+/// ワーカーが返す結果(`job_id` で発行元と対応付ける)。
+struct BackgroundJobResult {
+    job_id: u64,
+    outcome: Result<InpaintOutput, BackgroundJobError>,
+}
+
+/// v12 §53(ARCHITECTURE.md §22.4): **適用先の同一性**。
+///
+/// 世代カウンタを手で増やして回る方式は「増やし忘れ」が起きるため、
+/// **現在の状態から毎回導出する**値だけで構成する(導出値なので bump 漏れが
+/// 原理的に存在しない)。ジョブ発行時にこれを捕獲し、完了時に丸ごと一致
+/// しなければ結果を捨てる。
+///
+/// - `layer_uid`: アクティブレイヤーの安定 UID。**アクティブレイヤーの切替は
+///   `content_gen` を動かさない**ため、これが無いと実行中に別レイヤーへ
+///   切り替えたときに結果がそちらへ書かれてしまう。
+/// - `layer_index`/`layer_count`: 並べ替え・追加・削除の検出(UID が同じでも
+///   重なり順が変われば「同じ絵の同じ場所」ではなくなる)。
+/// - `alpha_lock`: 透明保護(SPEC §50.3)は書き込み規則そのものを変えるのに
+///   `content_gen` を動かさない。発行時と違う規則で適用しないよう一致を要求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditTarget {
+    layer_uid: u64,
+    layer_index: usize,
+    layer_count: usize,
+    alpha_lock: bool,
+}
+
+impl EditTarget {
+    /// 識別子が有効か(採番枯渇時は `INVALID_ID` = 決して一致させない)。
+    fn is_valid(&self) -> bool {
+        self.layer_uid != INVALID_ID
+    }
+}
+
+/// ワーカー本体(スレッドの中身)。**成功・エラー・panic のどの経路でも
+/// 終端通知と再描画要求をちょうど 1 回ずつ**出す、という契約をここに閉じ込める
+/// (`catch_unwind` で panic も 1 つの結果に変換する)。純粋な関数なので
+/// テストから直接呼んで「repaint が高々 1 回」を確かめられる。
+fn run_background_worker(
+    job_id: u64,
+    compute: impl FnOnce() -> Result<InpaintOutput, BackgroundJobError> + std::panic::UnwindSafe,
+    sender: &mpsc::Sender<BackgroundJobResult>,
+    request_repaint: impl Fn(),
+) {
+    let outcome = match std::panic::catch_unwind(compute) {
+        Ok(outcome) => outcome,
+        Err(_) => Err(BackgroundJobError::WorkerPanicked),
+    };
+    // 送信先が消えていても(タブを閉じた等)無視してよい。
+    let _ = sender.send(BackgroundJobResult { job_id, outcome });
+    // 完了時に 1 回だけ再描画を要求する(ポーリングしない)。
+    request_repaint();
+}
+
+/// v12 §53(ARCHITECTURE.md §22.4): 実行中の非同期ジョブ。**常に 1 本だけ**
+/// 保持する(single-flight。同種ジョブの多重発行を禁止する SPEC §53 の要件)。
+///
+/// 発行時に「タブ安定 ID・文書世代・選択世代・**適用先レイヤーの同一性**・
+/// JobId」を捕捉し、完了時に**全一致 + 進行中ストローク無し + 浮動片無し**の
+/// ときだけ結果を 1 undo 単位で適用する(SPEC §55.1 の世代ガード)。
+/// 不一致なら破棄してトーストで知らせる。
+struct BackgroundJob {
+    job_id: u64,
+    kind: BackgroundJobKind,
+    /// 発行時のタブ(`Tab::uid`)。
+    tab_uid: u64,
+    /// 発行時の `Document::content_gen`(画素内容の世代)。
+    doc_gen: u64,
+    /// 発行時の `Selection::gen`(選択の世代。`None` = 選択なし)。
+    sel_gen: Option<u64>,
+    /// 発行時の適用先(アクティブレイヤーの UID・位置・透明保護)。
+    target: EditTarget,
+    /// 発行後に適用先が一度でも切り替わったことを検出する世代。
+    /// 現在値だけでは「別レイヤーへ切替後、元へ戻す」を検出できない。
+    edit_target_gen: u64,
+    /// 適用先の領域(選択 bbox + 半径マージン。文書座標)。
+    rect: crate::document::IRect,
+    /// キャンセル要求(結果を破棄する。SPEC §53: 「キャンセル(結果破棄)」)。
+    cancel: Arc<AtomicBool>,
+    /// 結果の受け口(`try_recv` で「結果があるフレーム」だけ処理する。
+    /// フレームはワーカーが完了時に 1 回だけ出す `request_repaint` が駆動する
+    /// — ポーリングもスピナーもしない)。
+    receiver: Receiver<BackgroundJobResult>,
+    /// ワーカーのハンドル(終了確認用。キャンセル後もここが終わるまでは
+    /// single-flight を占有する = SPEC §55.1)。
+    join: Option<JoinHandle<()>>,
+}
+
+/// v12 §53 の**終了契約**: ジョブの枠が手放される瞬間(`poll_background_job`
+/// の `take`、タブやアプリの終了、`on_exit`)に、必ずワーカーへキャンセルを
+/// 通知する。`JoinHandle` はここでは待たずに落とす(= detach)ので**非
+/// ブロッキング**。P6 の通信ワーカー(数十秒待ち)でも終了が固まらない。
+impl Drop for BackgroundJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
 /// SPEC §7 のダイアログ群(ARCHITECTURE.md §10: `modal: Option<ModalState>`)。
 enum ModalState {
     New {
@@ -598,11 +766,19 @@ impl StartupToolState {
 /// 1 から連番にならず歯抜けになる、という 2 つの実在するバグを引き起こす。
 /// `untitled_number` と同様にタブごとに独立させることで両方解消する。
 struct Tab {
+    /// v12 §53(ARCHITECTURE.md §22.4): **タブの安定 ID**(作成順の単調増分)。
+    ///
+    /// 非同期ジョブ(修復・§55 のプラグイン)の世代ガードに使う。`tabs` の
+    /// 添字はタブを閉じると詰まるため識別子にしてはいけない(閉じた後に
+    /// 完了した結果が別のタブへ適用されてしまう)。
+    uid: u64,
     doc: Document,
     history: History,
     view: CanvasView,
     selection: Option<Selection>,
     floating: Option<Floating>,
+    /// 非同期ジョブ発行後の一時的な適用先変更も検出する世代。
+    edit_target_gen: u64,
     /// SPEC §30: 「無題」「無題2」「無題3」…の番号。`doc.path` が `None`
     /// (=ファイルに紐付いていない)間だけ意味を持つ。生成時に
     /// `DaraskApp::next_untitled_number` から一度だけ払い出され、以後は
@@ -654,11 +830,13 @@ impl Tab {
     ) -> Self {
         history.set_max_steps(max_undo_steps as usize);
         Self {
+            uid: NEXT_TAB_UID.next_or_invalid(),
             doc,
             history,
             view: CanvasView::new(),
             selection: None,
             floating: None,
+            edit_target_gen: 0,
             untitled_number,
             layer_rename: None,
             next_layer_number: 1,
@@ -840,6 +1018,8 @@ pub struct DaraskApp {
     text_edit: Option<TextEditState>,
 
     // -- M4: ダイアログ・未保存ガード(ARCHITECTURE.md §8, §10) -----------
+    /// v12 §53: 実行中の非同期ジョブ(single-flight。`None` なら空き)。
+    background_job: Option<BackgroundJob>,
     modal: Option<ModalState>,
     pending_action: Option<PendingAction>,
     pending_dialog: Option<DialogRequest>,
@@ -1093,6 +1273,7 @@ impl DaraskApp {
             text_outline_width: startup.text_outline_width,
             text_preview_rasterizations: 0,
             text_edit: None,
+            background_job: None,
             modal: None,
             pending_action: None,
             pending_dialog: None,
@@ -4434,6 +4615,10 @@ impl DaraskApp {
     /// テストであり、実行するたびに実 `%APPDATA%` の設定ファイルを上書きする
     /// のは望ましくない副作用になる。
     fn exit_process(&self) -> ! {
+        // v12 §53 の終了契約: 実行中ジョブへ非ブロッキングにキャンセルを
+        // 通知してから落ちる(`process::exit` はデストラクタを走らせないので
+        // ここで明示的に伝える必要がある)。
+        self.cancel_background_job();
         self.save_settings();
         std::process::exit(0);
     }
@@ -4698,6 +4883,8 @@ impl DaraskApp {
                 let pixels = select::extract_region(&tab.doc, &mask);
                 let src = &tab.doc.layers[i];
                 layers.push(Layer {
+                    // 複製したタブは**別レイヤー**として扱う(v12 §53)。
+                    uid: crate::document::next_layer_uid(),
                     name: src.name.clone(),
                     visible: src.visible,
                     opacity: src.opacity,
@@ -4922,6 +5109,321 @@ impl DaraskApp {
         tab.history.commit_stroke(&mut tab.doc, label);
     }
 
+    // -----------------------------------------------------------------
+    // v12 §53: 選択範囲を修復(内蔵・非 AI。ARCHITECTURE.md §22.4)
+    //
+    // 実行はワーカースレッド。UI 側は「発行」と「結果の受け取り」だけを行い、
+    // 結果は世代ガード(タブ安定 ID・文書世代・選択世代・適用先レイヤーの
+    // 同一性・JobId の全一致 + 進行中ストローク/浮動片無し)を通ったときだけ
+    // 1 undo 単位で適用する。
+    // -----------------------------------------------------------------
+
+    /// 現在の選択の世代(選択が無ければ `None`)。
+    fn selection_gen(&self) -> Option<u64> {
+        self.active_tab().selection.as_ref().map(|s| s.gen)
+    }
+
+    /// 現在の適用先(アクティブレイヤーの同一性 + 透明保護)。`EditTarget` の
+    /// ドキュメントコメント参照 — すべて現在の状態からの**導出値**なので、
+    /// 「世代を増やし忘れる」経路が原理的に存在しない。
+    fn edit_target(&self) -> EditTarget {
+        let doc = &self.active_tab().doc;
+        let layer = doc.active_layer();
+        EditTarget {
+            layer_uid: layer.uid,
+            layer_index: doc.active_index(),
+            layer_count: doc.layers.len(),
+            alpha_lock: layer.alpha_lock,
+        }
+    }
+
+    /// SPEC §53: 「選択範囲を修復」の発行。選択が必須・浮動片は commit-first・
+    /// 同種ジョブの多重発行は禁止(single-flight)。
+    fn start_inpaint_selection(&mut self, ctx: &egui::Context) {
+        // 実行中(キャンセル済みでもワーカーが終わるまで)は受け付けない。
+        if self.background_job.is_some() {
+            self.show_toast(
+                "処理中です。完了するかキャンセルしてからやり直してください".to_owned(),
+            );
+            return;
+        }
+        // 浮動片・進行中ストロークは先に確定する(SPEC §53: commit-first)。
+        self.commit_open_gesture();
+        let Some(selection) = self.active_tab().selection.as_ref() else {
+            self.show_toast("修復するには選択範囲が必要です".to_owned());
+            return;
+        };
+        let (doc_w, doc_h) = {
+            let doc = &self.active_tab().doc;
+            (doc.width, doc.height)
+        };
+        let mask = selection.mask.clamp_to(doc_w, doc_h);
+        if mask.is_empty() {
+            self.show_toast("修復するには選択範囲が必要です".to_owned());
+            return;
+        }
+        // 参照する近傍のぶんだけ bbox を広げて切り出す(半径ぶんのマージン)。
+        let margin = inpaint::INPAINT_RADIUS.ceil() as i32 + 1;
+        let rect = crate::document::IRect {
+            x0: mask.bbox.x0 - margin,
+            y0: mask.bbox.y0 - margin,
+            x1: mask.bbox.x1 + margin,
+            y1: mask.bbox.y1 + margin,
+        }
+        .clamp_to(doc_w, doc_h);
+        if rect.is_empty() {
+            self.show_toast("修復するには選択範囲が必要です".to_owned());
+            return;
+        }
+
+        let Some(input) = self.build_inpaint_input(rect, &mask) else {
+            self.show_toast(InpaintError::InvalidInput.message().to_owned());
+            return;
+        };
+        // 上限・全面選択は**発行前**に弾く(ワーカーを起こさない)。判定は
+        // すべて `build_inpaint_input` が返した**実効マスク**に対して行う
+        // (アルファロックで除外された画素は最初から数えない)。
+        let unknown = input.mask.iter().filter(|m| **m != 0).count();
+        if unknown == 0 {
+            if self.active_tab().doc.active_layer().alpha_lock {
+                self.show_toast(
+                    "透明保護が有効なため、選択範囲に修復できる画素がありません".to_owned(),
+                );
+            } else {
+                self.show_toast("修復するには選択範囲が必要です".to_owned());
+            }
+            return;
+        }
+        if unknown > inpaint::MAX_INPAINT_PIXELS {
+            self.show_toast(InpaintError::TooManyPixels.message().to_owned());
+            return;
+        }
+        if unknown == input.mask.len() {
+            self.show_toast(InpaintError::NothingToSampleFrom.message().to_owned());
+            return;
+        }
+
+        let Some(job_id) = NEXT_JOB_ID.next() else {
+            // 採番が枯渇した(現実には起こらないが、`fetch_add` の巻き戻りで
+            // 既存 ID を再利用して世代ガードが誤って一致するくらいなら、
+            // 発行を断るほうが安全)。
+            self.show_toast("修復を開始できませんでした(内部 ID が枯渇しました)".to_owned());
+            return;
+        };
+        let target = self.edit_target();
+        if !target.is_valid() {
+            self.show_toast("修復を開始できませんでした(内部 ID が枯渇しました)".to_owned());
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let repaint_ctx = ctx.clone();
+        // SPEC §53: `thread::spawn` は生成失敗で panic しうるので
+        // `thread::Builder::spawn`(Result)を使い、失敗はトーストにする。
+        let spawned = thread::Builder::new()
+            .name("darask-inpaint".to_owned())
+            .spawn(move || {
+                run_background_worker(
+                    job_id,
+                    move || inpaint::telea_inpaint(input).map_err(BackgroundJobError::Inpaint),
+                    &sender,
+                    || repaint_ctx.request_repaint(),
+                );
+            });
+        match spawned {
+            Ok(join) => {
+                self.background_job = Some(BackgroundJob {
+                    job_id,
+                    kind: BackgroundJobKind::BuiltinInpaint,
+                    tab_uid: self.active_tab().uid,
+                    doc_gen: self.active_tab().doc.content_gen,
+                    sel_gen: self.selection_gen(),
+                    target,
+                    edit_target_gen: self.active_tab().edit_target_gen,
+                    rect,
+                    cancel,
+                    receiver,
+                    join: Some(join),
+                });
+            }
+            Err(error) => {
+                self.show_toast(format!("修復を開始できませんでした: {error}"));
+            }
+        }
+    }
+
+    /// 選択 bbox+マージンの画素とマスクを切り出して `InpaintInput` にする。
+    /// 寸法計算は checked(巨大確保をワーカーへ持ち込まない)。
+    ///
+    /// v12 §50.3(アルファロック)対策: 透明保護が ON のとき、`dst_a == 0` の
+    /// 画素は適用時に `Surface::set_pixel` が**必ず捨てる**。それを未知画素と
+    /// して FMM に参加させると、捨てられる中間色が他画素の参照に使われて結果が
+    /// 変わってしまう(= 見えている書き込み対象と入力マスクが食い違う)。
+    /// そこで**発行時に実効マスクから外す**。400 万画素の判定も、この実効
+    /// マスクを数えた `unknown` に対して行われる(呼び出し側参照)。
+    fn build_inpaint_input(
+        &self,
+        rect: crate::document::IRect,
+        mask: &crate::document::SelMask,
+    ) -> Option<InpaintInput> {
+        let width = u32::try_from(rect.width()).ok()?;
+        let height = u32::try_from(rect.height()).ok()?;
+        let count = (width as usize).checked_mul(height as usize)?;
+        let byte_len = count.checked_mul(4)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(byte_len).ok()?;
+        let mut mask_out = Vec::new();
+        mask_out.try_reserve_exact(count).ok()?;
+        let doc = &self.active_tab().doc;
+        let alpha_lock = doc.active_layer().alpha_lock;
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                let px = doc.get_pixel(x, y).unwrap_or([0, 0, 0, 0]);
+                let selected = mask.get(x, y);
+                let writable = !alpha_lock || px[3] != 0;
+                pixels.extend_from_slice(&px);
+                mask_out.push(if writable { selected } else { 0 });
+            }
+        }
+        Some(InpaintInput {
+            pixels,
+            width,
+            height,
+            mask: mask_out,
+            radius: inpaint::INPAINT_RADIUS,
+        })
+    }
+
+    /// SPEC §53: 実行中ジョブのキャンセル(結果を破棄する。ワーカー自体は
+    /// 走り切るので、終わるまで single-flight は占有したまま)。
+    ///
+    /// v12 §53 の**終了契約**でもある: アプリ終了経路(`exit_process` /
+    /// `on_exit`)からも呼ばれ、**待たずに**「結果は要らない」とだけ伝える。
+    /// ワーカーの `JoinHandle` は `BackgroundJob::drop` で detach されるので
+    /// 終了がブロックされることはない(P6 の通信ワーカーを見据えた契約)。
+    fn cancel_background_job(&self) {
+        if let Some(job) = self.background_job.as_ref() {
+            job.cancel.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// ワーカーの結果が届いているフレームだけ処理する(`try_recv`。
+    /// ポーリングではない — フレームはワーカーの `request_repaint` が駆動する)。
+    ///
+    /// `Empty`(まだ走っている)と `Disconnected`(結果を送らないまま送信端が
+    /// 落ちた = ワーカーが異常終了した)を**必ず区別する**。両方を「結果なし」
+    /// として無視すると、single-flight の枠が永久に埋まったままになり、以後
+    /// 一切の修復が発行できなくなる(gpt-5.6-sol レビュー指摘)。
+    fn poll_background_job(&mut self) {
+        let Some(job) = self.background_job.as_ref() else {
+            return;
+        };
+        let received = match job.receiver.try_recv() {
+            Ok(result) => Some(result),
+            // まだ走っている。次の結果通知(= ワーカーの `request_repaint`)を待つ。
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        // ここまで来たらワーカーは終了済み。ジョブ枠を解放する
+        // (`BackgroundJob::drop` がキャンセルフラグを立てる = 終了契約)。
+        let Some(mut job) = self.background_job.take() else {
+            return;
+        };
+        // `join()` の `Err` は「ワーカーが unwind した」こと。`Ok` 前提で
+        // 握り潰さず、結果が届いていない理由の判定に使う。
+        let join_failed = matches!(job.join.take().map(JoinHandle::join), Some(Err(_)));
+        let cancelled = job.cancel.load(AtomicOrdering::Relaxed);
+
+        let outcome = match received {
+            Some(result) if result.job_id == job.job_id => result.outcome,
+            // 発行元が違う(理論上起きない)。取り違えを適用しない。
+            Some(_) => Err(BackgroundJobError::WorkerDisappeared),
+            None if join_failed => Err(BackgroundJobError::WorkerPanicked),
+            None => Err(BackgroundJobError::WorkerDisappeared),
+        };
+        if cancelled {
+            // SPEC §53: キャンセル後は結果を見ない(成功していても捨てる)。
+            self.show_toast("修復をキャンセルしました".to_owned());
+            return;
+        }
+        match outcome {
+            Ok(output) => self.apply_background_job_result(&job, output),
+            Err(error) => self.show_toast(error.message().to_owned()),
+        }
+    }
+
+    /// SPEC §55.1 の世代ガード。**発行時に捕獲した状態と現在の状態が全一致**
+    /// し、かつ進行中のストローク・浮動片が無いときだけ結果を適用してよい。
+    fn background_job_target_is_unchanged(&self, job: &BackgroundJob) -> bool {
+        let tab = self.active_tab();
+        job.tab_uid != INVALID_ID
+            && tab.uid == job.tab_uid
+            && tab.doc.content_gen == job.doc_gen
+            && self.selection_gen() == job.sel_gen
+            // アクティブレイヤーの同一性・重なり位置・透明保護
+            // (どれも `content_gen` では捕まらない)。
+            && job.target.is_valid()
+            && self.edit_target() == job.target
+            && tab.edit_target_gen == job.edit_target_gen
+            && !tab.history.has_open_stroke()
+            // 浮動片があると `commit_open_gesture` 前提が崩れる(確定時に
+            // 修復結果を上書きしうる)。明示的に拒否する。
+            && tab.floating.is_none()
+    }
+
+    /// 世代ガードを通ったときだけ、結果を 1 undo 単位で適用する。
+    fn apply_background_job_result(&mut self, job: &BackgroundJob, output: InpaintOutput) {
+        if !self.background_job_target_is_unchanged(job) {
+            self.show_toast("修復の結果は破棄されました(対象が変更されています)".to_owned());
+            return;
+        }
+        let rect = job
+            .rect
+            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        if rect.is_empty()
+            || rect.width() as u32 != output.width
+            || rect.height() as u32 != output.height
+        {
+            self.show_toast("修復の結果は破棄されました(対象が変更されています)".to_owned());
+            return;
+        }
+        // **履歴を開く前に**バッファ長を検証する。寸法だけ見て書き始めると、
+        // 短いバッファでは途中まで書いた状態で undo 単位が確定してしまう
+        // (内蔵処理では起きないが、P6 の外部応答も同じ経路に載るため)。
+        let expected_len = (output.width as usize)
+            .checked_mul(output.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if expected_len != Some(output.pixels.len()) {
+            self.show_toast(BackgroundJobError::InvalidOutput.message().to_owned());
+            return;
+        }
+
+        let tab = &mut self.tabs[self.active_tab];
+        tab.history.begin_stroke(tab.doc.active);
+        tab.history.ensure_tiles_saved(&tab.doc, rect);
+        {
+            // 書き込みは選択マスクでクリップされ、アルファロックも
+            // `Surface::set_pixel` が見る(SPEC §50.3)。
+            let clip = tab.selection.as_ref().map(|s| &s.mask);
+            let mut surface = tab.doc.active_surface_mut(clip);
+            for y in rect.y0..rect.y1 {
+                let row = (y - rect.y0) as usize * output.width as usize;
+                for x in rect.x0..rect.x1 {
+                    let idx = (row + (x - rect.x0) as usize) * 4;
+                    // 長さは上で検証済み。それでも添字は `get` で取る
+                    // (パニックしない I/O 経路。SPEC の鉄則)。
+                    let Some(px) = output.pixels.get(idx..idx + 4) else {
+                        continue;
+                    };
+                    surface.set_pixel(x, y, [px[0], px[1], px[2], px[3]]);
+                }
+            }
+        }
+        tab.doc.mark_dirty(rect);
+        tab.history
+            .commit_stroke(&mut tab.doc, job.kind.history_label());
+    }
+
     /// SPEC §24: 「階調の反転 (Ctrl+I) — 即時(RGB反転、アルファ不変)」。
     fn apply_invert(&mut self) {
         self.apply_tone_adjustment_immediate("階調の反転", raster::invert_pixel);
@@ -5120,6 +5622,11 @@ impl DaraskApp {
         // (並べ替えのように枚数が変わらない操作もあるため、枚数チェックだけ
         // では足りない)。サムネイルキャッシュは全消去する。
         self.active_tab_mut().thumbnails.invalidate_all();
+        self.active_tab_mut().edit_target_gen = self
+            .active_tab()
+            .edit_target_gen
+            .checked_add(1)
+            .unwrap_or(INVALID_ID);
     }
 
     /// SPEC §13: 「新規レイヤーは透明で名前は『レイヤー N』」。バグ修正:
@@ -5339,7 +5846,9 @@ impl DaraskApp {
             return;
         }
         self.commit_open_gesture();
-        self.active_tab_mut().doc.active = index;
+        let tab = self.active_tab_mut();
+        tab.doc.active = index;
+        tab.edit_target_gen = tab.edit_target_gen.checked_add(1).unwrap_or(INVALID_ID);
     }
 
     /// レイヤーパネルからの操作を配線する。
@@ -5430,6 +5939,7 @@ impl DaraskApp {
         if let Some(layer) = tab.doc.layers.get_mut(active) {
             if layer.alpha_lock != locked {
                 layer.alpha_lock = locked;
+                tab.edit_target_gen = tab.edit_target_gen.checked_add(1).unwrap_or(INVALID_ID);
                 tab.doc.modified = true;
                 tab.meta_dirty = true;
                 if let Some(floating) = tab.floating.as_mut() {
@@ -5473,7 +5983,9 @@ impl DaraskApp {
     // メニュー・モーダルのディスパッチ
     // -----------------------------------------------------------------
 
-    fn handle_menu_action(&mut self, action: MenuAction) {
+    /// v12 §53: `ctx` はワーカー完了時の `request_repaint` を予約するために
+    /// 必要(修復の発行だけが使う)。
+    fn handle_menu_action(&mut self, action: MenuAction, ctx: &egui::Context) {
         match action {
             // v5 §30: `begin_new_tab`/`begin_open_tab` のドキュメントコメント
             // 参照(新規タブ追加は既存タブを破壊しないため未保存ガード不要)。
@@ -5523,6 +6035,8 @@ impl DaraskApp {
             MenuAction::Deselect => self.commit_selection(),
             // v8 §37: 「選択範囲を反転」(Ctrl+Shift+I と同じ処理)。
             MenuAction::SelectInverse => self.invert_selection(),
+            // v12 §53: 「選択範囲を修復」(ワーカー実行。完了時に世代ガード)。
+            MenuAction::InpaintSelection => self.start_inpaint_selection(ctx),
             // v6 §33(ARCHITECTURE.md §18.1): 編集メニューに追加した
             // 「自由変形」。Ctrl+T(`Action::FreeTransform`)と全く同じ処理を
             // 呼ぶだけ(`free_transform` 自身が commit-first ガードを持つ、
@@ -5856,6 +6370,11 @@ impl eframe::App for DaraskApp {
         // ドキュメントコメント参照。
         self.tick_startup_nudge(ui.ctx());
 
+        // v12 §53: ワーカーの結果が届いていれば取り込む(`try_recv` なので
+        // 届いていないフレームは即座に抜ける = ポーリングではない。完了
+        // フレームはワーカー側の `request_repaint` 1 回が駆動する)。
+        self.poll_background_job();
+
         // 同ワークアラウンドの後段: 初回フレーム直後とウィンドウ内寸の変化
         // 直後は、合成器(DWM)のサーフェス作り直しと present が競合して
         // 「描画は成功しているのに画面に反映されない」ことがある(実機で
@@ -5936,6 +6455,8 @@ impl eframe::App for DaraskApp {
                 || self.active_tab().history.has_open_stroke(),
             can_redo: self.active_tab().history.can_redo(),
             has_selection,
+            // v12 §53: 実行中は多重発行させない(single-flight)。
+            background_job_running: self.background_job.is_some(),
             can_duplicate_selection_to_tab: has_selection,
             can_add_layer: layer_count < MAX_LAYERS,
             can_delete_layer: layer_count > 1,
@@ -5949,7 +6470,7 @@ impl eframe::App for DaraskApp {
             recent_files: &self.recent_files,
         };
         if let Some(action) = menu::show(ui, &menu_state) {
-            self.handle_menu_action(action);
+            self.handle_menu_action(action, ui.ctx());
         }
 
         // SPEC §30: メニューバーの直下に置くタブバー(横1列、水平スクロール)。
@@ -5972,14 +6493,24 @@ impl eframe::App for DaraskApp {
         // ステータスバーはレイアウト順の都合上キャンバスより先に描くため、
         // 表示するカーソル座標/ズームは 1 フレーム前の値になる
         // (ポインタ移動のたびにフレームが駆動されるため実用上は無視できる)。
-        status_bar::show(
+        // v12 §53: 実行中ジョブの表示とキャンセル。
+        let job_label = self
+            .background_job
+            .as_ref()
+            .filter(|job| !job.cancel.load(AtomicOrdering::Relaxed))
+            .map(|job| job.kind.status_label());
+        let cancel_clicked = status_bar::show(
             ui,
             &self.active_tab().doc,
             self.active_tab().view.hover_img(),
             self.active_tab().view.zoom,
             self.current_selection_size(),
             toast_text.as_deref(),
+            job_label,
         );
+        if cancel_clicked {
+            self.cancel_background_job();
+        }
 
         if let Some(action) = toolbar::show(ui, self.tool, self.lasso_mode) {
             match action {
@@ -6265,6 +6796,8 @@ impl eframe::App for DaraskApp {
     /// 呼ばれず、実 `%APPDATA%` を書き換えない(意図的、`exit_process` の
     /// ドキュメントコメント参照)。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // v12 §53 の終了契約(`cancel_background_job` のコメント参照)。
+        self.cancel_background_job();
         self.save_settings();
     }
 }
@@ -6364,6 +6897,8 @@ fn register_japanese_font(ctx: &egui::Context, bytes: Option<Vec<u8>>) -> Option
 mod tests {
     use super::*;
     use crate::document::{Background, IRect};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
 
     /// `DaraskApp::new` は `eframe::CreationContext`(フォント読み込みに
     /// egui の実 `Context` を要求)を必要とし、ユニットテストからは構築
@@ -6424,6 +6959,7 @@ mod tests {
             text_outline_width: settings::DEFAULT_TEXT_OUTLINE_WIDTH,
             text_preview_rasterizations: 0,
             text_edit: None,
+            background_job: None,
             modal: None,
             pending_action: None,
             pending_dialog: None,
@@ -7056,7 +7592,7 @@ mod tests {
 
         // undo(履歴の適用)。
         app.active_tab_mut().thumbnails.seed_rows_for_test(3);
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert_eq!(
             app.active_tab().thumbnails.cached_rows(),
             0,
@@ -7065,7 +7601,7 @@ mod tests {
 
         // redo。
         app.active_tab_mut().thumbnails.seed_rows_for_test(3);
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
         assert_eq!(
             app.active_tab().thumbnails.cached_rows(),
             0,
@@ -7183,7 +7719,7 @@ mod tests {
         let painted_stroke2 = app.active_tab().doc.get_pixel(10, 10);
         assert_ne!(painted_stroke2, Some([255, 255, 255, 255]));
 
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
 
         assert!(
             !app.active_tab().history.has_open_stroke(),
@@ -7221,7 +7757,7 @@ mod tests {
                 button: PointerButton::Primary,
             },
         ]);
-        app.handle_menu_action(MenuAction::Undo); // stroke1 -> redo スタックへ。
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default()); // stroke1 -> redo スタックへ。
         assert!(app.active_tab().history.can_redo());
 
         app.dispatch_canvas_events(vec![ToolEvent::Down {
@@ -7232,7 +7768,7 @@ mod tests {
         assert!(app.active_tab().history.has_open_stroke());
         let painted_stroke2 = app.active_tab().doc.get_pixel(10, 10);
 
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
 
         assert!(
             !app.active_tab().history.has_open_stroke(),
@@ -8080,9 +8616,9 @@ mod tests {
         app.finish_save(path, SaveFormat::Png);
         assert!(!app.active_tab().doc.modified, "保存直後は未変更");
 
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert!(app.active_tab().doc.modified, "保存位置から離れたら未保存");
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
         assert!(
             !app.active_tab().doc.modified,
             "redo で保存時と同じ内容に戻ったら未保存表示は消える"
@@ -8103,8 +8639,8 @@ mod tests {
         app.commit_rename_action(0, "改名".to_owned());
         assert!(app.active_tab().doc.modified);
 
-        app.handle_menu_action(MenuAction::Undo);
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
         assert!(
             app.active_tab().doc.modified,
             "履歴位置は保存時と同じでも、メタ変更があるので未保存のまま"
@@ -8120,7 +8656,7 @@ mod tests {
         app.tool = ToolKind::Pen;
         draw_one_stroke(&mut app, 2.0, 2.0);
         assert!(app.active_tab().doc.modified);
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert!(!app.active_tab().doc.modified);
     }
 
@@ -8134,10 +8670,10 @@ mod tests {
         draw_one_stroke(&mut app, 5.0, 5.0);
         app.finish_save(path, SaveFormat::Png);
 
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         draw_one_stroke(&mut app, 6.0, 6.0); // 保存位置より手前で新規 push
-        app.handle_menu_action(MenuAction::Undo);
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert!(
             app.active_tab().doc.modified,
             "保存済み状態はタイムライン書き換えで到達不能になった"
@@ -9105,7 +9641,7 @@ mod tests {
         app.panels.toggle_collapsed(PanelKind::Layers);
         assert_ne!(app.panels, PanelLayout::default());
 
-        app.handle_menu_action(MenuAction::ResetPanelLayout);
+        app.handle_menu_action(MenuAction::ResetPanelLayout, &egui::Context::default());
 
         assert_eq!(app.panels, PanelLayout::default());
         assert!(
@@ -11363,6 +11899,686 @@ mod tests {
         assert_eq!(app.text_preview_rasterizations, 4);
     }
 
+    // -- v12 §53: 選択範囲を修復(ワーカー実行・世代ガード)----------------
+
+    /// 修復ジョブを 1 本発行して**結果が届くまで待つ**テスト用ヘルパー
+    /// (`poll_background_job` は結果が無ければ即座に抜けるので、届くまで
+    /// 短い待機を挟んで回す)。
+    fn wait_for_background_job(app: &mut DaraskApp) {
+        for _ in 0..600 {
+            if app.background_job.is_none() {
+                return;
+            }
+            app.poll_background_job();
+            if app.background_job.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("ワーカーが終わらない");
+    }
+
+    /// 中央に穴(別色)を開けた単色ドキュメントと、その穴の選択を用意する。
+    fn app_with_hole_selection() -> DaraskApp {
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        let base = [30u8, 120, 200, 255];
+        for y in 0..40 {
+            for x in 0..40 {
+                app.active_tab_mut().doc.set_pixel(x, y, base);
+            }
+        }
+        for y in 16..24 {
+            for x in 16..24 {
+                app.active_tab_mut().doc.set_pixel(x, y, [255, 0, 0, 255]);
+            }
+        }
+        app.active_tab_mut().doc.recomposite_full();
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 16,
+            y0: 16,
+            x1: 24,
+            y1: 24,
+        })));
+        app
+    }
+
+    fn test_output(rect: IRect, color: [u8; 4]) -> InpaintOutput {
+        let width = rect.width() as u32;
+        let height = rect.height() as u32;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            pixels.extend_from_slice(&color);
+        }
+        InpaintOutput {
+            pixels,
+            width,
+            height,
+        }
+    }
+
+    fn test_background_job(
+        app: &DaraskApp,
+        job_id: u64,
+        rect: IRect,
+        cancel: Arc<AtomicBool>,
+        receiver: Receiver<BackgroundJobResult>,
+        join: Option<JoinHandle<()>>,
+    ) -> BackgroundJob {
+        BackgroundJob {
+            job_id,
+            kind: BackgroundJobKind::BuiltinInpaint,
+            tab_uid: app.active_tab().uid,
+            doc_gen: app.active_tab().doc.content_gen,
+            sel_gen: app.selection_gen(),
+            target: app.edit_target(),
+            edit_target_gen: app.active_tab().edit_target_gen,
+            rect,
+            cancel,
+            receiver,
+            join,
+        }
+    }
+
+    fn snapshot_test_job(app: &DaraskApp, rect: IRect) -> BackgroundJob {
+        let (_sender, receiver) = mpsc::channel();
+        test_background_job(
+            app,
+            NEXT_JOB_ID.next().expect("test job id"),
+            rect,
+            Arc::new(AtomicBool::new(false)),
+            receiver,
+            None,
+        )
+    }
+
+    fn assert_test_job_is_discarded(app: &mut DaraskApp, job: &BackgroundJob, reason: &str) {
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+        app.apply_background_job_result(job, test_output(job.rect, [1, 2, 3, 255]));
+        assert_eq!(app.active_tab().doc.active_pixels(), before, "{reason}");
+        assert_eq!(app.active_tab().history.undo_len(), undo_before, "{reason}");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("破棄")),
+            "{reason}"
+        );
+    }
+
+    fn install_test_worker<F>(
+        app: &mut DaraskApp,
+        compute: F,
+        repaint_count: Arc<AtomicUsize>,
+    ) -> u64
+    where
+        F: FnOnce() -> Result<InpaintOutput, BackgroundJobError>
+            + Send
+            + std::panic::UnwindSafe
+            + 'static,
+    {
+        let job_id = NEXT_JOB_ID.next().expect("test job id");
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_background_worker(job_id, compute, &sender, || {
+                repaint_count.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+        });
+        app.background_job = Some(test_background_job(
+            app,
+            job_id,
+            rect,
+            cancel,
+            receiver,
+            Some(join),
+        ));
+        job_id
+    }
+
+    #[test]
+    fn inpaint_selection_repairs_the_hole_as_one_undo_step() {
+        let mut app = app_with_hole_selection();
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+        let ctx = egui::Context::default();
+
+        app.start_inpaint_selection(&ctx);
+        assert!(app.background_job.is_some(), "ジョブが発行される");
+        wait_for_background_job(&mut app);
+
+        assert_eq!(
+            app.active_tab().history.undo_len(),
+            undo_before + 1,
+            "1 undo 単位で適用される"
+        );
+        // 穴が周囲の色で埋まっている(赤が消えている)。
+        for y in 16..24 {
+            for x in 16..24 {
+                let px = app.active_tab().doc.get_pixel(x, y).expect("in-bounds");
+                assert!(
+                    px[0] < 200 && px[2] > 100,
+                    "({x},{y}) が修復されていない: {px:?}"
+                );
+            }
+        }
+        // undo で完全復元。
+        {
+            let tab = app.active_tab_mut();
+            assert!(tab.history.undo(&mut tab.doc));
+        }
+        assert_eq!(app.active_tab().doc.active_pixels(), before);
+    }
+
+    #[test]
+    fn inpaint_requires_a_selection_and_is_single_flight() {
+        let ctx = egui::Context::default();
+        // 選択が無ければトーストだけ。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.start_inpaint_selection(&ctx);
+        assert!(app.background_job.is_none());
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.0.contains("選択範囲が必要")));
+
+        // 実行中は 2 本目を発行しない(single-flight)。
+        let mut app = app_with_hole_selection();
+        app.start_inpaint_selection(&ctx);
+        let first_id = app.background_job.as_ref().map(|j| j.job_id);
+        assert!(first_id.is_some());
+        app.start_inpaint_selection(&ctx);
+        assert_eq!(
+            app.background_job.as_ref().map(|j| j.job_id),
+            first_id,
+            "2 重発行されない"
+        );
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("処理中")));
+        wait_for_background_job(&mut app);
+    }
+
+    #[test]
+    fn inpaint_rejects_a_full_selection_before_spawning_a_worker() {
+        let ctx = egui::Context::default();
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 20,
+            y1: 20,
+        })));
+        app.start_inpaint_selection(&ctx);
+        assert!(app.background_job.is_none(), "ワーカーを起こさない");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.0.contains("全体が選択")));
+    }
+
+    /// SPEC §53: キャンセルすると結果は適用されない(履歴も増えない)。
+    #[test]
+    fn cancelling_discards_the_result() {
+        let mut app = app_with_hole_selection();
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+        let ctx = egui::Context::default();
+
+        app.start_inpaint_selection(&ctx);
+        app.cancel_background_job();
+        wait_for_background_job(&mut app);
+
+        assert_eq!(app.active_tab().doc.active_pixels(), before, "画素は不変");
+        assert_eq!(app.active_tab().history.undo_len(), undo_before);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.0.contains("キャンセル")));
+    }
+
+    /// SPEC §55.1 の世代ガード: 完了時に対象が変わっていたら破棄する。
+    #[test]
+    fn generation_guard_discards_results_when_the_target_changed() {
+        let ctx = egui::Context::default();
+
+        // ① 文書が変わった(別の描画が入った)。
+        let mut app = app_with_hole_selection();
+        app.start_inpaint_selection(&ctx);
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        {
+            // content_gen を進める(= 画素内容が変わった)。
+            let tab = app.active_tab_mut();
+            tab.doc.bump_content_gen();
+        }
+        wait_for_background_job(&mut app);
+        assert_eq!(
+            app.active_tab().doc.active_pixels(),
+            before,
+            "文書が変わっていたら適用しない"
+        );
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("破棄")));
+
+        // ② 選択が変わった。
+        let mut app = app_with_hole_selection();
+        app.start_inpaint_selection(&ctx);
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 1,
+            y0: 1,
+            x1: 5,
+            y1: 5,
+        })));
+        wait_for_background_job(&mut app);
+        assert_eq!(
+            app.active_tab().doc.active_pixels(),
+            before,
+            "選択が変わっていたら適用しない"
+        );
+
+        // ③ タブが切り替わった(タブ安定 ID の不一致)。
+        let mut app = app_with_hole_selection();
+        app.start_inpaint_selection(&ctx);
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        app.open_new_tab(Document::new(10, 10, Background::White));
+        assert_ne!(app.active_tab().uid, 0);
+        wait_for_background_job(&mut app);
+        app.switch_tab(0);
+        assert_eq!(
+            app.active_tab().doc.active_pixels(),
+            before,
+            "別タブへ切り替わっていたら適用しない"
+        );
+    }
+
+    #[test]
+    fn generation_guard_discards_after_layer_switch() {
+        let mut app = app_with_hole_selection();
+        app.layer_add();
+        app.set_active_layer(0);
+        let job = snapshot_test_job(
+            &app,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+
+        app.set_active_layer(1);
+
+        assert_test_job_is_discarded(&mut app, &job, "レイヤー切替後は適用しない");
+    }
+
+    #[test]
+    fn generation_guard_discards_after_switching_away_and_back() {
+        let mut app = app_with_hole_selection();
+        app.layer_add();
+        app.set_active_layer(0);
+        let job = snapshot_test_job(
+            &app,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+        let original_target = app.edit_target();
+
+        app.set_active_layer(1);
+        app.set_active_layer(0);
+
+        assert_eq!(
+            app.edit_target(),
+            original_target,
+            "現在値だけでは変更を検出できない"
+        );
+        assert_test_job_is_discarded(
+            &mut app,
+            &job,
+            "別レイヤーへ切り替えて元へ戻しても適用しない",
+        );
+    }
+
+    #[test]
+    fn generation_guard_discards_after_alpha_lock_changes() {
+        let mut app = app_with_hole_selection();
+        let job = snapshot_test_job(
+            &app,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+        let original_target = app.edit_target();
+
+        app.set_active_layer_alpha_lock(true);
+        app.set_active_layer_alpha_lock(false);
+
+        assert_eq!(
+            app.edit_target(),
+            original_target,
+            "現在の透明保護値は元へ戻っている"
+        );
+        assert_test_job_is_discarded(&mut app, &job, "透明保護を変更して元へ戻しても適用しない");
+    }
+
+    #[test]
+    fn generation_guard_discards_after_layer_add_or_delete() {
+        let mut added = app_with_hole_selection();
+        let add_job = snapshot_test_job(
+            &added,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+        added.layer_add();
+        assert_test_job_is_discarded(&mut added, &add_job, "レイヤー追加後は適用しない");
+
+        let mut deleted = app_with_hole_selection();
+        deleted.layer_add();
+        let delete_job = snapshot_test_job(
+            &deleted,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+        deleted.layer_delete();
+        assert_test_job_is_discarded(&mut deleted, &delete_job, "レイヤー削除後は適用しない");
+    }
+
+    #[test]
+    fn generation_guard_discards_after_undo_or_redo() {
+        let ctx = egui::Context::default();
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let mut app = app_with_hole_selection();
+        {
+            let tab = app.active_tab_mut();
+            tab.history.begin_stroke(tab.doc.active);
+            tab.history.ensure_tiles_saved(&tab.doc, rect);
+            tab.doc.set_pixel(0, 0, [9, 8, 7, 255]);
+            tab.doc.mark_dirty(rect);
+            tab.history.commit_stroke(&mut tab.doc, "test edit");
+        }
+
+        let undo_job = snapshot_test_job(&app, rect);
+        app.handle_menu_action(MenuAction::Undo, &ctx);
+        assert_test_job_is_discarded(&mut app, &undo_job, "undo 後は適用しない");
+
+        let redo_job = snapshot_test_job(&app, rect);
+        app.handle_menu_action(MenuAction::Redo, &ctx);
+        assert_test_job_is_discarded(&mut app, &redo_job, "redo 後は適用しない");
+    }
+
+    #[test]
+    fn generation_guard_discards_after_floating_is_created() {
+        let mut app = app_with_hole_selection();
+        let job = snapshot_test_job(
+            &app,
+            IRect {
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24,
+            },
+        );
+
+        app.begin_paste_floating(1, 1, vec![5, 6, 7, 255]);
+
+        assert!(app.active_tab().floating.is_some());
+        assert_test_job_is_discarded(&mut app, &job, "浮動片の生成後は適用しない");
+    }
+
+    #[test]
+    fn generation_guard_discards_after_target_tab_is_closed_and_recreated() {
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.open_new_tab(Document::new(8, 8, Background::White));
+        app.switch_tab(0);
+        let closed_uid = app.active_tab().uid;
+        let job = snapshot_test_job(
+            &app,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 1,
+                y1: 1,
+            },
+        );
+
+        app.close_tab(0);
+        app.open_new_tab(Document::new(8, 8, Background::White));
+
+        assert!(
+            app.tabs.iter().all(|tab| tab.uid != closed_uid),
+            "閉じた UID は再利用しない"
+        );
+        assert_test_job_is_discarded(
+            &mut app,
+            &job,
+            "対象タブを閉じて新規タブを作っても適用しない",
+        );
+    }
+
+    #[test]
+    fn worker_panic_releases_the_slot_and_shows_a_toast() {
+        let mut app = app_with_hole_selection();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        install_test_worker(
+            &mut app,
+            || -> Result<InpaintOutput, BackgroundJobError> { panic!("test panic") },
+            Arc::clone(&repaint_count),
+        );
+
+        wait_for_background_job(&mut app);
+
+        assert!(app.background_job.is_none(), "panic 後に枠を解放する");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("異常終了")));
+        assert_eq!(repaint_count.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sender_drop_releases_the_slot_and_shows_a_toast() {
+        let mut app = app_with_hole_selection();
+        let job_id = NEXT_JOB_ID.next().expect("test job id");
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let join = thread::spawn(|| {});
+        app.background_job = Some(test_background_job(
+            &app,
+            job_id,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 1,
+                y1: 1,
+            },
+            Arc::new(AtomicBool::new(false)),
+            receiver,
+            Some(join),
+        ));
+
+        wait_for_background_job(&mut app);
+
+        assert!(app.background_job.is_none(), "sender drop 後に枠を解放する");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("結果を返さず")));
+    }
+
+    #[test]
+    fn cancellation_holds_the_slot_until_worker_exit_then_allows_reissue() {
+        let mut app = app_with_hole_selection();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        let first_id = install_test_worker(
+            &mut app,
+            move || {
+                worker_barrier.wait();
+                Ok(test_output(
+                    IRect {
+                        x0: 0,
+                        y0: 0,
+                        x1: 1,
+                        y1: 1,
+                    },
+                    [0, 0, 0, 255],
+                ))
+            },
+            Arc::clone(&repaint_count),
+        );
+
+        app.cancel_background_job();
+        app.poll_background_job();
+        assert_eq!(
+            app.background_job.as_ref().map(|job| job.job_id),
+            Some(first_id)
+        );
+        app.start_inpaint_selection(&egui::Context::default());
+        assert_eq!(
+            app.background_job.as_ref().map(|job| job.job_id),
+            Some(first_id)
+        );
+
+        barrier.wait();
+        wait_for_background_job(&mut app);
+        assert!(app.background_job.is_none());
+        assert_eq!(
+            repaint_count.load(AtomicOrdering::Relaxed),
+            1,
+            "キャンセル完了も 1 回だけ再描画"
+        );
+
+        app.start_inpaint_selection(&egui::Context::default());
+        assert!(app.background_job.is_some(), "worker 終了後は再発行できる");
+        wait_for_background_job(&mut app);
+    }
+
+    #[test]
+    fn invalid_output_length_is_rejected_before_history_starts() {
+        let mut app = app_with_hole_selection();
+        let rect = IRect {
+            x0: 16,
+            y0: 16,
+            x1: 24,
+            y1: 24,
+        };
+        let job = snapshot_test_job(&app, rect);
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+        let mut output = test_output(rect, [1, 2, 3, 255]);
+        output.pixels.pop();
+
+        app.apply_background_job_result(&job, output);
+
+        assert_eq!(app.active_tab().doc.active_pixels(), before);
+        assert_eq!(app.active_tab().history.undo_len(), undo_before);
+        assert!(!app.active_tab().history.has_open_stroke());
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("壊れて")));
+    }
+
+    #[test]
+    fn background_worker_requests_repaint_once_for_success_error_and_panic() {
+        let cases: [Box<
+            dyn FnOnce() -> Result<InpaintOutput, BackgroundJobError> + std::panic::UnwindSafe,
+        >; 3] = [
+            Box::new(|| {
+                Ok(test_output(
+                    IRect {
+                        x0: 0,
+                        y0: 0,
+                        x1: 1,
+                        y1: 1,
+                    },
+                    [1, 2, 3, 255],
+                ))
+            }),
+            Box::new(|| Err(BackgroundJobError::WorkerDisappeared)),
+            Box::new(|| panic!("test panic")),
+        ];
+
+        for (index, compute) in cases.into_iter().enumerate() {
+            let (sender, receiver) = mpsc::channel();
+            let repaint_count = AtomicUsize::new(0);
+            run_background_worker(index as u64, compute, &sender, || {
+                repaint_count.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+            let result = receiver.recv().expect("worker result");
+            assert_eq!(result.job_id, index as u64);
+            assert_eq!(
+                repaint_count.load(AtomicOrdering::Relaxed),
+                1,
+                "case {index}"
+            );
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    /// タブの安定 ID は作成順に増え、閉じても再利用されない(添字と違って
+    /// 詰まらない)。
+    #[test]
+    fn tab_uids_are_stable_and_monotonic() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        let first = app.active_tab().uid;
+        app.open_new_tab(Document::new(10, 10, Background::White));
+        let second = app.active_tab().uid;
+        assert!(second > first, "作成順に増える");
+        app.close_tab(app.active_tab);
+        app.open_new_tab(Document::new(10, 10, Background::White));
+        let third = app.active_tab().uid;
+        assert!(third > second, "閉じても番号は再利用されない");
+    }
+
+    /// 選択の世代は選択を作り直すたびに増える(世代ガードの土台)。
+    #[test]
+    fn selection_generations_increase_on_every_new_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        assert_eq!(app.selection_gen(), None, "選択なしは None");
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        })));
+        let first = app.selection_gen();
+        assert!(first.is_some());
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        })));
+        assert!(app.selection_gen() > first, "作り直せば世代が進む");
+    }
+
     // -- v12 §52.2: 袋文字(縁取り)----------------------------------------
 
     /// SPEC §52.2: 袋文字 ON でも、クリック位置に対する**文字の見た目の位置**は
@@ -12206,7 +13422,7 @@ mod tests {
         // ① undo(履歴操作)。
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         start_drag(&mut app);
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert!(app.select_brush_stroke.is_none());
         assert!(app.active_tab().selection.is_some(), "確定済みの選択は残る");
 
@@ -12838,7 +14054,7 @@ mod tests {
             (5, 5)
         );
 
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert_eq!(
             (app.active_tab().doc.width, app.active_tab().doc.height),
             (20, 20),
@@ -12854,7 +14070,7 @@ mod tests {
             y1: 18,
         })));
 
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
         assert_eq!(
             (app.active_tab().doc.width, app.active_tab().doc.height),
             (5, 5),
@@ -12872,7 +14088,7 @@ mod tests {
     fn undo_of_a_shrinking_resize_keeps_a_still_overlapping_selection_clamped_and_paintable() {
         let mut app = new_for_test(Document::new(20, 20, Background::White));
         app.confirm_canvas_resize(10, 10);
-        app.handle_menu_action(MenuAction::Undo);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
         assert_eq!(
             (app.active_tab().doc.width, app.active_tab().doc.height),
             (20, 20)
@@ -12886,7 +14102,7 @@ mod tests {
             y1: 15,
         })));
 
-        app.handle_menu_action(MenuAction::Redo);
+        app.handle_menu_action(MenuAction::Redo, &egui::Context::default());
         assert_eq!(
             (app.active_tab().doc.width, app.active_tab().doc.height),
             (10, 10)

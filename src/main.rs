@@ -9,6 +9,7 @@ mod canvas_view;
 mod document;
 mod history;
 mod icon;
+mod inpaint;
 mod io;
 mod keymap;
 mod project;

@@ -14,11 +14,63 @@
 //! バッファへ順に適用する。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::raster::{self, Surface};
 
 /// SPEC §13: レイヤーは上限 64 枚。
 pub const MAX_LAYERS: usize = 64;
+
+/// v12 §53: 「識別子が無い」ことを表す予約値。世代ガード
+/// (`app.rs` の `BackgroundJob`)は**この値を決して一致とみなさない**ので、
+/// 採番が枯渇した場合は安全側(結果を捨てる)に倒れる。
+pub const INVALID_ID: u64 = 0;
+
+/// v12 §53(ARCHITECTURE.md §22.4): プロセス内で単調増加する識別子の採番。
+///
+/// タブ・レイヤー・選択・非同期ジョブの「安定 ID」を 1 つの実装に集約する。
+/// `fetch_add` を素で使うと `u64` を一周した後に 0 と既存 ID を再利用して
+/// しまう(= 世代ガードが誤って一致する)ため、**checked**(`checked_add`)で
+/// 払い出し、枯渇したら `None` を返す。呼び出し側は `None` を
+/// `INVALID_ID`(= 決して一致しない)へ倒すか、ジョブ発行自体を諦める。
+pub struct IdAllocator(AtomicU64);
+
+impl IdAllocator {
+    /// `INVALID_ID`(0)は予約値なので 1 から配る。
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    /// 次の ID。枯渇(`u64::MAX` まで配り切った)なら `None`。
+    pub fn next(&self) -> Option<u64> {
+        self.0
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                v.checked_add(1)
+            })
+            .ok()
+    }
+
+    /// 枯渇時に `INVALID_ID` へ倒す版(ID を持てないと構造体が作れない
+    /// `Layer`/`Tab` 用。`INVALID_ID` は世代ガードで常に不一致になる)。
+    pub fn next_or_invalid(&self) -> u64 {
+        self.next().unwrap_or(INVALID_ID)
+    }
+}
+
+impl Default for IdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `Layer::uid` の採番(v12 §53: 適用先レイヤーの同一性判定)。
+static NEXT_LAYER_UID: IdAllocator = IdAllocator::new();
+
+/// 新しいレイヤー安定 UID を払い出す(`Layer` を構造体リテラルで組み立てる
+/// 数少ない経路 — `history.rs`/`project.rs` の復元など — から使う)。
+pub fn next_layer_uid() -> u64 {
+    NEXT_LAYER_UID.next_or_invalid()
+}
 
 /// SPEC §7/§16/§36: 扱う画像寸法の上限(1 辺、px)。新規ダイアログ(1–8192)、
 /// 浮動片の拡縮上限、`.dpaint` の防御上限と同じ値。v8 レビュー修正で
@@ -310,6 +362,17 @@ impl BlendMode {
 /// v2 §13/§14.1: 1 枚のレイヤー。RGBA8・行優先、`Document` と同寸。
 #[derive(Clone)]
 pub struct Layer {
+    /// v12 §53: **レイヤーの安定 UID**(作成順に単調増加、添字と違って
+    /// 並べ替え・削除で意味が変わらない)。非同期ジョブ(修復・§55 の
+    /// プラグイン)が「発行時に見ていたレイヤー」と「完了時のアクティブ
+    /// レイヤー」の同一性を確かめるために使う。
+    ///
+    /// `Clone` は UID をそのまま引き継ぐ(undo 用のスナップショットや
+    /// 履歴からの復元は**同じレイヤーの別時点**であって別レイヤーでは
+    /// ないため)。明示的に別レイヤーを作る経路(複製)だけが
+    /// `next_layer_uid()` で新しい UID を振り直す。`.dpaint` には保存
+    /// しない(プロセス内でだけ意味を持つ実行時 ID)。
+    pub uid: u64,
     /// V2-M2(レイヤー UI)の右パネルに一覧表示・変更される(SPEC §13)。
     pub name: String,
     pub visible: bool,
@@ -336,6 +399,7 @@ impl Layer {
             pixels.extend_from_slice(&fill);
         }
         Self {
+            uid: next_layer_uid(),
             name: name.into(),
             visible: true,
             opacity: 255,
@@ -350,6 +414,7 @@ impl Layer {
     /// v12 §50 でメタが 2 つ増えたときに書き漏らしが起きないようにする)。
     pub fn from_pixels(name: impl Into<String>, pixels: Vec<u8>) -> Self {
         Self {
+            uid: next_layer_uid(),
             name: name.into(),
             visible: true,
             opacity: 255,
@@ -844,7 +909,9 @@ impl Document {
             return false;
         }
         let idx = self.active_index();
-        let dup = self.layers[idx].clone();
+        let mut dup = self.layers[idx].clone();
+        // 複製は**別レイヤー**なので UID を振り直す(v12 §53)。
+        dup.uid = next_layer_uid();
         let insert_at = idx + 1;
         self.layers.insert(insert_at, dup);
         self.active = insert_at;
@@ -1460,6 +1527,7 @@ mod tests {
     #[test]
     fn project_snapshot_constructor_rebuilds_composite_and_state() {
         let bottom = Layer {
+            uid: next_layer_uid(),
             name: "背景".to_owned(),
             visible: true,
             opacity: 255,
@@ -1468,6 +1536,7 @@ mod tests {
             pixels: vec![10, 20, 30, 255],
         };
         let top = Layer {
+            uid: next_layer_uid(),
             name: "上".to_owned(),
             visible: false,
             opacity: 255,

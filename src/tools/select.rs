@@ -13,6 +13,8 @@
 //! (SPEC §6:「浮動片はキャンバス外にはみ出してよい(確定時にクリップ)」)
 //! でパニックしないことを保証する。
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
 use eframe::egui::{self, pos2, vec2, Pos2, Rect};
 
 use crate::document::{Document, IRect, SelMask};
@@ -30,12 +32,28 @@ use crate::raster;
 pub struct Selection {
     pub mask: SelMask,
     pub boundary: Vec<[Pos2; 2]>,
+    /// v12 §53: **選択の世代**(生成ごとに単調増加する識別子)。
+    ///
+    /// 非同期ジョブ(修復・§55 のプラグイン)は発行時にこの値を捕捉し、
+    /// 完了時に一致するときだけ結果を適用する(SPEC §55.1 の世代ガード)。
+    /// `Selection` は生成後イミュータブル(常に丸ごと置き換えられる)なので、
+    /// `new` で 1 回払い出すだけで「選択が変わったか」を厳密に判定できる。
+    /// `Clone` は同じ世代を保つ(内容が同じなら同じ選択)。
+    pub gen: u64,
 }
+
+/// `Selection::gen` の採番(プロセス内で単調増加。0 は「選択なし」を表す
+/// 予約値なので 1 から始める)。
+static NEXT_SELECTION_GEN: AtomicU64 = AtomicU64::new(1);
 
 impl Selection {
     pub fn new(mask: SelMask) -> Self {
         let boundary = mask_boundary(&mask);
-        Self { mask, boundary }
+        Self {
+            mask,
+            boundary,
+            gen: NEXT_SELECTION_GEN.fetch_add(1, AtomicOrdering::Relaxed),
+        }
     }
 }
 

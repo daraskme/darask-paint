@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::document::{DocSnapshot, Document, IRect, Layer, MAX_LAYERS};
+use crate::document::{next_layer_uid, DocSnapshot, Document, IRect, Layer, MAX_LAYERS};
 use crate::history::{History, HistoryEntry, HistoryOp, PatchRegion};
 
 const MAGIC: &[u8; 8] = b"DPAINT\x1a\0";
@@ -1115,6 +1115,8 @@ fn decode_layer(
     }
     Ok((
         Layer {
+            // UID は `.dpaint` に保存しない実行時 ID(v12 §53)。
+            uid: next_layer_uid(),
             name,
             visible,
             opacity,
@@ -2440,6 +2442,7 @@ mod tests {
     fn v1_round_trip_restores_layers_undo_redo_and_middle_cursor() {
         let mut doc = Document::new(4, 3, Background::Transparent);
         doc.layers.push(Layer {
+            uid: next_layer_uid(),
             name: "上レイヤー".to_owned(),
             visible: false,
             opacity: 123,
@@ -2629,6 +2632,7 @@ mod tests {
         let merged = crate::document::composite_two(&lower_before, &upper, 2, 2);
         let merged_name = lower_before.name.clone();
         doc.layers[0] = Layer {
+            uid: next_layer_uid(),
             name: merged_name.clone(),
             visible: true,
             opacity: 255,

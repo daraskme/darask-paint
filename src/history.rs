@@ -920,6 +920,7 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             doc.layers.insert(
                 idx,
                 Layer {
+                    uid: crate::document::next_layer_uid(),
                     name: name.clone(),
                     // v10 §47: 追加後に変更されたメタも redo で復元する
                     // (`refresh_op_for_redo` が undo 時に刷新した値)。
@@ -973,6 +974,10 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             if lower_idx < doc.layers.len() {
                 let merged = composite_two(lower_before, upper, width, height);
                 doc.layers[lower_idx] = Layer {
+                    // 結合の undo で作り直す下側レイヤー。UID は保存していない
+                    // ので新しく払い出す(レイヤー構成の変更は content_gen も
+                    // 動くため、世代ガードはどちらでも破棄側に倒れる)。
+                    uid: crate::document::next_layer_uid(),
                     name: merged_name.clone(),
                     visible: *merged_visible,
                     opacity: *merged_opacity,

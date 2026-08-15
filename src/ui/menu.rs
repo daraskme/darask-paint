@@ -74,6 +74,8 @@ pub enum MenuAction {
     /// v8 §37: 「選択範囲を反転」(Ctrl+Shift+I)。選択マスクの補集合を
     /// 新しい選択にする(`app.rs::invert_selection`)。
     SelectInverse,
+    /// v12 §53: 「選択範囲を修復」(内蔵 Telea/FMM。ワーカー実行)。
+    InpaintSelection,
     /// v6 §33(ARCHITECTURE.md §18.1): 編集メニューに新規追加された
     /// 「自由変形」(Ctrl+T と同じ、`app.rs::free_transform` を呼ぶだけ。
     /// v3 §18 で実装済みの機能に、メニューからのアクセス経路を追加する)。
@@ -146,6 +148,7 @@ impl MenuAction {
             Self::SelectAll => "全選択",
             Self::Deselect => "選択解除",
             Self::SelectInverse => "選択反転",
+            Self::InpaintSelection => "修復",
             Self::FreeTransform => "自由変形",
             Self::ImageResize => "画像サイズ",
             Self::CanvasResize => "キャンバス",
@@ -187,6 +190,9 @@ pub struct MenuState<'a> {
     pub can_redo: bool,
     /// 選択または浮動片がある(切り取り/コピー/削除/トリミングを有効にする)。
     pub has_selection: bool,
+    /// v12 §53: 非同期ジョブ(修復)が実行中か。実行中は多重発行を防ぐため
+    /// 該当メニューを無効化する。
+    pub background_job_running: bool,
     /// v5 §31(ARCHITECTURE.md §17.6): 「選択範囲を新規タブに複製」の有効/
     /// 無効(`has_selection` と同じ値でよい)。
     pub can_duplicate_selection_to_tab: bool,
@@ -526,6 +532,14 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             Action::SelectInverse,
             icons::paint_select_inverse_icon,
             MenuAction::SelectInverse,
+        ),
+        // v12 §53: 「選択範囲を修復」(選択があるときのみ有効。実行中は
+        // 多重発行できないので無効化する)。
+        mi(
+            state.has_selection && !state.background_job_running,
+            "選択範囲を修復",
+            icons::paint_inpaint_icon,
+            MenuAction::InpaintSelection,
         ),
         // v6 §33: 編集メニューに新規追加(`MenuAction::FreeTransform`
         // ドキュメントコメント参照)。
@@ -905,6 +919,7 @@ mod tests {
             can_undo: true,
             can_redo: true,
             has_selection: true,
+            background_job_running: false,
             can_duplicate_selection_to_tab: true,
             can_add_layer: true,
             can_delete_layer: true,
@@ -982,15 +997,21 @@ mod tests {
         }
     }
 
+    /// 既定ウィンドウ幅(1280px)での行数。項目が増えるたびに 1 行あたりの
+    /// 収容数(約 25 スロット)を超えると行が増える。v12 §53 で「選択範囲を
+    /// 修復」が加わり 54 スロットになったため 3 行になった(SPEC §33 は行数を
+    /// 定めておらず、本質は ARCHITECTURE.md §18.6-6 の「最小幅でも操作不能に
+    /// ならない」こと — 下の 640px のテストが担保する)。これ以上増えると
+    /// キャンバスの高さを圧迫するので、上限を明示して気づけるようにしておく。
     #[test]
-    fn default_window_width_layout_stays_within_two_rows() {
+    fn default_window_width_layout_stays_within_three_rows() {
         let recent_files = std::collections::VecDeque::new();
         let state = all_enabled_state(&recent_files);
         let slots = build_slots(&state);
         let rows = pack_rows(&slots, 1280.0 - PANEL_MARGIN_H * 2.0, ROW_ITEM_SPACING_X);
         assert!(
-            rows.len() <= 2,
-            "既定幅では 2 行以内(実際は {} 行)",
+            rows.len() <= 3,
+            "既定幅では 3 行以内(実際は {} 行)",
             rows.len()
         );
     }
@@ -1024,6 +1045,7 @@ mod tests {
             can_undo: false,
             can_redo: false,
             has_selection: false,
+            background_job_running: false,
             can_duplicate_selection_to_tab: false,
             can_add_layer: true,
             can_delete_layer: false,
@@ -1040,9 +1062,10 @@ mod tests {
         // v11 §48 で「切り出し」が加わり 46(+区切り 5 = 51)。
         // v12 §58 で表示グループに「パネル配置をリセット」が加わり 47(+5 = 52)。
         // v12 §51.1 で色調補正グループに「モザイク…」が加わり 48(+5 = 53)。
-        assert_eq!(item_count, 48);
+        // v12 §53 で編集グループに「選択範囲を修復」が加わり 49(+5 = 54)。
+        assert_eq!(item_count, 49);
         assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 53);
+        assert_eq!(slots.len(), 54);
     }
 
     /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を
@@ -1060,6 +1083,7 @@ mod tests {
             can_undo: false,
             can_redo: false,
             has_selection: false,
+            background_job_running: false,
             can_duplicate_selection_to_tab: false,
             can_add_layer: true,
             can_delete_layer: false,

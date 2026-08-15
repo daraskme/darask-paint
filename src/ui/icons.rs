@@ -1028,6 +1028,48 @@ pub fn paint_invert_icon(painter: &Painter, rect: Rect, color: Color32) {
     painter.add(Shape::convex_polygon(half, color, Stroke::NONE));
 }
 
+/// v12 §53: 編集 = 選択範囲を修復(破線の選択枠 + 傷を消す「絆創膏」風の
+/// 斜め帯。「選択の中を周囲から埋める」ことを示す)。
+pub fn paint_inpaint_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    // 破線の選択枠(`select_icon` と同じ意匠)。
+    let frame = Rect::from_min_max(p(rect, 0.10, 0.10), p(rect, 0.90, 0.90));
+    let dash = rect.width() * 0.14;
+    let mut x = frame.min.x;
+    while x < frame.max.x {
+        let x1 = (x + dash * 0.6).min(frame.max.x);
+        painter.line_segment([pos2(x, frame.min.y), pos2(x1, frame.min.y)], st);
+        painter.line_segment([pos2(x, frame.max.y), pos2(x1, frame.max.y)], st);
+        x += dash;
+    }
+    let mut y = frame.min.y;
+    while y < frame.max.y {
+        let y1 = (y + dash * 0.6).min(frame.max.y);
+        painter.line_segment([pos2(frame.min.x, y), pos2(frame.min.x, y1)], st);
+        painter.line_segment([pos2(frame.max.x, y), pos2(frame.max.x, y1)], st);
+        y += dash;
+    }
+    // 斜めの帯(絆創膏)。
+    let center = p(rect, 0.5, 0.5);
+    let half = vec2(rect.width() * 0.30, rect.height() * 0.13);
+    let angle: f32 = -0.7;
+    let (sin, cos) = angle.sin_cos();
+    let rotate = |v: Vec2| vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos);
+    let corners: Vec<Pos2> = [
+        vec2(-half.x, -half.y),
+        vec2(half.x, -half.y),
+        vec2(half.x, half.y),
+        vec2(-half.x, half.y),
+    ]
+    .into_iter()
+    .map(|v| center + rotate(v))
+    .collect();
+    let outline = rounded_polygon(&corners, half.y * 0.8, 4);
+    painter.add(Shape::closed_line(outline, st));
+    // 中央の点(修復した跡)。
+    painter.circle_filled(center, rect.width() * 0.05, color);
+}
+
 /// v12 §51.1: 画像 = モザイク(格子ごとにブロック平均で塗り潰した見た目)。
 pub fn paint_mosaic_icon(painter: &Painter, rect: Rect, color: Color32) {
     // v12 §51.1: モザイク = 濃淡の違う 3x3 のブロック(格子平均の見た目)。
