@@ -89,6 +89,9 @@ pub const DEFAULT_MAX_UNDO_STEPS: u32 = 50;
 pub const MIN_MAX_UNDO_STEPS: u32 = 1;
 pub const MAX_MAX_UNDO_STEPS: u32 = 500;
 
+pub const DEFAULT_IOPAINT_PORT: u16 = 8423;
+pub const DEFAULT_DIFFUSION_PORT: u16 = 8424;
+
 /// 永続化する設定(SPEC §26 の列挙そのもの。これ以外のフィールドを足さない
 /// こと — 「最近使った色」は同 SPEC の永続化対象リストに含まれていないため
 /// ここには無い)。
@@ -131,6 +134,8 @@ pub struct Settings {
     /// ダイアログの OK で更新され、開いている全タブへ即座に反映される
     /// (`app.rs::apply_preferences` 参照)。
     pub max_undo_steps: u32,
+    pub plugin_iopaint_port: u16,
+    pub plugin_diffusion_port: u16,
     /// v12 §58: ドッキングパネルの配置(右/左/フローティング・ドック内順序・
     /// 折りたたみ・フローティングの位置と寸法)。パースと直列化の実体は
     /// `ui/panels.rs`(キーは `panel.<kind>.*`)。
@@ -168,6 +173,8 @@ impl Default for Settings {
             // SPEC §25: 「デフォルト ON」。
             show_pixel_grid: true,
             max_undo_steps: DEFAULT_MAX_UNDO_STEPS,
+            plugin_iopaint_port: DEFAULT_IOPAINT_PORT,
+            plugin_diffusion_port: DEFAULT_DIFFUSION_PORT,
             // SPEC §58: 既定は全パネル右ドック(色→レイヤー→履歴)。
             panels: PanelLayout::default(),
         }
@@ -477,6 +484,16 @@ pub fn parse(text: &str) -> Settings {
                     settings.show_pixel_grid = v;
                 }
             }
+            "plugin.iopaint.port" => {
+                if let Ok(v) = value.parse::<u16>() {
+                    settings.plugin_iopaint_port = v;
+                }
+            }
+            "plugin.diffusion.port" => {
+                if let Ok(v) = value.parse::<u16>() {
+                    settings.plugin_diffusion_port = v;
+                }
+            }
             "history.max_steps" => {
                 if let Ok(v) = value.parse::<u32>() {
                     settings.max_undo_steps = v;
@@ -585,6 +602,16 @@ pub fn serialize(settings: &Settings) -> String {
     push_line(&mut out, "last_tool", tool_kind_tag(s.last_tool));
     push_line(&mut out, "pixel_grid", bool_tag(s.show_pixel_grid));
     push_line(&mut out, "history.max_steps", &s.max_undo_steps.to_string());
+    push_line(
+        &mut out,
+        "plugin.iopaint.port",
+        &s.plugin_iopaint_port.to_string(),
+    );
+    push_line(
+        &mut out,
+        "plugin.diffusion.port",
+        &s.plugin_diffusion_port.to_string(),
+    );
     // v12 §58: `panel.<kind>.*` は行数がパネル数×配置で変わるため、
     // `ui/panels.rs` に `キー\t値\n` の塊を作らせて末尾へ連結する。
     out.push_str(&panels::serialize(&s.panels));
@@ -713,6 +740,8 @@ mod tests {
             last_tool: ToolKind::Gradient,
             show_pixel_grid: false,
             max_undo_steps: 123,
+            plugin_iopaint_port: 18423,
+            plugin_diffusion_port: 18424,
             panels: sample_panel_layout(),
         }
     }
@@ -852,6 +881,20 @@ palette.0\t#FF0000
     }
 
     // -- SPEC §34/ARCHITECTURE.md §18.2: 「元に戻す履歴の保持数」 -------------
+
+    #[test]
+    fn plugin_ports_round_trip_and_bad_values_fall_back() {
+        let settings = Settings {
+            plugin_iopaint_port: 18423,
+            plugin_diffusion_port: 18424,
+            ..Settings::default()
+        };
+        assert_eq!(parse(&serialize(&settings)).plugin_iopaint_port, 18423);
+        assert_eq!(parse(&serialize(&settings)).plugin_diffusion_port, 18424);
+        let bad = parse("plugin.iopaint.port\tnope\nplugin.diffusion.port\t70000\n");
+        assert_eq!(bad.plugin_iopaint_port, DEFAULT_IOPAINT_PORT);
+        assert_eq!(bad.plugin_diffusion_port, DEFAULT_DIFFUSION_PORT);
+    }
 
     #[test]
     fn default_max_undo_steps_is_50() {

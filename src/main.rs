@@ -13,6 +13,7 @@ mod inpaint;
 mod io;
 mod keymap;
 mod pages;
+mod plugin;
 mod project;
 mod raster;
 mod settings;

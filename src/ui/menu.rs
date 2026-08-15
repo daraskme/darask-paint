@@ -32,6 +32,9 @@ pub enum MenuAction {
     Deselect,
     SelectInverse,
     InpaintSelection,
+    IopaintInpaint,
+    DiffusionGenerate,
+    DiffusionInpaint,
     FreeTransform,
     ImageResize,
     CanvasResize,
@@ -144,8 +147,12 @@ const COLOR_ITEMS: &[MenuAction] = &[
     MenuAction::Grayscale,
     MenuAction::Mosaic,
 ];
-// §55・§56 の外部 AI 操作はまだ MenuAction に存在しない。追加時はここへ並べる。
-const AI_ITEMS: &[MenuAction] = &[MenuAction::InpaintSelection];
+const AI_ITEMS: &[MenuAction] = &[
+    MenuAction::InpaintSelection,
+    MenuAction::IopaintInpaint,
+    MenuAction::DiffusionGenerate,
+    MenuAction::DiffusionInpaint,
+];
 const LAYER_ITEMS: &[MenuAction] = &[
     MenuAction::LayerAdd,
     MenuAction::LayerDuplicate,
@@ -263,6 +270,9 @@ impl MenuAction {
             Self::Deselect => "選択解除",
             Self::SelectInverse => "選択反転",
             Self::InpaintSelection => "修復",
+            Self::IopaintInpaint => "AI修復",
+            Self::DiffusionGenerate => "AI生成",
+            Self::DiffusionInpaint => "AI置換",
             Self::FreeTransform => "自由変形",
             Self::ImageResize => "画像サイズ",
             Self::CanvasResize => "キャンバス",
@@ -318,6 +328,9 @@ impl MenuAction {
             Self::Deselect => "選択解除",
             Self::SelectInverse => "選択範囲を反転",
             Self::InpaintSelection => "選択範囲を修復",
+            Self::IopaintInpaint => "AI 修復(IOpaint)…",
+            Self::DiffusionGenerate => "AI 生成(Diffusion)…",
+            Self::DiffusionInpaint => "AI 置換(Diffusion)…",
             Self::FreeTransform => "自由変形",
             Self::ImageResize => "画像サイズ変更",
             Self::CanvasResize => "キャンバスサイズ変更",
@@ -418,7 +431,10 @@ impl MenuAction {
             | Self::SelectInverse
             | Self::Crop
             | Self::CutSelectionToTab => state.has_selection,
-            Self::InpaintSelection => state.has_selection && !state.background_job_running,
+            Self::InpaintSelection | Self::IopaintInpaint | Self::DiffusionInpaint => {
+                state.has_selection && !state.background_job_running
+            }
+            Self::DiffusionGenerate => !state.background_job_running,
             Self::DuplicateSelectionToTab => state.can_duplicate_selection_to_tab,
             Self::LayerAdd | Self::LayerDuplicate => state.can_add_layer,
             Self::LayerDelete => state.can_delete_layer,
@@ -455,7 +471,10 @@ impl MenuAction {
             Self::SelectAll => icons::paint_select_all_icon,
             Self::Deselect => icons::paint_deselect_icon,
             Self::SelectInverse => icons::paint_select_inverse_icon,
-            Self::InpaintSelection => icons::paint_inpaint_icon,
+            Self::InpaintSelection
+            | Self::IopaintInpaint
+            | Self::DiffusionGenerate
+            | Self::DiffusionInpaint => icons::paint_inpaint_icon,
             Self::FreeTransform => icons::paint_free_transform_icon,
             Self::ImageResize => icons::paint_image_resize_icon,
             Self::CanvasResize => icons::paint_canvas_resize_icon,
@@ -812,6 +831,9 @@ mod tests {
         MenuAction::Deselect,
         MenuAction::SelectInverse,
         MenuAction::InpaintSelection,
+        MenuAction::IopaintInpaint,
+        MenuAction::DiffusionGenerate,
+        MenuAction::DiffusionInpaint,
         MenuAction::FreeTransform,
         MenuAction::ImageResize,
         MenuAction::CanvasResize,
@@ -967,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn all_50_menu_entries_appear_exactly_once() {
+    fn all_53_menu_entries_appear_exactly_once() {
         let mut placed = Vec::new();
         for slot in TOP_LEVEL_SLOTS {
             match slot {
@@ -989,13 +1011,14 @@ mod tests {
                 "{action:?} の配置数"
             );
         }
-        assert_eq!(placed.len(), 50);
+        assert_eq!(placed.len(), 53);
     }
 
     #[test]
     fn group_is_disabled_only_when_every_item_is_disabled() {
         let recent_files = std::collections::VecDeque::new();
-        let disabled = state_with(&recent_files, false);
+        let mut disabled = state_with(&recent_files, false);
+        disabled.background_job_running = true;
         assert!(!AI_GROUP.enabled(&disabled));
         assert!(!LAYER_GROUP.enabled(&disabled));
 

@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{pos2, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2};
+use image::{ImageDecoder, ImageEncoder};
 
 use crate::canvas_view::CanvasView;
 use crate::document::{
@@ -61,6 +62,7 @@ use crate::inpaint::{self, InpaintError, InpaintInput, InpaintOutput};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
 use crate::pages::PageSet;
+use crate::plugin::{self, PluginError};
 use crate::raster;
 use crate::settings::{self, Settings};
 use crate::text;
@@ -423,8 +425,10 @@ static NEXT_JOB_ID: IdAllocator = IdAllocator::new();
 /// だけだが、P6 の外部プラグイン(IOpaint / Diffusion)も同じ基盤に載る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundJobKind {
-    /// SPEC §53: 内蔵の「選択範囲を修復」(Telea/FMM)。
     BuiltinInpaint,
+    IopaintInpaint,
+    DiffusionGenerate,
+    DiffusionInpaint,
 }
 
 impl BackgroundJobKind {
@@ -432,6 +436,9 @@ impl BackgroundJobKind {
     fn status_label(self) -> &'static str {
         match self {
             BackgroundJobKind::BuiltinInpaint => "選択範囲を修復中…",
+            BackgroundJobKind::IopaintInpaint => "AI 修復中…",
+            BackgroundJobKind::DiffusionGenerate => "AI 生成中…",
+            BackgroundJobKind::DiffusionInpaint => "AI 置換中…",
         }
     }
 
@@ -439,6 +446,9 @@ impl BackgroundJobKind {
     fn history_label(self) -> &'static str {
         match self {
             BackgroundJobKind::BuiltinInpaint => "選択範囲を修復",
+            BackgroundJobKind::IopaintInpaint => "AI 修復(IOpaint)",
+            BackgroundJobKind::DiffusionGenerate => "AI 生成(Diffusion)",
+            BackgroundJobKind::DiffusionInpaint => "AI 置換(Diffusion)",
         }
     }
 }
@@ -457,6 +467,10 @@ enum BackgroundJobError {
     /// 返ってきたバッファが宣言された寸法と食い違う(内蔵処理では起きないが、
     /// P6 の外部応答を同じ基盤へ載せたときの防御)。
     InvalidOutput,
+    IopaintUnavailable,
+    DiffusionUnavailable,
+    PluginBusy,
+    PluginFailed,
 }
 
 impl BackgroundJobError {
@@ -467,9 +481,11 @@ impl BackgroundJobError {
             BackgroundJobError::WorkerDisappeared => {
                 "処理が結果を返さずに終了しました(結果は適用していません)"
             }
-            BackgroundJobError::InvalidOutput => {
-                "処理の結果が壊れていました(結果は適用していません)"
-            }
+            BackgroundJobError::InvalidOutput => "処理の結果が壊れていました(結果は適用していません)",
+            BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが起動していません(darask-paint-iopaint の darask-plugin.bat を実行してください)",
+            BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが起動していません(darask-paint-ai-diffusion の darask-plugin.bat を実行してください)",
+            BackgroundJobError::PluginBusy => "AI プラグインは処理中です。完了後にもう一度実行してください",
+            BackgroundJobError::PluginFailed => "AI プラグインの処理に失敗しました",
         }
     }
 }
@@ -527,6 +543,63 @@ fn run_background_worker(
     let _ = sender.send(BackgroundJobResult { job_id, outcome });
     // 完了時に 1 回だけ再描画を要求する(ポーリングしない)。
     request_repaint();
+}
+
+fn verify_plugin(
+    port: u16,
+    expected: &str,
+    unavailable: BackgroundJobError,
+) -> Result<(), BackgroundJobError> {
+    let health = plugin::health_check(port).map_err(|_| unavailable)?;
+    let model_ready = match expected {
+        plugin::IOPAINT_PLUGIN => health.model == "lama",
+        plugin::DIFFUSION_PLUGIN => !health.model.trim().is_empty(),
+        _ => false,
+    };
+    if health.plugin != expected
+        || health.api != plugin::PLUGIN_API_VERSION
+        || health.backend != "ready"
+        || !model_ready
+    {
+        return Err(unavailable);
+    }
+    Ok(())
+}
+
+fn map_plugin_error(error: PluginError) -> BackgroundJobError {
+    match error {
+        PluginError::HttpStatus(503) => BackgroundJobError::PluginBusy,
+        _ => BackgroundJobError::PluginFailed,
+    }
+}
+
+fn decode_plugin_png(
+    bytes: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<InpaintOutput, BackgroundJobError> {
+    if bytes.len() > plugin::MAX_RESPONSE_BYTES {
+        return Err(BackgroundJobError::InvalidOutput);
+    }
+    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|_| BackgroundJobError::InvalidOutput)?;
+    let (width, height) = decoder.dimensions();
+    if width == 0
+        || height == 0
+        || width > 8192
+        || height > 8192
+        || width != expected_width
+        || height != expected_height
+    {
+        return Err(BackgroundJobError::InvalidOutput);
+    }
+    let image = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| BackgroundJobError::InvalidOutput)?;
+    Ok(InpaintOutput {
+        pixels: image.to_rgba8().into_raw(),
+        width,
+        height,
+    })
 }
 
 /// v12 §53(ARCHITECTURE.md §22.4): 実行中の非同期ジョブ。**常に 1 本だけ**
@@ -637,6 +710,17 @@ enum ModalState {
     /// このドラフトにだけ保持する。
     Preferences {
         draft_max_undo_steps: u32,
+        draft_iopaint_port: u16,
+        draft_diffusion_port: u16,
+    },
+    DiffusionGenerate {
+        prompt: String,
+        negative: String,
+        seed: String,
+    },
+    DiffusionInpaint {
+        prompt: String,
+        strength: f32,
     },
 }
 
@@ -970,6 +1054,8 @@ pub struct DaraskApp {
     /// 反映するのは `apply_preferences` の責務(ARCHITECTURE.md §18.6-2:
     /// 「既存タブが取り残される、というバグを作らない」)。
     max_undo_steps: u32,
+    plugin_iopaint_port: u16,
+    plugin_diffusion_port: u16,
 
     // -- v12 §58: ドッキングパネル(ARCHITECTURE.md §22.6b) ---------------
     /// パネル(色/レイヤー/履歴)の配置。SPEC §26 の永続化対象
@@ -1264,6 +1350,8 @@ impl DaraskApp {
             alt_eyedropper_active: false,
             show_pixel_grid: settings.show_pixel_grid,
             max_undo_steps: settings.max_undo_steps,
+            plugin_iopaint_port: settings.plugin_iopaint_port,
+            plugin_diffusion_port: settings.plugin_diffusion_port,
             // v12 §58: 設定から復元した配置。画面外クランプは最初のフレーム。
             panels: settings.panels,
             panels_need_clamp: true,
@@ -4841,6 +4929,8 @@ impl DaraskApp {
             last_tool: self.tool,
             show_pixel_grid: self.show_pixel_grid,
             max_undo_steps: self.max_undo_steps,
+            plugin_iopaint_port: self.plugin_iopaint_port,
+            plugin_diffusion_port: self.plugin_diffusion_port,
             // v12 §58: ドッキングパネルの配置(ドラッグ・メニュー操作の結果は
             // `self.panels` に随時反映されているので、ここはその写しでよい)。
             panels: self.panels.clone(),
@@ -4939,6 +5029,8 @@ impl DaraskApp {
     fn open_preferences_modal(&mut self) {
         self.modal = Some(ModalState::Preferences {
             draft_max_undo_steps: self.max_undo_steps,
+            draft_iopaint_port: self.plugin_iopaint_port,
+            draft_diffusion_port: self.plugin_diffusion_port,
         });
     }
 
@@ -4949,8 +5041,15 @@ impl DaraskApp {
     ///   (ARCHITECTURE.md §18.2: 「OK で即座に適用+設定ファイルへ保存」)。
     /// - **開いている全タブ**の `History::set_max_steps` を呼び、履歴パネルの
     ///   表示上限を揃える。値を下げても undo/redo エントリは削除しない。
-    fn apply_preferences(&mut self, new_max_undo_steps: u32) {
+    fn apply_preferences(
+        &mut self,
+        new_max_undo_steps: u32,
+        iopaint_port: u16,
+        diffusion_port: u16,
+    ) {
         self.max_undo_steps = new_max_undo_steps;
+        self.plugin_iopaint_port = iopaint_port;
+        self.plugin_diffusion_port = diffusion_port;
         for tab in &mut self.tabs {
             tab.history.set_max_steps(new_max_undo_steps as usize);
         }
@@ -5412,14 +5511,230 @@ impl DaraskApp {
         }
     }
 
-    /// SPEC §53: 「選択範囲を修復」の発行。選択が必須・浮動片は commit-first・
-    /// 同種ジョブの多重発行は禁止(single-flight)。
-    fn start_inpaint_selection(&mut self, ctx: &egui::Context) {
-        // 実行中(キャンセル済みでもワーカーが終わるまで)は受け付けない。
+    /// 外部修復へ送る選択 bbox + 128px の領域を返す。
+    fn plugin_selection_region(
+        &self,
+    ) -> Option<(crate::document::IRect, crate::document::SelMask)> {
+        let doc = &self.active_tab().doc;
+        let mask = self
+            .active_tab()
+            .selection
+            .as_ref()?
+            .mask
+            .clamp_to(doc.width, doc.height);
+        if mask.is_empty() {
+            return None;
+        }
+        let rect = crate::document::IRect {
+            x0: mask.bbox.x0 - 128,
+            y0: mask.bbox.y0 - 128,
+            x1: mask.bbox.x1 + 128,
+            y1: mask.bbox.y1 + 128,
+        }
+        .clamp_to(doc.width, doc.height);
+        Some((rect, mask))
+    }
+
+    fn encode_plugin_region(
+        &self,
+        rect: crate::document::IRect,
+        mask: &crate::document::SelMask,
+    ) -> Result<(Vec<u8>, Vec<u8>), BackgroundJobError> {
+        let width = u32::try_from(rect.width()).map_err(|_| BackgroundJobError::InvalidOutput)?;
+        let height = u32::try_from(rect.height()).map_err(|_| BackgroundJobError::InvalidOutput)?;
+        let count = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(BackgroundJobError::InvalidOutput)?;
+        let mut rgba = Vec::with_capacity(
+            count
+                .checked_mul(4)
+                .ok_or(BackgroundJobError::InvalidOutput)?,
+        );
+        let mut gray = Vec::with_capacity(count);
+        let doc = &self.active_tab().doc;
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                rgba.extend_from_slice(&doc.get_pixel(x, y).unwrap_or([0, 0, 0, 0]));
+                gray.push(mask.get(x, y));
+            }
+        }
+        let mut image_png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut image_png)
+            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
+        let mut mask_png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut mask_png)
+            .write_image(&gray, width, height, image::ExtendedColorType::L8)
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
+        Ok((image_png, mask_png))
+    }
+
+    fn ensure_background_job_idle(&mut self) -> bool {
         if self.background_job.is_some() {
             self.show_toast(
                 "処理中です。完了するかキャンセルしてからやり直してください".to_owned(),
             );
+            return false;
+        }
+        true
+    }
+
+    fn spawn_plugin_job<F>(
+        &mut self,
+        ctx: &egui::Context,
+        kind: BackgroundJobKind,
+        rect: crate::document::IRect,
+        compute: F,
+    ) where
+        F: FnOnce() -> Result<InpaintOutput, BackgroundJobError>
+            + Send
+            + std::panic::UnwindSafe
+            + 'static,
+    {
+        let Some(job_id) = NEXT_JOB_ID.next() else {
+            self.show_toast("AI 処理を開始できませんでした".to_owned());
+            return;
+        };
+        let target = self.edit_target();
+        if !target.is_valid() {
+            self.show_toast("AI 処理を開始できませんでした".to_owned());
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let repaint_ctx = ctx.clone();
+        let spawned = thread::Builder::new()
+            .name("darask-plugin".to_owned())
+            .spawn(move || {
+                run_background_worker(job_id, compute, &sender, || repaint_ctx.request_repaint());
+            });
+        match spawned {
+            Ok(join) => {
+                self.background_job = Some(BackgroundJob {
+                    job_id,
+                    kind,
+                    tab_uid: self.active_tab().uid,
+                    doc_gen: self.active_tab().doc.content_gen,
+                    sel_gen: self.selection_gen(),
+                    target,
+                    edit_target_gen: self.active_tab().edit_target_gen,
+                    rect,
+                    cancel,
+                    receiver,
+                    join: Some(join),
+                })
+            }
+            Err(error) => self.show_toast(format!("AI 処理を開始できませんでした: {error}")),
+        }
+    }
+
+    fn start_iopaint_inpaint(&mut self, ctx: &egui::Context) {
+        if !self.ensure_background_job_idle() {
+            return;
+        }
+        self.commit_open_gesture();
+        let Some((rect, mask)) = self.plugin_selection_region() else {
+            self.show_toast("AI 修復には選択範囲が必要です".to_owned());
+            return;
+        };
+        let Ok((image_png, mask_png)) = self.encode_plugin_region(rect, &mask) else {
+            self.show_toast("送信画像を作成できませんでした".to_owned());
+            return;
+        };
+        let port = self.plugin_iopaint_port;
+        let width = rect.width() as u32;
+        let height = rect.height() as u32;
+        self.spawn_plugin_job(ctx, BackgroundJobKind::IopaintInpaint, rect, move || {
+            verify_plugin(
+                port,
+                plugin::IOPAINT_PLUGIN,
+                BackgroundJobError::IopaintUnavailable,
+            )?;
+            let bytes =
+                plugin::iopaint_inpaint(port, &image_png, &mask_png).map_err(map_plugin_error)?;
+            decode_plugin_png(&bytes, width, height)
+        });
+    }
+
+    fn start_diffusion_inpaint(&mut self, ctx: &egui::Context, prompt: String, strength: f32) {
+        if !self.ensure_background_job_idle() {
+            return;
+        }
+        self.commit_open_gesture();
+        let Some((rect, mask)) = self.plugin_selection_region() else {
+            self.show_toast("AI 置換には選択範囲が必要です".to_owned());
+            return;
+        };
+        let Ok((image_png, mask_png)) = self.encode_plugin_region(rect, &mask) else {
+            self.show_toast("送信画像を作成できませんでした".to_owned());
+            return;
+        };
+        let port = self.plugin_diffusion_port;
+        let width = rect.width() as u32;
+        let height = rect.height() as u32;
+        self.spawn_plugin_job(ctx, BackgroundJobKind::DiffusionInpaint, rect, move || {
+            verify_plugin(
+                port,
+                plugin::DIFFUSION_PLUGIN,
+                BackgroundJobError::DiffusionUnavailable,
+            )?;
+            let bytes = plugin::diffusion_inpaint(
+                port,
+                &image_png,
+                &mask_png,
+                &prompt,
+                Some(strength.clamp(0.01, 1.0)),
+            )
+            .map_err(map_plugin_error)?;
+            decode_plugin_png(&bytes, width, height)
+        });
+    }
+
+    fn start_diffusion_generate(
+        &mut self,
+        ctx: &egui::Context,
+        prompt: String,
+        negative: String,
+        seed: Option<u64>,
+    ) {
+        if !self.ensure_background_job_idle() {
+            return;
+        }
+        self.commit_open_gesture();
+        let doc = &self.active_tab().doc;
+        let rect = self
+            .active_tab()
+            .selection
+            .as_ref()
+            .map(|selection| selection.mask.bbox.clamp_to(doc.width, doc.height))
+            .unwrap_or(crate::document::IRect {
+                x0: 0,
+                y0: 0,
+                x1: doc.width.min(8192) as i32,
+                y1: doc.height.min(8192) as i32,
+            });
+        if rect.is_empty() {
+            self.show_toast("生成サイズが不正です".to_owned());
+            return;
+        }
+        let port = self.plugin_diffusion_port;
+        let width = rect.width() as u32;
+        let height = rect.height() as u32;
+        self.spawn_plugin_job(ctx, BackgroundJobKind::DiffusionGenerate, rect, move || {
+            verify_plugin(
+                port,
+                plugin::DIFFUSION_PLUGIN,
+                BackgroundJobError::DiffusionUnavailable,
+            )?;
+            let negative = (!negative.trim().is_empty()).then_some(negative.as_str());
+            let bytes = plugin::diffusion_generate(port, &prompt, negative, width, height, seed)
+                .map_err(map_plugin_error)?;
+            decode_plugin_png(&bytes, width, height)
+        });
+    }
+
+    fn start_inpaint_selection(&mut self, ctx: &egui::Context) {
+        if !self.ensure_background_job_idle() {
             return;
         }
         // 浮動片・進行中ストロークは先に確定する(SPEC §53: commit-first)。
@@ -5649,48 +5964,67 @@ impl DaraskApp {
     /// 世代ガードを通ったときだけ、結果を 1 undo 単位で適用する。
     fn apply_background_job_result(&mut self, job: &BackgroundJob, output: InpaintOutput) {
         if !self.background_job_target_is_unchanged(job) {
-            self.show_toast("修復の結果は破棄されました(対象が変更されています)".to_owned());
+            self.show_toast("AI/修復の結果は破棄されました(対象が変更されています)".to_owned());
             return;
         }
         let rect = job
             .rect
             .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
-        if rect.is_empty()
-            || rect.width() as u32 != output.width
-            || rect.height() as u32 != output.height
-        {
-            self.show_toast("修復の結果は破棄されました(対象が変更されています)".to_owned());
-            return;
-        }
-        // **履歴を開く前に**バッファ長を検証する。寸法だけ見て書き始めると、
-        // 短いバッファでは途中まで書いた状態で undo 単位が確定してしまう
-        // (内蔵処理では起きないが、P6 の外部応答も同じ経路に載るため)。
         let expected_len = (output.width as usize)
             .checked_mul(output.height as usize)
             .and_then(|n| n.checked_mul(4));
-        if expected_len != Some(output.pixels.len()) {
+        if rect.is_empty()
+            || rect.width() as u32 != output.width
+            || rect.height() as u32 != output.height
+            || expected_len != Some(output.pixels.len())
+        {
             self.show_toast(BackgroundJobError::InvalidOutput.message().to_owned());
             return;
         }
-
+        if job.kind == BackgroundJobKind::DiffusionGenerate {
+            let before = self.active_tab().doc.snapshot();
+            let name = self.next_layer_name();
+            if !self.active_tab_mut().doc.add_layer(name) {
+                self.show_toast("レイヤー上限のため生成結果を配置できません".to_owned());
+                return;
+            }
+            let tab = &mut self.tabs[self.active_tab];
+            for y in rect.y0..rect.y1 {
+                let row = (y - rect.y0) as usize * output.width as usize;
+                for x in rect.x0..rect.x1 {
+                    let index = (row + (x - rect.x0) as usize) * 4;
+                    if let Some(px) = output.pixels.get(index..index + 4) {
+                        tab.doc.set_pixel(x, y, [px[0], px[1], px[2], px[3]]);
+                    }
+                }
+            }
+            tab.doc.mark_dirty(rect);
+            self.push_replace_all(before, job.kind.history_label());
+            return;
+        }
+        let preserve_alpha = matches!(
+            job.kind,
+            BackgroundJobKind::IopaintInpaint | BackgroundJobKind::DiffusionInpaint
+        );
         let tab = &mut self.tabs[self.active_tab];
         tab.history.begin_stroke(tab.doc.active);
         tab.history.ensure_tiles_saved(&tab.doc, rect);
         {
-            // 書き込みは選択マスクでクリップされ、アルファロックも
-            // `Surface::set_pixel` が見る(SPEC §50.3)。
-            let clip = tab.selection.as_ref().map(|s| &s.mask);
+            let clip = tab.selection.as_ref().map(|selection| &selection.mask);
             let mut surface = tab.doc.active_surface_mut(clip);
             for y in rect.y0..rect.y1 {
                 let row = (y - rect.y0) as usize * output.width as usize;
                 for x in rect.x0..rect.x1 {
-                    let idx = (row + (x - rect.x0) as usize) * 4;
-                    // 長さは上で検証済み。それでも添字は `get` で取る
-                    // (パニックしない I/O 経路。SPEC の鉄則)。
-                    let Some(px) = output.pixels.get(idx..idx + 4) else {
+                    let index = (row + (x - rect.x0) as usize) * 4;
+                    let Some(px) = output.pixels.get(index..index + 4) else {
                         continue;
                     };
-                    surface.set_pixel(x, y, [px[0], px[1], px[2], px[3]]);
+                    let alpha = if preserve_alpha {
+                        surface.get_pixel(x, y).map_or(0, |old| old[3])
+                    } else {
+                        px[3]
+                    };
+                    surface.set_pixel(x, y, [px[0], px[1], px[2], alpha]);
                 }
             }
         }
@@ -6315,6 +6649,24 @@ impl DaraskApp {
             MenuAction::SelectInverse => self.invert_selection(),
             // v12 §53: 「選択範囲を修復」(ワーカー実行。完了時に世代ガード)。
             MenuAction::InpaintSelection => self.start_inpaint_selection(ctx),
+            MenuAction::IopaintInpaint => self.start_iopaint_inpaint(ctx),
+            MenuAction::DiffusionGenerate => {
+                self.modal = Some(ModalState::DiffusionGenerate {
+                    prompt: String::new(),
+                    negative: String::new(),
+                    seed: String::new(),
+                });
+            }
+            MenuAction::DiffusionInpaint => {
+                if self.active_tab().selection.is_some() {
+                    self.modal = Some(ModalState::DiffusionInpaint {
+                        prompt: String::new(),
+                        strength: 0.75,
+                    });
+                } else {
+                    self.show_toast("AI 置換には選択範囲が必要です".to_owned());
+                }
+            }
             // v6 §33(ARCHITECTURE.md §18.1): 編集メニューに追加した
             // 「自由変形」。Ctrl+T(`Action::FreeTransform`)と全く同じ処理を
             // 呼ぶだけ(`free_transform` 自身が commit-first ガードを持つ、
@@ -6565,9 +6917,20 @@ impl DaraskApp {
             }
             ModalState::Preferences {
                 draft_max_undo_steps,
-            } => match dialogs::show_preferences(ctx, draft_max_undo_steps) {
+                draft_iopaint_port,
+                draft_diffusion_port,
+            } => match dialogs::show_preferences(
+                ctx,
+                draft_max_undo_steps,
+                draft_iopaint_port,
+                draft_diffusion_port,
+            ) {
                 DialogOutcome::Confirmed => {
-                    self.apply_preferences(*draft_max_undo_steps);
+                    self.apply_preferences(
+                        *draft_max_undo_steps,
+                        *draft_iopaint_port,
+                        *draft_diffusion_port,
+                    );
                     keep_open = false;
                 }
                 DialogOutcome::Cancelled => {
@@ -6575,6 +6938,40 @@ impl DaraskApp {
                 }
                 DialogOutcome::Pending => {}
             },
+            ModalState::DiffusionGenerate {
+                prompt,
+                negative,
+                seed,
+            } => match dialogs::show_diffusion_generate(ctx, prompt, negative, seed) {
+                DialogOutcome::Confirmed => {
+                    let seed = if seed.trim().is_empty() {
+                        None
+                    } else {
+                        match seed.trim().parse::<u64>() {
+                            Ok(value) => Some(value),
+                            Err(_) => {
+                                self.show_toast("シードは整数で入力してください".to_owned());
+                                self.modal = Some(modal);
+                                return;
+                            }
+                        }
+                    };
+                    self.start_diffusion_generate(ctx, prompt.clone(), negative.clone(), seed);
+                    keep_open = false;
+                }
+                DialogOutcome::Cancelled => keep_open = false,
+                DialogOutcome::Pending => {}
+            },
+            ModalState::DiffusionInpaint { prompt, strength } => {
+                match dialogs::show_diffusion_inpaint(ctx, prompt, strength) {
+                    DialogOutcome::Confirmed => {
+                        self.start_diffusion_inpaint(ctx, prompt.clone(), *strength);
+                        keep_open = false;
+                    }
+                    DialogOutcome::Cancelled => keep_open = false,
+                    DialogOutcome::Pending => {}
+                }
+            }
             ModalState::ConfirmUnsaved => {
                 let label = self.window_doc_label();
                 match dialogs::show_confirm_unsaved(ctx, &label) {
@@ -7205,6 +7602,8 @@ fn register_japanese_font(ctx: &egui::Context, bytes: Option<Vec<u8>>) -> Option
 mod tests {
     use super::*;
     use crate::document::{Background, IRect};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
 
@@ -7249,6 +7648,8 @@ mod tests {
             alt_eyedropper_active: false,
             show_pixel_grid: true,
             max_undo_steps: settings::DEFAULT_MAX_UNDO_STEPS,
+            plugin_iopaint_port: settings::DEFAULT_IOPAINT_PORT,
+            plugin_diffusion_port: settings::DEFAULT_DIFFUSION_PORT,
             panels: PanelLayout::default(),
             panels_need_clamp: false,
             color_wheel: ColorWheelState::new(),
@@ -9465,6 +9866,7 @@ mod tests {
         app.open_preferences_modal();
         let Some(ModalState::Preferences {
             draft_max_undo_steps,
+            ..
         }) = app.modal
         else {
             panic!("expected ModalState::Preferences to be open");
@@ -9476,7 +9878,11 @@ mod tests {
     fn apply_preferences_updates_max_undo_steps_field() {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
         assert_eq!(app.max_undo_steps, settings::DEFAULT_MAX_UNDO_STEPS);
-        app.apply_preferences(200);
+        app.apply_preferences(
+            200,
+            settings::DEFAULT_IOPAINT_PORT,
+            settings::DEFAULT_DIFFUSION_PORT,
+        );
         assert_eq!(app.max_undo_steps, 200);
     }
 
@@ -9494,7 +9900,11 @@ mod tests {
         }
         assert_eq!(app.tabs.len(), 2);
 
-        app.apply_preferences(3);
+        app.apply_preferences(
+            3,
+            settings::DEFAULT_IOPAINT_PORT,
+            settings::DEFAULT_DIFFUSION_PORT,
+        );
 
         for tab in &mut app.tabs {
             assert_eq!(tab.history.display_step_limit(), 3);
@@ -9508,7 +9918,11 @@ mod tests {
     #[test]
     fn new_tab_inherits_the_currently_configured_max_undo_steps() {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
-        app.apply_preferences(3);
+        app.apply_preferences(
+            3,
+            settings::DEFAULT_IOPAINT_PORT,
+            settings::DEFAULT_DIFFUSION_PORT,
+        );
         app.open_new_tab(Document::new(4, 4, Background::White));
 
         for _ in 0..5 {
@@ -12266,6 +12680,71 @@ mod tests {
         }
     }
 
+    fn generation_state(app: &DaraskApp) -> (usize, usize, bool) {
+        (
+            app.active_tab().doc.layers.len(),
+            app.active_tab().history.undo_len(),
+            app.active_tab().doc.modified,
+        )
+    }
+
+    fn assert_snapshot_restored(app: &DaraskApp, expected: &crate::document::DocSnapshot) {
+        let doc = &app.active_tab().doc;
+        assert_eq!(doc.width, expected.width);
+        assert_eq!(doc.height, expected.height);
+        assert_eq!(doc.active, expected.active);
+        assert_eq!(doc.layers.len(), expected.layers.len());
+        for (actual, expected) in doc.layers.iter().zip(&expected.layers) {
+            assert_eq!(actual.uid, expected.uid);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.visible, expected.visible);
+            assert_eq!(actual.opacity, expected.opacity);
+            assert_eq!(actual.blend, expected.blend);
+            assert_eq!(actual.alpha_lock, expected.alpha_lock);
+            assert_eq!(actual.pixels, expected.pixels);
+        }
+    }
+
+    fn read_test_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let mut expected_len = None;
+        loop {
+            let count = stream.read(&mut buffer).expect("read request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if expected_len.is_none() {
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let header_end = end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let body_len = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                    expected_len = Some(header_end + body_len.unwrap_or(0));
+                }
+            }
+            if expected_len.is_some_and(|length| request.len() >= length) {
+                break;
+            }
+        }
+        request
+    }
+
+    fn write_test_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write response head");
+        stream.write_all(body).expect("write response body");
+    }
+
     fn test_background_job(
         app: &DaraskApp,
         job_id: u64,
@@ -12448,6 +12927,392 @@ mod tests {
             .toast
             .as_ref()
             .is_some_and(|t| t.0.contains("キャンセル")));
+    }
+
+    #[test]
+    fn iopaint_health_mismatch_shows_guide_without_posting_image() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).expect("read health");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            let json = br#"{"plugin":"darask-iopaint","api":1,"engine":"x","backend":"ready","model":"sdxl"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                json.len()
+            )
+            .expect("head");
+            stream.write_all(json).expect("body");
+            thread::sleep(Duration::from_millis(100));
+            listener.set_nonblocking(true).expect("nonblocking");
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        });
+        let mut app = app_with_hole_selection();
+        app.plugin_iopaint_port = port;
+        app.start_iopaint_inpaint(&egui::Context::default());
+        for _ in 0..100 {
+            app.poll_background_job();
+            if app.background_job.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        server.join().expect("server");
+        assert!(app.background_job.is_none());
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("darask-plugin.bat")));
+    }
+
+    #[test]
+    fn plugin_ports_are_lazy_and_health_is_requested_only_on_menu_execution() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut app = app_with_hole_selection();
+        app.plugin_iopaint_port = port;
+        thread::sleep(Duration::from_millis(30));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        listener.set_nonblocking(false).expect("blocking");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health connection");
+            let request = read_test_http_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            let health = br#"{"plugin":"darask-iopaint","api":1,"engine":"x","backend":"ready","model":"other"}"#;
+            write_test_http_response(&mut stream, 200, health);
+        });
+        app.start_iopaint_inpaint(&egui::Context::default());
+        wait_for_background_job(&mut app);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn diffusion_health_requires_a_loaded_model_before_posting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health connection");
+            let request = read_test_http_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            let health = br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"ready","model":""}"#;
+            write_test_http_response(&mut stream, 200, health);
+            thread::sleep(Duration::from_millis(50));
+            listener.set_nonblocking(true).expect("nonblocking");
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.plugin_diffusion_port = port;
+        app.start_diffusion_generate(
+            &egui::Context::default(),
+            "test".to_owned(),
+            String::new(),
+            None,
+        );
+        wait_for_background_job(&mut app);
+        server.join().expect("server");
+        assert_eq!(generation_state(&app), (1, 0, false));
+    }
+
+    #[test]
+    fn plugin_health_and_post_503_are_not_retried() {
+        let health_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind health");
+        let health_port = health_listener.local_addr().expect("addr").port();
+        let health_server = thread::spawn(move || {
+            let (mut stream, _) = health_listener.accept().expect("health connection");
+            let request = read_test_http_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            write_test_http_response(&mut stream, 503, b"");
+            thread::sleep(Duration::from_millis(50));
+            health_listener.set_nonblocking(true).expect("nonblocking");
+            assert!(matches!(
+                health_listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let mut health_app = new_for_test(Document::new(8, 8, Background::White));
+        health_app.plugin_diffusion_port = health_port;
+        health_app.start_diffusion_generate(
+            &egui::Context::default(),
+            "test".to_owned(),
+            String::new(),
+            None,
+        );
+        wait_for_background_job(&mut health_app);
+        health_server.join().expect("health server");
+
+        let post_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind post");
+        let post_port = post_listener.local_addr().expect("addr").port();
+        let post_server = thread::spawn(move || {
+            let (mut health_stream, _) = post_listener.accept().expect("health connection");
+            let health_request = read_test_http_request(&mut health_stream);
+            assert!(
+                String::from_utf8_lossy(&health_request).starts_with("GET /api/v1/health HTTP/1.1")
+            );
+            let health = br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"ready","model":"sdxl"}"#;
+            write_test_http_response(&mut health_stream, 200, health);
+
+            let (mut post_stream, _) = post_listener.accept().expect("post connection");
+            let post_request = read_test_http_request(&mut post_stream);
+            assert!(String::from_utf8_lossy(&post_request)
+                .starts_with("POST /api/v1/generate HTTP/1.1"));
+            write_test_http_response(&mut post_stream, 503, b"");
+            thread::sleep(Duration::from_millis(50));
+            post_listener.set_nonblocking(true).expect("nonblocking");
+            assert!(matches!(
+                post_listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let mut post_app = new_for_test(Document::new(8, 8, Background::White));
+        let before = generation_state(&post_app);
+        post_app.plugin_diffusion_port = post_port;
+        post_app.start_diffusion_generate(
+            &egui::Context::default(),
+            "test".to_owned(),
+            String::new(),
+            None,
+        );
+        wait_for_background_job(&mut post_app);
+        post_server.join().expect("post server");
+        assert_eq!(generation_state(&post_app), before);
+        assert!(post_app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("処理中")));
+    }
+
+    #[test]
+    fn plugin_single_flight_guard_has_no_document_or_floating_side_effects() {
+        let mut app = app_with_hole_selection();
+        app.begin_paste_floating(1, 1, vec![1, 2, 3, 255]);
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        app.background_job = Some(snapshot_test_job(&app, rect));
+        let floating = app.active_tab().floating.as_ref().expect("floating");
+        let floating_before = (
+            floating.id,
+            floating.w,
+            floating.h,
+            floating.pos,
+            floating.pixels.clone(),
+            floating.mask.clone(),
+        );
+        let pixels_before = app.active_tab().doc.active_pixels().to_vec();
+        let generation_before = app.active_tab().doc.content_gen;
+        let history_before = app.active_tab().history.undo_len();
+        let modified_before = app.active_tab().doc.modified;
+        let job_id = app.background_job.as_ref().map(|job| job.job_id);
+        let ctx = egui::Context::default();
+
+        app.start_iopaint_inpaint(&ctx);
+        app.start_diffusion_inpaint(&ctx, "test".to_owned(), 0.5);
+        app.start_diffusion_generate(&ctx, "test".to_owned(), String::new(), None);
+
+        let floating = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .expect("floating remains");
+        assert_eq!(
+            (
+                floating.id,
+                floating.w,
+                floating.h,
+                floating.pos,
+                floating.pixels.clone(),
+                floating.mask.clone(),
+            ),
+            floating_before
+        );
+        assert_eq!(app.active_tab().doc.active_pixels(), pixels_before);
+        assert_eq!(app.active_tab().doc.content_gen, generation_before);
+        assert_eq!(app.active_tab().history.undo_len(), history_before);
+        assert_eq!(app.active_tab().doc.modified, modified_before);
+        assert_eq!(app.background_job.as_ref().map(|job| job.job_id), job_id);
+    }
+
+    #[test]
+    fn diffusion_generate_success_adds_one_layer_and_one_undo_then_restores_fully() {
+        let mut app = new_for_test(Document::new(4, 3, Background::White));
+        let before = app.active_tab().doc.snapshot();
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 3,
+        };
+        let mut job = snapshot_test_job(&app, rect);
+        job.kind = BackgroundJobKind::DiffusionGenerate;
+
+        app.apply_background_job_result(&job, test_output(rect, [9, 8, 7, 255]));
+
+        assert_eq!(app.active_tab().doc.layers.len(), before.layers.len() + 1);
+        assert_eq!(app.active_tab().history.undo_len(), 1);
+        assert!(app.active_tab().doc.modified);
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
+        assert_snapshot_restored(&app, &before);
+        assert_eq!(app.active_tab().history.undo_len(), 0);
+        assert!(!app.active_tab().doc.modified);
+    }
+
+    #[test]
+    fn diffusion_generate_cancellation_keeps_layers_history_and_modified_unchanged() {
+        let mut app = new_for_test(Document::new(4, 3, Background::White));
+        let before = generation_state(&app);
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        install_test_worker(
+            &mut app,
+            move || {
+                worker_barrier.wait();
+                Ok(test_output(
+                    IRect {
+                        x0: 0,
+                        y0: 0,
+                        x1: 1,
+                        y1: 1,
+                    },
+                    [1, 2, 3, 255],
+                ))
+            },
+            Arc::new(AtomicUsize::new(0)),
+        );
+        app.background_job.as_mut().expect("job").kind = BackgroundJobKind::DiffusionGenerate;
+        app.cancel_background_job();
+        barrier.wait();
+        wait_for_background_job(&mut app);
+        assert_eq!(generation_state(&app), before);
+    }
+
+    #[test]
+    fn diffusion_generate_dimension_mismatch_keeps_layers_history_and_modified_unchanged() {
+        let mut app = new_for_test(Document::new(4, 3, Background::White));
+        let before = generation_state(&app);
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 3,
+        };
+        let mut job = snapshot_test_job(&app, rect);
+        job.kind = BackgroundJobKind::DiffusionGenerate;
+        let mut output = test_output(rect, [1, 2, 3, 255]);
+        output.width += 1;
+        app.apply_background_job_result(&job, output);
+        assert_eq!(generation_state(&app), before);
+    }
+
+    #[test]
+    fn diffusion_generate_generation_mismatch_keeps_layers_history_and_modified_unchanged() {
+        let mut app = new_for_test(Document::new(4, 3, Background::White));
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 3,
+        };
+        let mut job = snapshot_test_job(&app, rect);
+        job.kind = BackgroundJobKind::DiffusionGenerate;
+        app.active_tab_mut().doc.bump_content_gen();
+        let before = generation_state(&app);
+        app.apply_background_job_result(&job, test_output(rect, [1, 2, 3, 255]));
+        assert_eq!(generation_state(&app), before);
+    }
+
+    #[test]
+    fn plugin_payload_region_is_selection_bbox_plus_128_only() {
+        let mut app = new_for_test(Document::new(1000, 900, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 400,
+            y0: 300,
+            x1: 410,
+            y1: 320,
+        })));
+        let (rect, _) = app.plugin_selection_region().expect("region");
+        assert_eq!(
+            rect,
+            IRect {
+                x0: 272,
+                y0: 172,
+                x1: 538,
+                y1: 448
+            }
+        );
+        assert_ne!(
+            rect,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 1000,
+                y1: 900
+            }
+        );
+    }
+
+    #[test]
+    fn plugin_inpaint_applies_inside_mask_and_preserves_alpha() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 1,
+            y0: 1,
+            x1: 3,
+            y1: 3,
+        })));
+        app.active_tab_mut().doc.set_pixel(1, 1, [1, 2, 3, 77]);
+        let rect = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        };
+        let mut job = snapshot_test_job(&app, rect);
+        job.kind = BackgroundJobKind::IopaintInpaint;
+        app.apply_background_job_result(&job, test_output(rect, [9, 8, 7, 0]));
+        assert_eq!(app.active_tab().doc.get_pixel(1, 1), Some([9, 8, 7, 77]));
+        assert_eq!(
+            app.active_tab().doc.get_pixel(0, 0),
+            Some([255, 255, 255, 255])
+        );
+        assert_eq!(app.active_tab().history.undo_len(), 1);
+    }
+
+    #[test]
+    fn plugin_kind_uses_the_existing_generation_guard() {
+        let mut app = app_with_hole_selection();
+        let rect = IRect {
+            x0: 16,
+            y0: 16,
+            x1: 24,
+            y1: 24,
+        };
+        let mut job = snapshot_test_job(&app, rect);
+        job.kind = BackgroundJobKind::DiffusionInpaint;
+        app.active_tab_mut().doc.bump_content_gen();
+        assert_test_job_is_discarded(&mut app, &job, "plugin result must use generation guard");
     }
 
     /// SPEC §55.1 の世代ガード: 完了時に対象が変わっていたら破棄する。

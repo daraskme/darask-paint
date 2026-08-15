@@ -307,10 +307,23 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
 /// `New`/`ImageResize` 等と同じ「ドラフト値を `&mut` で受け取り、OK/
 /// キャンセルで呼び出し側(app.rs)が確定/破棄する」パターン(`ModalState::
 /// Preferences` のドラフト値をそのまま渡す)。
-pub fn show_preferences(ctx: &egui::Context, draft_max_undo_steps: &mut u32) -> DialogOutcome {
+pub fn show_preferences(
+    ctx: &egui::Context,
+    draft_max_undo_steps: &mut u32,
+    iopaint_port: &mut u16,
+    diffusion_port: &mut u16,
+) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
     let modal = egui::Modal::new(egui::Id::new("darask_dialog_preferences")).show(ctx, |ui| {
         ui.heading("設定");
+        ui.horizontal(|ui| {
+            ui.label("IOpaint ポート:");
+            ui.add(egui::DragValue::new(iopaint_port).range(1..=u16::MAX));
+        });
+        ui.horizontal(|ui| {
+            ui.label("AI Diffusion ポート:");
+            ui.add(egui::DragValue::new(diffusion_port).range(1..=u16::MAX));
+        });
         ui.horizontal(|ui| {
             ui.label("履歴パネルの表示件数:");
             let mut v = *draft_max_undo_steps;
@@ -350,6 +363,47 @@ pub fn show_about(ctx: &egui::Context, version: &str, repository: &str) -> Dialo
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Confirmed;
     }
+    outcome
+}
+
+pub fn show_diffusion_generate(
+    ctx: &egui::Context,
+    prompt: &mut String,
+    negative: &mut String,
+    seed: &mut String,
+) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Pending;
+    egui::Modal::new(egui::Id::new("darask_dialog_diffusion_generate")).show(ctx, |ui| {
+        ui.heading("AI 生成(Diffusion)");
+        ui.label("プロンプト:");
+        ui.text_edit_multiline(prompt);
+        ui.label("ネガティブプロンプト(任意):");
+        ui.text_edit_multiline(negative);
+        ui.horizontal(|ui| {
+            ui.label("シード(任意):");
+            ui.text_edit_singleline(seed);
+        });
+        confirm_buttons(ui, &mut outcome);
+    });
+    outcome
+}
+
+pub fn show_diffusion_inpaint(
+    ctx: &egui::Context,
+    prompt: &mut String,
+    strength: &mut f32,
+) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Pending;
+    egui::Modal::new(egui::Id::new("darask_dialog_diffusion_inpaint")).show(ctx, |ui| {
+        ui.heading("AI 置換(Diffusion)");
+        ui.label("プロンプト:");
+        ui.text_edit_multiline(prompt);
+        ui.horizontal(|ui| {
+            ui.label("強さ:");
+            ui.add(egui::DragValue::new(strength).range(0.01..=1.0).speed(0.01));
+        });
+        confirm_buttons(ui, &mut outcome);
+    });
     outcome
 }
 
