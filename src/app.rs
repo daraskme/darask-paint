@@ -3970,7 +3970,7 @@ impl DaraskApp {
                         let path = io::ensure_extension(path);
                         self.begin_save_to_path(path);
                     }
-                    None => self.after_save_action = None,
+                    None => self.abort_after_save_action(),
                 }
             }
             // v9 §43: 画像を読み込み、クリップボード貼り付けと同じ経路
@@ -4077,6 +4077,9 @@ impl DaraskApp {
             return;
         }
         self.tabs.remove(index);
+        // SPEC §54: 閉じたタブのページ集に属していたサムネイルを解放する
+        // (他のタブがまだ同じページを持っていれば残る)。
+        self.prune_page_thumbnails();
         if self.active_tab > index {
             self.active_tab -= 1;
         } else if self.active_tab == index {
@@ -4219,7 +4222,7 @@ impl DaraskApp {
             return;
         };
         if let Some(existing) = self.find_other_tab_by_path(tab_uid, &path) {
-            self.pending_page_set = None;
+            self.attach_pending_page_set_to_tab(tab_uid, page_index, existing);
             self.switch_tab(existing);
             self.show_toast("このページは別のタブで開いています".to_owned());
             return;
@@ -4288,6 +4291,37 @@ impl DaraskApp {
         })
     }
 
+    fn attach_pending_page_set_to_tab(
+        &mut self,
+        tab_uid: u64,
+        page_index: usize,
+        target_tab: usize,
+    ) {
+        if let Some((_, mut pages)) = self
+            .pending_page_set
+            .take()
+            .filter(|(uid, _)| *uid == tab_uid)
+        {
+            pages.current = page_index;
+            self.tabs[target_tab].pages = Some(pages);
+            self.prune_page_thumbnails();
+        }
+    }
+
+    /// どのタブのページ集にも属さなくなったサムネイルを破棄する
+    /// (SPEC §54 のサムネイルキャッシュ。ページ集の張り替え・タブを閉じる・
+    /// パスの切り離しで呼ぶ。毎フレームではなく**ページ集が変わったときだけ**
+    /// 呼ぶこと — 生存パス集合の構築が入るため)。
+    fn prune_page_thumbnails(&mut self) {
+        let live: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.pages.as_ref())
+            .flat_map(|pages| pages.entries.iter().map(|entry| entry.path.clone()))
+            .collect();
+        self.page_thumbnails.prune(live);
+    }
+
     fn switch_page_transactional(&mut self, tab_uid: u64, page_index: usize) {
         let Some(tab_index) = self.tabs.iter().position(|tab| tab.uid == tab_uid) else {
             self.pending_page_set = None;
@@ -4297,7 +4331,7 @@ impl DaraskApp {
             return;
         };
         if let Some(existing) = self.find_other_tab_by_path(tab_uid, &path) {
-            self.pending_page_set = None;
+            self.attach_pending_page_set_to_tab(tab_uid, page_index, existing);
             self.switch_tab(existing);
             self.show_toast("このページは別のタブで開いています".to_owned());
             return;
@@ -4336,7 +4370,7 @@ impl DaraskApp {
         tab.view = CanvasView::new();
         tab.selection = None;
         tab.floating = None;
-        tab.edit_target_gen = tab.edit_target_gen.wrapping_add(1);
+        tab.edit_target_gen = tab.edit_target_gen.checked_add(1).unwrap_or(INVALID_ID);
         tab.untitled_number = None;
         tab.layer_rename = None;
         tab.next_layer_number = 1;
@@ -4583,6 +4617,7 @@ impl DaraskApp {
         };
         match result {
             Ok(()) => {
+                self.page_thumbnails.invalidate(&path);
                 // v8 レビュー修正: 「名前を付けて保存」/書き出しで別タブが
                 // 開いているパスへ書いた場合、同じパスを 2 タブが保持して
                 // 以後の Ctrl+S で互いの内容を黙って上書きし合わないよう、
@@ -4603,7 +4638,8 @@ impl DaraskApp {
                     // 未保存ガードから「保存」を選んで画像形式を選んだ場合、
                     // プロジェクト内容(レイヤー・履歴)は保存されていない
                     // ため、続く破壊的操作(閉じる等)は続行しない。
-                    if self.after_save_action.take().is_some() {
+                    if self.after_save_action.is_some() {
+                        self.abort_after_save_action();
                         self.show_toast(
                             "画像として書き出しました。閉じる前にプロジェクト(.dpaint)として保存してください"
                                 .to_owned(),
@@ -4623,7 +4659,7 @@ impl DaraskApp {
                 }
             }
             Err(e) => {
-                self.after_save_action = None;
+                self.abort_after_save_action();
                 self.show_toast(format!("保存に失敗しました: {e}"));
             }
         }
@@ -4653,7 +4689,16 @@ impl DaraskApp {
         for index in detach {
             let number = self.take_untitled_number();
             let tab = &mut self.tabs[index];
+            let current_page_matches = tab
+                .pages
+                .as_ref()
+                .and_then(|pages| pages.entries.get(pages.current))
+                .is_some_and(|entry| normalize_path_for_compare(&entry.path) == normalized);
             tab.doc.path = None;
+            let dropped_page_set = current_page_matches;
+            if current_page_matches {
+                tab.pages = None;
+            }
             tab.untitled_number = Some(number);
             tab.doc.modified = true;
             // SPEC §40-①: ディスク上のファイルはもうこのタブの履歴のどの
@@ -4661,6 +4706,10 @@ impl DaraskApp {
             // 「保存済み」表示に戻ってしまうと、閉じる確認が出ないまま
             // このタブの内容が失われうる)。
             tab.history.invalidate_saved();
+            if dropped_page_set {
+                // SPEC §54: ページ集を失ったタブのサムネイルを解放する。
+                self.prune_page_thumbnails();
+            }
             self.show_toast("同じファイルを開いていた別のタブは「無題」になりました".to_owned());
         }
     }
@@ -4669,6 +4718,18 @@ impl DaraskApp {
         let action = self.pending_action.take();
         self.after_save_action = action;
         self.begin_save();
+    }
+
+    fn abort_after_save_action(&mut self) {
+        if let Some(PendingAction::SwitchPage { tab_uid, .. }) = self.after_save_action.take() {
+            if self
+                .pending_page_set
+                .as_ref()
+                .is_some_and(|(pending_uid, _)| *pending_uid == tab_uid)
+            {
+                self.pending_page_set = None;
+            }
+        }
     }
 
     fn confirm_unsaved_discard(&mut self) {
@@ -6395,7 +6456,7 @@ impl DaraskApp {
                         keep_open = false;
                     }
                     DialogOutcome::Cancelled => {
-                        self.after_save_action = None;
+                        self.abort_after_save_action();
                         keep_open = false;
                     }
                     DialogOutcome::Pending => {}
