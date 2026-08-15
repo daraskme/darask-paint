@@ -89,6 +89,8 @@ impl Binding {
         let key = match self.key {
             Key::Escape => "Esc",
             Key::Minus => "-",
+            Key::PageUp => "PageUp",
+            Key::PageDown => "PageDown",
             other => other.symbol_or_name(),
         };
         if parts.is_empty() {
@@ -194,6 +196,10 @@ pub enum Action {
     /// v5 §30/§32(V5-M3、ARCHITECTURE.md §17.4): `Ctrl+W`: アクティブタブを
     /// 閉じる(未保存なら確認ダイアログ、`app.rs::close_tab` 参照)。
     CloseTab,
+    /// SPEC §54: 前のページへ。
+    PrevPage,
+    /// SPEC §54: 次のページへ。
+    NextPage,
 
     // -- 表示(SPEC §20「表示」) ---------------------------------------------
     ZoomIn,
@@ -372,6 +378,8 @@ pub const KEYMAP: &[Entry] = &[
     // (`SelectLastWandTool`)に束縛済みだが、`Ctrl` 修飾があるので衝突しない、
     // `no_two_entries_share_the_same_binding` 参照)。
     e(Modifiers::CTRL, Key::W, Action::CloseTab),
+    e(Modifiers::NONE, Key::PageUp, Action::PrevPage),
+    e(Modifiers::NONE, Key::PageDown, Action::NextPage),
     // -- 表示 ------------------------------------------------------------
     e(Modifiers::CTRL, Key::Plus, Action::ZoomIn),
     e(Modifiers::CTRL, Key::Minus, Action::ZoomOut),
@@ -902,7 +910,7 @@ mod tests {
         // v12 §51.2 でさらに 1 件追加: Shift+W(CycleWandTool。W 自体は
         // `SelectTool(MagicWand)` → `SelectLastWandTool` に置き換わっただけで
         // バインド数は変わらない) = 73 + 1 = 74。
-        assert_eq!(KEYMAP.len(), 74);
+        assert_eq!(KEYMAP.len(), 76);
     }
 
     // -- v9 §41: 矢印キーのナッジ ---------------------------------------------
@@ -933,6 +941,20 @@ mod tests {
             binding_for(Action::Nudge(-10, 0)),
             Some(Binding::new(Modifiers::SHIFT, Key::ArrowLeft))
         );
+    }
+
+    #[test]
+    fn page_keys_map_one_to_one_to_page_navigation() {
+        assert_eq!(
+            binding_for(Action::PrevPage),
+            Some(Binding::new(Modifiers::NONE, Key::PageUp))
+        );
+        assert_eq!(
+            binding_for(Action::NextPage),
+            Some(Binding::new(Modifiers::NONE, Key::PageDown))
+        );
+        assert_eq!(labels_for(Action::PrevPage), "PageUp");
+        assert_eq!(labels_for(Action::NextPage), "PageDown");
     }
 
     #[test]

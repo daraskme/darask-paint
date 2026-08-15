@@ -223,6 +223,12 @@ pub fn open_dialog() -> Option<PathBuf> {
         .pick_file()
 }
 
+pub fn open_pages_folder_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("フォルダをページとして開く")
+        .pick_folder()
+}
+
 /// v9 §43: 「ファイルから貼り付け」ダイアログ(画像形式のみ — `.dpaint` は
 /// レイヤー構成を持つため貼り付け元にしない。開きたい場合は「開く」で
 /// 別タブに開く)。

@@ -14,6 +14,7 @@ use crate::ui::icons;
 pub enum MenuAction {
     New,
     Open,
+    OpenFolderAsPages,
     OpenRecent(usize),
     Save,
     SaveAs,
@@ -91,7 +92,7 @@ const PANEL_MARGIN_V: f32 = 2.0;
 const POPUP_MIN_WIDTH: f32 = 286.0;
 const POPUP_ROW_H: f32 = 27.0;
 const POPUP_ICON_SIZE: f32 = 17.0;
-const FILE_RECENT_INSERT_INDEX: usize = 2;
+const FILE_RECENT_INSERT_INDEX: usize = 3;
 
 type PaintFn = fn(&egui::Painter, egui::Rect, egui::Color32);
 
@@ -111,6 +112,7 @@ enum MenuSlot {
 
 const FILE_ITEMS: &[MenuAction] = &[
     MenuAction::SaveAs,
+    MenuAction::OpenFolderAsPages,
     MenuAction::PasteFromFile,
     MenuAction::CloseTab,
     MenuAction::Exit,
@@ -243,6 +245,7 @@ impl MenuAction {
         match self {
             Self::New => "新規",
             Self::Open => "開く",
+            Self::OpenFolderAsPages => "ページフォルダ",
             Self::OpenRecent(_) => "最近開く",
             Self::Save => "保存",
             Self::SaveAs => "別名保存",
@@ -297,6 +300,7 @@ impl MenuAction {
         match self {
             Self::New => "新規",
             Self::Open => "開く",
+            Self::OpenFolderAsPages => "フォルダをページとして開く…",
             Self::OpenRecent(_) => "最近使ったファイル",
             Self::Save => "上書き保存",
             Self::SaveAs => "名前を付けて保存",
@@ -434,6 +438,7 @@ impl MenuAction {
         match self {
             Self::New => icons::paint_new_document_icon,
             Self::Open => icons::paint_open_icon,
+            Self::OpenFolderAsPages => icons::paint_open_icon,
             Self::OpenRecent(_) => icons::paint_recent_files_icon,
             Self::Save => icons::paint_save_icon,
             Self::SaveAs => icons::paint_save_as_icon,
@@ -789,6 +794,7 @@ mod tests {
     const ALL_MENU_ACTIONS: &[MenuAction] = &[
         MenuAction::New,
         MenuAction::Open,
+        MenuAction::OpenFolderAsPages,
         MenuAction::Save,
         MenuAction::SaveAs,
         MenuAction::CloseTab,
@@ -961,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn all_49_menu_entries_appear_exactly_once() {
+    fn all_50_menu_entries_appear_exactly_once() {
         let mut placed = Vec::new();
         for slot in TOP_LEVEL_SLOTS {
             match slot {
@@ -983,7 +989,7 @@ mod tests {
                 "{action:?} の配置数"
             );
         }
-        assert_eq!(placed.len(), 49);
+        assert_eq!(placed.len(), 50);
     }
 
     #[test]
@@ -1003,11 +1009,12 @@ mod tests {
 
     #[test]
     fn file_group_keeps_recent_files_between_paste_and_close() {
-        assert_eq!(FILE_RECENT_INSERT_INDEX, 2);
+        assert_eq!(FILE_RECENT_INSERT_INDEX, 3);
         assert_eq!(
             FILE_GROUP.items,
             [
                 MenuAction::SaveAs,
+                MenuAction::OpenFolderAsPages,
                 MenuAction::PasteFromFile,
                 MenuAction::CloseTab,
                 MenuAction::Exit,

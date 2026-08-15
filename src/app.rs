@@ -60,6 +60,7 @@ use crate::history::{History, HistoryOp};
 use crate::inpaint::{self, InpaintError, InpaintInput, InpaintOutput};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
+use crate::pages::PageSet;
 use crate::raster;
 use crate::settings::{self, Settings};
 use crate::text;
@@ -78,6 +79,7 @@ use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
 use crate::ui::layers_panel::{LayersPanelAction, RenameState, ThumbnailCache};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
+use crate::ui::pages_panel::PageThumbnailCache;
 use crate::ui::panels::PanelLayout;
 use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
 use crate::ui::toolbar::{self, ToolbarAction};
@@ -392,6 +394,10 @@ enum PendingAction {
     /// 削除しないので `tabs` の長さは変わらず、残りの index がずれる
     /// 心配もない)。
     CloseAllTabs(VecDeque<usize>),
+    SwitchPage {
+        tab_uid: u64,
+        page_index: usize,
+    },
 }
 
 /// v12 §51.2: 選択ブラシの進行中ストローク(`DaraskApp::select_brush_stroke`)。
@@ -640,6 +646,7 @@ enum ModalState {
 /// 次フレームの `ui()` 冒頭で実際に呼び出す。
 enum DialogRequest {
     OpenFile,
+    OpenPagesFolder,
     SaveAs,
     /// v9 §43: 「ファイルから貼り付け」(画像を選んで現在のタブへ浮動片
     /// として貼り付ける。MS ペイントの「貼り付け元」に相当)。
@@ -802,6 +809,7 @@ struct Tab {
     /// `ui/layers_panel.rs` 参照)。文書を差し替える経路では
     /// `ThumbnailCache::invalidate_all` を呼ぶこと。
     thumbnails: ThumbnailCache,
+    pages: Option<PageSet>,
 }
 
 impl Tab {
@@ -842,6 +850,7 @@ impl Tab {
             next_layer_number: 1,
             meta_dirty: false,
             thumbnails: ThumbnailCache::default(),
+            pages: None,
         }
     }
 
@@ -1022,6 +1031,8 @@ pub struct DaraskApp {
     background_job: Option<BackgroundJob>,
     modal: Option<ModalState>,
     pending_action: Option<PendingAction>,
+    pending_page_set: Option<(u64, PageSet)>,
+    page_thumbnails: PageThumbnailCache,
     pending_dialog: Option<DialogRequest>,
     /// 保存が完了したら続けて実行するアクション(未保存ガードで「保存」を
     /// 選んだ場合に使う)。
@@ -1276,6 +1287,8 @@ impl DaraskApp {
             background_job: None,
             modal: None,
             pending_action: None,
+            pending_page_set: None,
+            page_thumbnails: PageThumbnailCache::default(),
             pending_dialog: None,
             after_save_action: None,
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
@@ -1530,6 +1543,8 @@ impl DaraskApp {
                 Action::PrevTab => self.prev_tab(),
                 // v5 §30/§32(V5-M3): タブを閉じる(ARCHITECTURE.md §17.4)。
                 Action::CloseTab => self.close_tab(self.active_tab),
+                Action::PrevPage => self.move_page_relative(-1),
+                Action::NextPage => self.move_page_relative(1),
 
                 Action::ZoomIn => self.active_tab_mut().view.zoom_in(),
                 Action::ZoomOut => self.active_tab_mut().view.zoom_out(),
@@ -3870,7 +3885,11 @@ impl DaraskApp {
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for path in dropped.into_iter().filter_map(|f| f.path) {
-            self.open_path_in_new_tab(path);
+            if path.is_dir() {
+                self.open_folder_as_pages(path);
+            } else {
+                self.open_path_in_new_tab(path);
+            }
         }
     }
 
@@ -3937,6 +3956,11 @@ impl DaraskApp {
             DialogRequest::OpenFile => {
                 if let Some(path) = io::open_dialog() {
                     self.open_path_in_new_tab(path);
+                }
+            }
+            DialogRequest::OpenPagesFolder => {
+                if let Some(path) = io::open_pages_folder_dialog() {
+                    self.open_folder_as_pages(path);
                 }
             }
             DialogRequest::SaveAs => {
@@ -4008,7 +4032,9 @@ impl DaraskApp {
     /// 未保存ガードを通過した(または最初から不要だった)アクションを
     /// 実際に行う。
     fn execute_pending_action(&mut self, action: PendingAction) {
-        self.commit_selection();
+        if !matches!(action, PendingAction::SwitchPage { .. }) {
+            self.commit_selection();
+        }
         match action {
             // SPEC §30: 「最後の 1 タブを閉じようとした場合…「新規」と同じ
             // 扱い(未保存ガードを通してから内容を白紙に戻す)」。通常の
@@ -4033,6 +4059,12 @@ impl DaraskApp {
             // v5 §17.4: 「先頭から 1 つずつ確認フローを回す」の続きを行う。
             PendingAction::CloseAllTabs(queue) => {
                 self.continue_closing_all_tabs(queue);
+            }
+            PendingAction::SwitchPage {
+                tab_uid,
+                page_index,
+            } => {
+                self.switch_page_transactional(tab_uid, page_index);
             }
         }
     }
@@ -4145,6 +4177,185 @@ impl DaraskApp {
                 }
                 Err(e) => self.show_toast(format!("開けませんでした: {e}")),
             }
+        }
+    }
+
+    fn open_folder_as_pages(&mut self, dir: PathBuf) {
+        let pages = match PageSet::enumerate(&dir) {
+            Ok(pages) => pages,
+            Err(error) => {
+                self.show_toast(format!("フォルダを開けませんでした: {error}"));
+                return;
+            }
+        };
+        if pages.entries.is_empty() {
+            self.show_toast("対応するページファイルがありません".to_owned());
+            return;
+        }
+        let uid = self.active_tab().uid;
+        if let Some(current) = self.active_tab().doc.path.as_deref().and_then(|path| {
+            pages.entries.iter().position(|entry| {
+                normalize_path_for_compare(&entry.path) == normalize_path_for_compare(path)
+            })
+        }) {
+            let mut pages = pages;
+            pages.current = current;
+            self.active_tab_mut().pages = Some(pages);
+            return;
+        }
+        self.pending_page_set = Some((uid, pages));
+        self.request_page_switch(uid, 0);
+    }
+
+    fn request_page_switch(&mut self, tab_uid: u64, page_index: usize) {
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.uid == tab_uid) else {
+            self.pending_page_set = None;
+            return;
+        };
+        if tab_index != self.active_tab {
+            self.switch_tab(tab_index);
+        }
+        let Some(path) = self.page_target_path(tab_uid, page_index) else {
+            return;
+        };
+        if let Some(existing) = self.find_other_tab_by_path(tab_uid, &path) {
+            self.pending_page_set = None;
+            self.switch_tab(existing);
+            self.show_toast("このページは別のタブで開いています".to_owned());
+            return;
+        }
+        let action = PendingAction::SwitchPage {
+            tab_uid,
+            page_index,
+        };
+        self.commit_open_gesture();
+        if !self.active_tab().doc.modified {
+            self.execute_pending_action(action);
+            return;
+        }
+        let autosave = self
+            .page_set_for(tab_uid)
+            .is_some_and(|pages| pages.autosave);
+        if autosave && can_autosave_faithfully(self.active_tab()) {
+            let Some(save_path) = self.active_tab().doc.path.clone() else {
+                self.request_action(action);
+                return;
+            };
+            let Some(mut format) = io::format_for_path(&save_path) else {
+                self.request_action(action);
+                return;
+            };
+            if matches!(format, SaveFormat::Jpeg { .. }) {
+                format = SaveFormat::Jpeg {
+                    quality: self.last_jpeg_quality,
+                };
+            }
+            self.after_save_action = Some(action);
+            self.finish_save(save_path, format);
+        } else {
+            self.request_action(action);
+        }
+    }
+
+    fn page_set_for(&self, tab_uid: u64) -> Option<&PageSet> {
+        self.pending_page_set
+            .as_ref()
+            .filter(|(uid, _)| *uid == tab_uid)
+            .map(|(_, pages)| pages)
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.uid == tab_uid)
+                    .and_then(|tab| tab.pages.as_ref())
+            })
+    }
+
+    fn page_target_path(&self, tab_uid: u64, page_index: usize) -> Option<PathBuf> {
+        self.page_set_for(tab_uid)
+            .and_then(|pages| pages.entries.get(page_index))
+            .map(|entry| entry.path.clone())
+    }
+
+    fn find_other_tab_by_path(&self, tab_uid: u64, path: &Path) -> Option<usize> {
+        let target = normalize_path_for_compare(path);
+        self.tabs.iter().position(|tab| {
+            tab.uid != tab_uid
+                && tab
+                    .doc
+                    .path
+                    .as_deref()
+                    .is_some_and(|candidate| normalize_path_for_compare(candidate) == target)
+        })
+    }
+
+    fn switch_page_transactional(&mut self, tab_uid: u64, page_index: usize) {
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.uid == tab_uid) else {
+            self.pending_page_set = None;
+            return;
+        };
+        let Some(path) = self.page_target_path(tab_uid, page_index) else {
+            return;
+        };
+        if let Some(existing) = self.find_other_tab_by_path(tab_uid, &path) {
+            self.pending_page_set = None;
+            self.switch_tab(existing);
+            self.show_toast("このページは別のタブで開いています".to_owned());
+            return;
+        }
+        let doc = match load_page_document(&path) {
+            Ok(doc) => doc,
+            Err(error) => {
+                if self
+                    .pending_page_set
+                    .as_ref()
+                    .is_some_and(|(uid, _)| *uid == tab_uid)
+                {
+                    self.pending_page_set = None;
+                }
+                self.show_toast(format!("ページを開けませんでした: {error}"));
+                return;
+            }
+        };
+        let mut pages = self
+            .pending_page_set
+            .take()
+            .filter(|(uid, _)| *uid == tab_uid)
+            .map(|(_, pages)| pages)
+            .or_else(|| self.tabs[tab_index].pages.take());
+        if let Some(pages) = pages.as_mut() {
+            pages.current = page_index;
+        }
+        let history = {
+            let mut history = History::new();
+            history.set_max_steps(self.max_undo_steps as usize);
+            history
+        };
+        let tab = &mut self.tabs[tab_index];
+        tab.doc = doc;
+        tab.history = history;
+        tab.view = CanvasView::new();
+        tab.selection = None;
+        tab.floating = None;
+        tab.edit_target_gen = tab.edit_target_gen.wrapping_add(1);
+        tab.untitled_number = None;
+        tab.layer_rename = None;
+        tab.next_layer_number = 1;
+        tab.meta_dirty = false;
+        tab.thumbnails = ThumbnailCache::default();
+        tab.pages = pages;
+        self.active_tab = tab_index;
+        self.reset_tool_state_for_new_document();
+        self.remember_recent_file(path);
+    }
+
+    fn move_page_relative(&mut self, delta: isize) {
+        let tab = self.active_tab();
+        let Some(pages) = tab.pages.as_ref() else {
+            return;
+        };
+        let target = pages.current.saturating_add_signed(delta);
+        if target < pages.entries.len() && target != pages.current {
+            self.request_page_switch(tab.uid, target);
         }
     }
 
@@ -4467,6 +4678,9 @@ impl DaraskApp {
     }
 
     fn confirm_unsaved_cancel(&mut self) {
+        if matches!(self.pending_action, Some(PendingAction::SwitchPage { .. })) {
+            self.pending_page_set = None;
+        }
         self.pending_action = None;
     }
 
@@ -5991,6 +6205,9 @@ impl DaraskApp {
             // 参照(新規タブ追加は既存タブを破壊しないため未保存ガード不要)。
             MenuAction::New => self.begin_new_tab(),
             MenuAction::Open => self.begin_open_tab(),
+            MenuAction::OpenFolderAsPages => {
+                self.pending_dialog = Some(DialogRequest::OpenPagesFolder);
+            }
             MenuAction::OpenRecent(index) => self.open_recent_file(index),
             MenuAction::Save => self.begin_save(),
             MenuAction::SaveAs => self.begin_save_as(),
@@ -6572,6 +6789,8 @@ impl eframe::App for DaraskApp {
                 rename: &mut tab.layer_rename,
                 thumbnails: &mut tab.thumbnails,
                 history: &tab.history,
+                pages: tab.pages.as_mut(),
+                page_thumbnails: &mut self.page_thumbnails,
                 color: color_ctx,
             },
             panels_interactive,
@@ -6582,6 +6801,13 @@ impl eframe::App for DaraskApp {
         // v6-M3(SPEC §35、ARCHITECTURE.md §18.4): 履歴パネルの行クリック。
         if let Some(target_len) = panels_out.history_jump {
             self.jump_history_to(target_len);
+        }
+        if let Some(page_index) = panels_out.page_switch {
+            let uid = self.active_tab().uid;
+            self.request_page_switch(uid, page_index);
+        }
+        if let Some(error) = panels_out.page_errors.into_iter().next() {
+            self.show_toast(error);
         }
 
         {
@@ -6843,6 +7069,27 @@ fn normalize_path_for_compare(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn load_page_document(path: &Path) -> Result<Document, String> {
+    if matches!(io::format_for_path(path), Some(SaveFormat::Project)) {
+        crate::project::load(path).map(|(doc, _history)| doc)
+    } else {
+        io::load_image(path)
+    }
+}
+
+fn can_autosave_faithfully(tab: &Tab) -> bool {
+    let Some(path) = tab.doc.path.as_deref() else {
+        return false;
+    };
+    match io::format_for_path(path) {
+        Some(SaveFormat::Project) => true,
+        Some(SaveFormat::Png | SaveFormat::Jpeg { .. } | SaveFormat::Bmp) => {
+            tab.doc.layers.len() == 1
+        }
+        None => false,
+    }
+}
+
 /// SPEC §30: 「タブ数の上限は 24。超えて新規タブを作ろうとしたら作成せず
 /// トースト通知」。
 fn tab_limit_toast_message() -> String {
@@ -6962,6 +7209,8 @@ mod tests {
             background_job: None,
             modal: None,
             pending_action: None,
+            pending_page_set: None,
+            page_thumbnails: PageThumbnailCache::default(),
             pending_dialog: None,
             after_save_action: None,
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
@@ -14206,5 +14455,162 @@ mod tests {
             selection.mask.contains(25, 99),
             "the correct (build-then-clip) ellipse must include this pixel"
         );
+    }
+
+    fn page_set(paths: &[PathBuf], current: usize, autosave: bool) -> PageSet {
+        PageSet {
+            dir: paths[0].parent().unwrap_or(Path::new(".")).to_path_buf(),
+            entries: paths
+                .iter()
+                .cloned()
+                .map(|path| crate::pages::PageEntry { path })
+                .collect(),
+            current,
+            autosave,
+        }
+    }
+
+    #[test]
+    fn can_autosave_faithfully_covers_all_supported_branches() {
+        let mut tab = Tab::new(
+            Document::new(2, 2, Background::White),
+            Some(1),
+            settings::DEFAULT_MAX_UNDO_STEPS,
+        );
+        assert!(!can_autosave_faithfully(&tab));
+        for extension in ["png", "jpg", "jpeg", "bmp"] {
+            tab.doc.path = Some(PathBuf::from(format!("page.{extension}")));
+            assert!(can_autosave_faithfully(&tab), "{extension}");
+        }
+        tab.doc.add_layer("追加".to_owned());
+        assert!(!can_autosave_faithfully(&tab));
+        tab.doc.path = Some(PathBuf::from("page.dpaint"));
+        assert!(can_autosave_faithfully(&tab));
+        for extension in ["gif", "webp"] {
+            tab.doc.path = Some(PathBuf::from(format!("page.{extension}")));
+            assert!(!can_autosave_faithfully(&tab), "{extension}");
+        }
+    }
+
+    #[test]
+    fn page_switch_load_failure_and_cancel_leave_the_current_page_untouched() {
+        let dir = temp_dir_for_app_test("page_failure_cancel");
+        let first = dir.join("1.png");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &first,
+            SaveFormat::Png,
+        )
+        .expect("seed page should save");
+        let missing = dir.join("2.png");
+        let mut app = new_for_test(io::load_image(&first).expect("first page should load"));
+        let uid = app.active_tab().uid;
+        app.active_tab_mut().pages = Some(page_set(&[first.clone(), missing], 0, false));
+        app.request_page_switch(uid, 1);
+        assert_eq!(app.active_tab().doc.path.as_deref(), Some(first.as_path()));
+        assert_eq!(
+            app.active_tab().pages.as_ref().map(|pages| pages.current),
+            Some(0)
+        );
+
+        app.active_tab_mut().doc.modified = true;
+        app.request_page_switch(uid, 1);
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+        app.confirm_unsaved_cancel();
+        assert_eq!(app.active_tab().doc.path.as_deref(), Some(first.as_path()));
+        assert_eq!(
+            app.active_tab().pages.as_ref().map(|pages| pages.current),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn page_switch_to_a_path_open_in_another_tab_activates_that_tab() {
+        let dir = temp_dir_for_app_test("page_dedupe");
+        let first = dir.join("1.png");
+        let second = dir.join("2.png");
+        for path in [&first, &second] {
+            io::save_image(
+                &mut Document::new(3, 3, Background::White),
+                path,
+                SaveFormat::Png,
+            )
+            .expect("seed page should save");
+        }
+        let mut app = new_for_test(io::load_image(&first).expect("first page should load"));
+        let uid = app.active_tab().uid;
+        app.active_tab_mut().pages = Some(page_set(&[first, second.clone()], 0, false));
+        app.open_path_in_new_tab(second);
+        app.switch_tab(0);
+        app.request_page_switch(uid, 1);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(
+            app.tabs[0].pages.as_ref().map(|pages| pages.current),
+            Some(0)
+        );
+        assert!(app.toast.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn successful_page_switch_resets_document_scoped_state_but_keeps_page_settings() {
+        let dir = temp_dir_for_app_test("page_reset");
+        let first = dir.join("1.png");
+        let second = dir.join("2.png");
+        for path in [&first, &second] {
+            io::save_image(
+                &mut Document::new(4, 4, Background::White),
+                path,
+                SaveFormat::Png,
+            )
+            .expect("seed page should save");
+        }
+        let mut app = new_for_test(io::load_image(&first).expect("first page should load"));
+        let uid = app.active_tab().uid;
+        app.active_tab_mut().pages = Some(page_set(&[first, second.clone()], 0, true));
+        let snapshot = app.active_tab().doc.snapshot();
+        app.active_tab_mut().history.push(
+            HistoryOp::ReplaceAll {
+                before: snapshot.clone(),
+                after: snapshot,
+            },
+            "テスト",
+        );
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        })));
+        app.active_tab_mut().floating = Some(Floating::new(
+            vec![0; 4],
+            1,
+            1,
+            vec![255],
+            pos2(1.0, 1.0),
+            None,
+            1,
+        ));
+        app.active_tab_mut().view.zoom = 3.0;
+        app.active_tab_mut().view.pan = egui::vec2(12.0, 8.0);
+        app.active_tab_mut().layer_rename = Some((0, "編集中".to_owned(), false));
+
+        app.request_page_switch(uid, 1);
+        let tab = app.active_tab();
+        assert_eq!(tab.doc.path.as_deref(), Some(second.as_path()));
+        assert!(!tab.history.can_undo());
+        assert!(tab.selection.is_none());
+        assert!(tab.floating.is_none());
+        assert_eq!(tab.view.zoom, 1.0);
+        assert_eq!(tab.view.pan, egui::Vec2::ZERO);
+        assert!(tab.layer_rename.is_none());
+        assert_eq!(
+            tab.pages
+                .as_ref()
+                .map(|pages| (pages.current, pages.autosave)),
+            Some((1, true))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

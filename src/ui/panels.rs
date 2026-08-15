@@ -45,16 +45,21 @@ pub enum PanelKind {
     Color,
     Layers,
     History,
+    Pages,
 }
 
 /// `PanelKind` の総数(配列添字に使う)。
-pub const PANEL_COUNT: usize = 3;
+pub const PANEL_COUNT: usize = 4;
 
 impl PanelKind {
     /// 既定の並び(SPEC §58: 「色→レイヤー→履歴」)。UI・永続化の反復は
     /// すべてこの配列を通す。
-    pub const ALL: [PanelKind; PANEL_COUNT] =
-        [PanelKind::Color, PanelKind::Layers, PanelKind::History];
+    pub const ALL: [PanelKind; PANEL_COUNT] = [
+        PanelKind::Color,
+        PanelKind::Layers,
+        PanelKind::History,
+        PanelKind::Pages,
+    ];
 
     /// ヘッダに出す日本語名(UI 表示専用)。
     pub fn title(self) -> &'static str {
@@ -62,6 +67,7 @@ impl PanelKind {
             Self::Color => "色",
             Self::Layers => "レイヤー",
             Self::History => "履歴",
+            Self::Pages => "ページ",
         }
     }
 
@@ -73,6 +79,7 @@ impl PanelKind {
             Self::Color => "color",
             Self::Layers => "layers",
             Self::History => "history",
+            Self::Pages => "pages",
         }
     }
 
@@ -82,6 +89,7 @@ impl PanelKind {
             Self::Color => 0,
             Self::Layers => 1,
             Self::History => 2,
+            Self::Pages => 3,
         }
     }
 }
@@ -501,7 +509,12 @@ mod tests {
         let layout = PanelLayout::default();
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::Color, PanelKind::Layers, PanelKind::History],
+            vec![
+                PanelKind::Color,
+                PanelKind::Layers,
+                PanelKind::History,
+                PanelKind::Pages
+            ],
             "SPEC §58: 既定は全部右ドック・色→レイヤー→履歴"
         );
         assert!(layout.is_dock_empty(DockSide::Left));
@@ -514,6 +527,32 @@ mod tests {
     #[test]
     fn default_round_trips() {
         let layout = PanelLayout::default();
+        assert_eq!(round_trip(&layout), layout);
+    }
+
+    #[test]
+    fn pages_panel_supports_right_left_and_floating_placements() {
+        let mut layout = PanelLayout::default();
+        assert!(matches!(
+            layout.placement(PanelKind::Pages),
+            PanelPlacement::Dock {
+                side: DockSide::Right,
+                ..
+            }
+        ));
+        assert!(layout.dock_at_slot(PanelKind::Pages, DockSide::Left, 0));
+        assert!(matches!(
+            layout.placement(PanelKind::Pages),
+            PanelPlacement::Dock {
+                side: DockSide::Left,
+                order: 0
+            }
+        ));
+        layout.float_at(PanelKind::Pages, pos2(40.0, 50.0), DEFAULT_FLOAT_SIZE);
+        assert!(matches!(
+            layout.placement(PanelKind::Pages),
+            PanelPlacement::Floating { .. }
+        ));
         assert_eq!(round_trip(&layout), layout);
     }
 
@@ -588,7 +627,12 @@ panel.history.order\t0
         // order 0 の履歴が先頭、同点の色/レイヤーは ALL の順で続く。
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::History, PanelKind::Color, PanelKind::Layers]
+            vec![
+                PanelKind::History,
+                PanelKind::Pages,
+                PanelKind::Color,
+                PanelKind::Layers
+            ]
         );
         for (expected, kind) in layout.docked(DockSide::Right).iter().enumerate().map(
             |(i, &k)| (i, k), // (order, kind)
@@ -615,13 +659,23 @@ panel.history.order\t0
         assert!(layout.dock_at_slot(PanelKind::History, DockSide::Right, 0));
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::History, PanelKind::Color, PanelKind::Layers]
+            vec![
+                PanelKind::History,
+                PanelKind::Color,
+                PanelKind::Layers,
+                PanelKind::Pages
+            ]
         );
         // 末尾へ戻す。
         assert!(layout.dock_at_slot(PanelKind::History, DockSide::Right, 3));
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::Color, PanelKind::Layers, PanelKind::History]
+            vec![
+                PanelKind::Color,
+                PanelKind::Layers,
+                PanelKind::History,
+                PanelKind::Pages
+            ]
         );
     }
 
@@ -642,7 +696,7 @@ panel.history.order\t0
         assert_eq!(layout.docked(DockSide::Left), vec![PanelKind::Color]);
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::Layers, PanelKind::History]
+            vec![PanelKind::Layers, PanelKind::History, PanelKind::Pages]
         );
         for (expected, kind) in [(0, PanelKind::Layers), (1, PanelKind::History)] {
             match layout.placement(kind) {
@@ -658,7 +712,7 @@ panel.history.order\t0
         layout.float_at(PanelKind::Color, pos2(50.0, 60.0), vec2(200.0, 300.0));
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::Layers, PanelKind::History]
+            vec![PanelKind::Layers, PanelKind::History, PanelKind::Pages]
         );
         assert_eq!(layout.floating(), vec![PanelKind::Color]);
         match layout.placement(PanelKind::Layers) {
@@ -706,7 +760,10 @@ panel.history.order\t0
             layout.docked(DockSide::Left),
             vec![PanelKind::Color, PanelKind::Layers]
         );
-        assert_eq!(layout.docked(DockSide::Right), vec![PanelKind::History]);
+        assert_eq!(
+            layout.docked(DockSide::Right),
+            vec![PanelKind::History, PanelKind::Pages]
+        );
     }
 
     #[test]

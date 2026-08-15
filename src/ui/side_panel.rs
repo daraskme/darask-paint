@@ -39,11 +39,13 @@ use eframe::egui;
 
 use crate::document::Document;
 use crate::history::History;
+use crate::pages::PageSet;
 use crate::ui::color_panel::{self, ColorPanelCtx};
 use crate::ui::history_panel;
 use crate::ui::layers_panel::{
     self, LayersPanelAction, LayersPanelCtx, RenameState, ThumbnailCache,
 };
+use crate::ui::pages_panel::{self, PageThumbnailCache};
 use crate::ui::panels::{self, DockSide, PanelKind, PanelLayout, PanelMove, PanelPlacement};
 
 /// ヘッダの折りたたみ矢印の一辺。
@@ -63,6 +65,8 @@ pub struct PanelsCtx<'a> {
     pub rename: &'a mut RenameState,
     pub thumbnails: &'a mut ThumbnailCache,
     pub history: &'a History,
+    pub pages: Option<&'a mut PageSet>,
+    pub page_thumbnails: &'a mut PageThumbnailCache,
     pub color: ColorPanelCtx<'a>,
 }
 
@@ -73,6 +77,8 @@ pub struct PanelsOutput {
     pub layer_action: Option<LayersPanelAction>,
     /// 履歴パネルの行クリック(`History::jump_to` に渡す undo スタック長)。
     pub history_jump: Option<usize>,
+    pub page_switch: Option<usize>,
+    pub page_errors: Vec<String>,
 }
 
 /// 1 フレームの描画中に溜まる副作用(引数の数を抑えるための束ね。
@@ -374,6 +380,13 @@ fn panel_body(ui: &mut egui::Ui, kind: PanelKind, ctx: &mut PanelsCtx<'_>, out: 
                 out.history_jump = jump;
             }
         }
+        PanelKind::Pages => {
+            let result = pages_panel::show(ui, ctx.pages.as_deref_mut(), ctx.page_thumbnails);
+            if result.switch_to.is_some() {
+                out.page_switch = result.switch_to;
+            }
+            out.page_errors.extend(result.errors);
+        }
     }
 }
 
@@ -599,6 +612,7 @@ mod tests {
         rename: RenameState,
         thumbnails: ThumbnailCache,
         history: History,
+        page_thumbnails: PageThumbnailCache,
         primary: Color32,
         secondary: Color32,
         wheel: ColorWheelState,
@@ -614,6 +628,7 @@ mod tests {
                 rename: None,
                 thumbnails: ThumbnailCache::default(),
                 history: History::new(),
+                page_thumbnails: PageThumbnailCache::default(),
                 primary: Color32::BLACK,
                 secondary: Color32::WHITE,
                 wheel: ColorWheelState::new(),
@@ -629,6 +644,8 @@ mod tests {
                 rename: &mut self.rename,
                 thumbnails: &mut self.thumbnails,
                 history: &self.history,
+                pages: None,
+                page_thumbnails: &mut self.page_thumbnails,
                 color: ColorPanelCtx {
                     primary: &mut self.primary,
                     secondary: &mut self.secondary,
@@ -834,7 +851,12 @@ mod tests {
 
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::History, PanelKind::Color, PanelKind::Layers]
+            vec![
+                PanelKind::History,
+                PanelKind::Color,
+                PanelKind::Layers,
+                PanelKind::Pages
+            ]
         );
     }
 
@@ -860,7 +882,7 @@ mod tests {
         // 残りは右ドックに詰められる。
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::Color, PanelKind::Layers]
+            vec![PanelKind::Color, PanelKind::Layers, PanelKind::Pages]
         );
     }
 
@@ -885,7 +907,12 @@ mod tests {
 
         assert_eq!(
             layout.docked(DockSide::Right),
-            vec![PanelKind::History, PanelKind::Color, PanelKind::Layers],
+            vec![
+                PanelKind::History,
+                PanelKind::Color,
+                PanelKind::Layers,
+                PanelKind::Pages
+            ],
             "フローティングを右ドックの先頭へ戻せること"
         );
     }

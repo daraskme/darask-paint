@@ -12,6 +12,7 @@ mod icon;
 mod inpaint;
 mod io;
 mod keymap;
+mod pages;
 mod project;
 mod raster;
 mod settings;
