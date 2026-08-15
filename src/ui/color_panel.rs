@@ -69,9 +69,8 @@ pub fn show(ui: &mut egui::Ui, ctx: ColorPanelCtx) {
         user_palette,
     } = ctx;
 
-    ui.heading("色");
-    ui.add_space(4.0);
-
+    // v12 §50.1: 見出しは `side_panel.rs` の `CollapsingHeader`(「色」)が
+    // 描くため、パネル自身は中身だけを描く。
     show_swatches(ui, primary, secondary);
     ui.add_space(6.0);
 

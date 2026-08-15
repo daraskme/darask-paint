@@ -106,8 +106,16 @@ impl GradientTool {
                 let p = (x as f32 + 0.5, y as f32 + 0.5);
                 let t = raster::gradient_span(kind, p0, p1, p);
                 let gradient_color = raster::lerp_color(c0, c1, t);
-                let blended = raster::blend_over(original, gradient_color);
-                surface.set_pixel(x, y, blended);
+                // v12 §50.3: グラデーションも部分カバレッジの合成なので
+                // `blend_pixel` を通す(ロック無しの結果は従来と同一、
+                // ロック時は α 固定で RGB のみカバレッジ補間)。
+                surface.blend_pixel(
+                    x,
+                    y,
+                    original,
+                    [gradient_color[0], gradient_color[1], gradient_color[2]],
+                    gradient_color[3] as f32 / 255.0,
+                );
             }
         }
         ctx.doc.mark_dirty(bounds);

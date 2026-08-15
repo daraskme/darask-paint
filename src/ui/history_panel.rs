@@ -25,9 +25,8 @@ const OLDER_HISTORY_NOTE: &str = "(古い履歴もプロジェクトに保存さ
 /// そのまま渡せる目標 `undo_stack` 長を返す。
 pub fn show(ui: &mut egui::Ui, history: &History) -> Option<usize> {
     let mut jump_target = None;
-    ui.heading("履歴");
-    ui.add_space(4.0);
-
+    // v12 §50.1: 見出しは `side_panel.rs` の `CollapsingHeader`(「履歴」)が
+    // 描くため、パネル自身は中身だけを描く。
     let current_len = history.undo_len();
     let redo_len = history.redo_labels_reversed().len();
     let display_limit = history.display_step_limit();
@@ -39,41 +38,40 @@ pub fn show(ui: &mut egui::Ui, history: &History) -> Option<usize> {
     redo_take += redo_len.saturating_sub(redo_take).min(remaining);
     let undo_start = current_len.saturating_sub(undo_take);
 
-    egui::ScrollArea::vertical()
-        .max_height(140.0)
-        .auto_shrink([false, true])
-        .id_salt("darask_history_panel_scroll")
-        .show(ui, |ui| {
-            if undo_start > 0 {
-                ui.weak(OLDER_HISTORY_NOTE);
-            }
+    // v12 §50.1: 内側の固定高さスクロールは廃止(右パネル全体のスクロール
+    // 1 本に集約 — `side_panel.rs` のモジュールコメント参照)。表示件数は
+    // 従来どおり `display_step_limit` で上限が掛かっている。
+    ui.vertical(|ui| {
+        if undo_start > 0 {
+            ui.weak(OLDER_HISTORY_NOTE);
+        }
 
-            // 仮想「(初期状態)」行。target_len = 0(未編集の状態まで戻る)。
-            if undo_start == 0 && row(ui, INITIAL_STATE_LABEL, current_len == 0, false).clicked() {
-                jump_target = Some(0);
-            }
+        // 仮想「(初期状態)」行。target_len = 0(未編集の状態まで戻る)。
+        if undo_start == 0 && row(ui, INITIAL_STATE_LABEL, current_len == 0, false).clicked() {
+            jump_target = Some(0);
+        }
 
-            // undo_stack: 先頭(最古)から順に。行 i(0-indexed)をクリック
-            // すると、そのラベルの操作を適用した直後の状態(target_len =
-            // i + 1)まで戻る/進む。末尾(target_len == current_len)が
-            // 「現在位置」。
-            for (i, label) in history.undo_labels().enumerate().skip(undo_start) {
-                let target = i + 1;
-                if row(ui, label, target == current_len, false).clicked() {
-                    jump_target = Some(target);
-                }
+        // undo_stack: 先頭(最古)から順に。行 i(0-indexed)をクリック
+        // すると、そのラベルの操作を適用した直後の状態(target_len =
+        // i + 1)まで戻る/進む。末尾(target_len == current_len)が
+        // 「現在位置」。
+        for (i, label) in history.undo_labels().enumerate().skip(undo_start) {
+            let target = i + 1;
+            if row(ui, label, target == current_len, false).clicked() {
+                jump_target = Some(target);
             }
+        }
 
-            // redo_stack: 「逆順(直近の undo ほど上)」で、現在位置の直後
-            // から時系列順に続く(`History::redo_labels_reversed` のドキュ
-            // メント参照)。淡色表示、target_len は現在位置からの通し番号。
-            for (j, label) in history.redo_labels_reversed().take(redo_take).enumerate() {
-                let target = current_len + j + 1;
-                if row(ui, label, false, true).clicked() {
-                    jump_target = Some(target);
-                }
+        // redo_stack: 「逆順(直近の undo ほど上)」で、現在位置の直後
+        // から時系列順に続く(`History::redo_labels_reversed` のドキュ
+        // メント参照)。淡色表示、target_len は現在位置からの通し番号。
+        for (j, label) in history.redo_labels_reversed().take(redo_take).enumerate() {
+            let target = current_len + j + 1;
+            if row(ui, label, false, true).clicked() {
+                jump_target = Some(target);
             }
-        });
+        }
+    });
 
     jump_target
 }

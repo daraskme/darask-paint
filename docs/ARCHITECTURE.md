@@ -820,3 +820,80 @@ SPEC.md「v9 拡張仕様」(§41〜§45)に対応。
 2. 浮動片変換後は必ず `reset_resample_source()` + 新 id。忘れると次の拡縮が変換**前**の画素から再サンプリングされ、変換が巻き戻って見える。
 3. ナッジは `wants_keyboard_input` ガード必須(テキスト編集・リネーム中に矢印でカーソル移動できなくなる)— 既存の `handle_shortcuts` 先頭ガードで足りる。
 4. 画像書き出しの export 判定(§45-3)は「保存 Ok の後」ではなく**保存前の状態**(パス・レイヤー数)で決める(保存後にパスを書き換えてから判定すると常に export でなくなる)。
+
+---
+
+# 22. v12 設計(レイヤー刷新 / モザイク・選択ブラシ / 縦書き / 修復 / ページ / 外部プラグイン)
+
+SPEC.md「v12 拡張仕様」(§50〜§57)に対応。実装は 7 フェーズ(P1〜P7)で、**各フェーズ完了ごとに** SPEC v12 冒頭の受け入れ検査(fmt --check / clippy -D warnings / build --release / test --release / bench first_frame ≤300ms / exe ≤15MB / 依存集合不変 / 新規 unwrap なし / 新規 repaint 監査)を通すこと。計画レビュー(Codex gpt-5.6-sol、2026-08-15)の確定事項は SPEC §57-1 参照。
+
+## 22.1 P1 — レイヤー UX 刷新(SPEC §50)
+
+- **Layer 拡張**: `blend: BlendMode`(`#[derive(Clone, Copy, PartialEq)] enum BlendMode { Normal, Multiply, Screen, Overlay, Add }`)+ `alpha_lock: bool`。`Layer::filled` は Normal/false で初期化。
+- **合成**: `composite_layers`(document.rs — recomposite・結合・統合・書き出しの共通経路)へ blend 対応を実装。レイヤーごとに blend 関数を 1 回解決し行スライスへ適用。**Normal は既存コードパスを温存**(fast path、結果完全一致の回帰テスト)。式は SPEC §50.2(premultiplied 中間 → straight 出力)。`composite_two`(MergeDown 用)は Normal×Normal 限定になる(§50.2 の結合制限)。
+- **MoveLayer 意味論変更**: `HistoryOp::MoveLayer { from, to }` を swap から「remove→insert」へ。undo は to→from の remove→insert。active 追随も挿入規則で再計算。既存テストの期待値を全て更新し、非隣接 from/to のケースを追加。`.dpaint` の符号化は不変(添字 2 つ)で、旧ファイルは隣接のみなので挙動互換。
+- **アルファロックの描画経路**: 描画側の合成ヘルパ(ストロークの mask 合成・図形・fill・gradient・色調補正・モザイク・修復の書き込み)に「alpha_lock 時: `dst_a==0` スキップ / `dst_a>0` は RGB のみ補間」を通す。`ToolCtx` の clip と同様に、アクティブレイヤーの alpha_lock をツール実行文脈へ渡す。flood fill の直接 RGBA 代入(raster.rs)も alpha-aware 化。消しゴムは lock 時 no-op(空 undo を積まない — before==after 抑制で自然に成立するが、トースト通知のため明示分岐)。
+- **パネル**(layers_panel.rs): 行を [目アイコン(icons.rs 追加)] [サムネ] [名前] へ。DnD は egui の `dnd_drag_source`/`dnd_drop_zone`(ドロップ index は `Option` を安全に処理)。ドロップで `LayersPanelAction::Move { from, to }` を返し app.rs が 1 undo 適用。
+- **サムネイル**: `Document` に `content_gen: u64`(成功した変更境界でのみ増加・undo で巻き戻らない。History 適用/commit/ReplaceAll/構造変更/スナップショット復元の共通出口でインクリメント)+ レイヤー行ごとの `TextureHandle` キャッシュ(タブごと、`Vec<Option<(u64, TextureHandle)>>` を行数に同期し置換)。生成は可視行のみ・1 フレーム最大 4 枚・初回プレースホルダ(単色矩形)。box 平均縮小の純関数 `thumbnail_rgba(pixels, w, h, max_w, max_h) -> (tw, th, Vec<u8>)`+テスト。市松はテクスチャに焼き込む。
+- **右パネル再構成**(side_panel.rs): `egui::CollapsingHeader` で 色 / レイヤー / 履歴(+P5 でページ)。パネル全体の ScrollArea とリストの二重スクロールを解消(レイヤー一覧の max_height 固定 180px を廃止し、展開状態の残り高さ配分に変更)。
+- **.dpaint v3**(project.rs): `parse_chunks` の version 受理を 1..=3 に。`encode_layer`/`decode_layer` に version を渡し、reserved u16 を v3 で `blend u8 + flags u8` に再解釈(SPEC §50.4)。AddLayer/MergeDown の redo メタ + `refresh_op_for_redo` 拡張。v1/v2 実バイト後方互換テスト(`encode_project_with_version` の流儀を v2→v3 にも適用)。
+- **blend/alpha_lock setter**(app.rs): SetVisible/SetOpacity と同じ commit-first + `modified`/`meta_dirty` + 浮動片の `prev_modified` 整合。blend のみ `mark_all_dirty()`。
+- テスト: blend 5 式(部分 α 含む)/ Normal 完全一致 / merge 制限 / MoveLayer 非隣接 undo/redo / alpha_lock 全経路 / v1/v2/v3 roundtrip + 不正 blend/flags 拒否 / サムネ縮小 / content_gen の単調性。
+
+## 22.2 P2 — モザイク・選択ブラシ(SPEC §51)
+
+- `raster.rs::apply_mosaic(pixels, w, h, region: IRect, mask: Option<(&SelMask)>, block: u32, alpha_lock: bool)`: 原点固定格子・α 加重平均・選択内のみ置換・行スライス。`auto_block_size(w, h)` 純関数(399/400/499/500 テスト)。
+- モーダルは §24 の Brightness/Contrast 状態機械を踏襲(開始時スナップショット保持・値が変わったフレームのみ再適用)。スナップショット領域は「選択 bbox を格子境界へ外側拡張した矩形」(格子平均が bbox 外画素を含むため)。
+- 選択ブラシ(tools/ 新規 select_brush.rs): ドラッグ中は作業マスク(選択と同寸法系)へ 2 値スタンプ、Up で `Selection` へ合成(追加=max / 消去=クリア)+境界再計算。プレビューは既存の選択枠描画を流用。ToolKind/keymap(Shift+W 巡回)/icons.rs/オプションバー(追加・消去モード)追加。
+- テスト: 格子整列 / 端 / α加重 / マスククリップ / ブラシ追加・消去・空化で選択解除。
+
+## 22.3 P3 — 縦書きテキスト(SPEC §52)
+
+- text.rs: `rasterize_text_vertical(font_bytes, text, px_size, color, char_spacing, line_spacing) -> Result<(u32, u32, Vec<u8>), TextRasterError>`。列レイアウト(右→左)・固定縦送り(height+char_spacing)・回転文字(グリフのカバレッジを小バッファへ→transpose+flip)・句読点右上寄せ・その他センタリング。回転集合は SPEC §52 の全角集合を `const` で定義。
+- 既存 `rasterize_text` も `Result` 化+checked 確保+文字間・行間対応(呼び出し側は Err → トースト)。
+- オプションバー: 縦書きチェック+文字間/行間スライダー(設定永続化 §26 追加)。プレビュー: `TextEditState` に「最終ラスタライズ結果+入力世代」をキャッシュし、テキスト/設定が変わったフレームだけ再生成して canvas_view がテクスチャ描画。
+- テスト: SPEC §52 記載の 6 項目+回転文字の ink 検証(「ー」の縦横比が入れ替わる)。
+
+## 22.4 P4 — 内蔵修復(SPEC §53)
+
+- 新規 `src/inpaint.rs`: `telea_inpaint(snapshot: InpaintInput) -> Result<InpaintOutput, InpaintError>` 純関数(bbox+マージンの画素・マスク・半径)。FMM: 境界画素を距離 0 で BinaryHeap へ、eikonal 更新で距離場を前進、既知近傍(半径内)の 方向×距離×レベル 重み平均で画素決定。RGBA は premultiplied で平均し straight へ戻す。
+- ワーカー実行の共通基盤(P4 で先行導入、P6 のプラグインと共用): `app.rs` に `BackgroundJob { job_id, tab_id, doc_gen, sel_gen, kind, cancel_flag, join: JoinHandle<Result<..>> }` を 1 本だけ保持(single-flight)。完了はワーカーが結果を `mpsc::Sender` へ入れ `ctx.request_repaint()` を 1 回。UI 側は「チャネルに結果があるフレーム」だけ処理(ポーリングなし — 受信は `try_recv`、フレーム駆動はワーカーの repaint)。タブ安定 ID(`Tab::uid: u64`)を導入。
+- テスト: SPEC §53 の 7 項目。
+
+## 22.5 P5 — ページ管理パネル(SPEC §54)
+
+- 新規 `src/pages.rs`: `PageSet { dir, entries: Vec<PageEntry>, current: usize, autosave: bool }`+自然順ソート純関数 `natural_cmp(&OsStr, &OsStr)`(数値列は桁数→値比較、テスト必須)+列挙(拡張子フィルタ、Result)。
+- `Tab` に `pages: Option<PageSet>`。切替は `PendingAction::SwitchPage { tab_uid, page_index }` を既存未保存ガード状態機械へ追加(§54 のトランザクション順)。自動保存の忠実度条件は「`.dpaint` パス or (単一レイヤー && 画像パス && PNG/JPEG/BMP)」を関数 `can_autosave_faithfully(&Tab) -> bool` に切り出しテスト。
+- 新規 `src/ui/pages_panel.rs`: 一覧+自動保存チェック+現在ページ強調。サムネはワーカーキュー(同時 1 スレッド・キュー上限・結果 mpsc+repaint 1 回、P4 の基盤とは独立の軽量版)で `image` デコード→縮小。`.dpaint` は汎用アイコン。
+- keymap: PageUp/PageDown。D&D: `dropped_files` のディレクトリ判定を分岐追加。
+
+## 22.6 P6 — 外部プラグイン連携(SPEC §55〜§56)
+
+- 新規 `src/plugin.rs`(本体): `http_post_stream(port, path, body_parts) -> Result<Vec<u8>, PluginError>`(127.0.0.1 固定・タイムアウト・Content-Length/chunked・上限・リダイレクト拒否)+ `base64_encode_to(writer)` ストリーム版+`json` 最小生成/パース(固定スキーマ)+ `health_check(port) -> Result<PluginHealth>`。全純関数テスト(fragmented read・oversize・timeout はローカル TcpListener スタブで)。
+- ジョブ発行・適用は P4 の `BackgroundJob` 基盤を共用(kind: BuiltinInpaint / IopaintInpaint / DiffusionGenerate / DiffusionInpaint)。
+- fork 側(daraskme/darask-paint-iopaint の参照エンジン): `--darask-plugin-mode`(SPEC §55.2)。fork 側(darask-paint-ai-diffusion): `darask_server.py` + bat + manifest(SPEC §56)。どちらも Python 側は本体リポジトリ外(このリポジトリの受け入れ検査対象外だが、両モデルレビューを Phase 内で実施)。
+- 設定: `plugin_iopaint_port` / `plugin_diffusion_port`(u16、パース失敗は既定値)。設定ダイアログに数値欄 2 つ。
+
+## 22.6b P1.5 — ドッキングパネル(SPEC §58)
+
+- **前提**: P1 の右パネル・セクション分割(各セクションが独立した描画関数になっていること)。P1 レビュー完了直後に実施。
+- 新規 `src/ui/panels.rs`: `PanelKind { Color, Layers, History, Pages }` / `PanelPlacement { Dock { side: DockSide, order: usize }, Floating { x, y, w, h } }` / `PanelLayout`(全パネルの配置+折りたたみ。settings 文字列との往復関数 `parse` / `serialize` +クランプ規則、テスト必須)。
+- `side_panel.rs` を「ドックレンダラ」へ一般化: `show_dock(side, ui, layout, ...)` が該当 side のパネルを order 順に描画。各パネルの中身は P1 で分離済みのセクション関数を呼ぶだけ。左ドックはツールバー直後に `SidePanel::left` を条件表示、右ドックは空なら show しない。
+- ヘッダ DnD はレイヤー行 DnD と同じ egui API(ヘッダ=drag source、各ドック=drop zone+挿入インジケータ)。ドロップ先がどのドックでもない場合はポインタ位置でフローティング化。フローティングは `egui::Window`(`.default_size` / `.current_pos`、移動・リサイズは egui が処理し、確定値を `PanelLayout` へ書き戻して保存)。
+- 設定キー(§26 追加): `panel.<kind>.place`(right|left|float)/ `panel.<kind>.order` / `panel.<kind>.x|y|w|h` / `panel.<kind>.collapsed`。不正・欠損は既定配置。「パネル配置をリセット」は `PanelLayout::default()` を適用+保存。
+- 落とし穴: (1) egui のパネル宣言順(左→右→中央)を守る。(2) フローティング Window はフォーカス時のみ前面 — z 順は egui 任せで良い。(3) 画面外クランプは復元時のみ(実行中は egui が制約)。(4) ドラッグ中の再描画は入力イベント駆動で発生するため `request_repaint` 不要。
+
+## 22.7 P7 — 既存機能レビュー改善(SPEC §57-2)
+
+- Fable 5 + gpt-5.6-sol の両モデルで全体レビュー → 有効な指摘を選別 → SPEC §57-2 に記録してから実装。候補(計画時点のメモ): ブラシサイズ上限 64px の拡大(性能実測付き)/ テキストサイズ上限 144px の拡大 / 選択範囲の拡張・縮小(数 px の morphology — モザイク・修復の前処理に有効)。
+
+## 22.8 v12 の落とし穴
+
+1. **blend の中間式**: `Cr` は最終色ではない(SPEC §50.2 の 2 段階)。Normal fast path を分岐で温存しないと全文書が遅くなる。
+2. **MoveLayer**: swap のまま DnD に使うと非隣接ドロップで並びが壊れる(レビュー致命的③)。既存の上へ/下へも新意味論(隣接挿入)で書き直し、テスト期待値を全更新。
+3. **アルファロック**: 「書いてから α を戻す」実装は禁止(透明画素の RGB が汚れる)。`dst_a==0` はスキップ、消しゴムは no-op。
+4. **サムネ世代**: `content_gen` を Layer の clone に含めない(undo 枝で衝突する — Document 側の単調カウンタ)。
+5. **ページ自動保存**: 多層×画像パスは「書き出し」であり保存済みにできない(§45-3)。GIF/WebP は書けない。忠実度条件を必ず関数化してテスト。
+6. **プラグイン送信**: レイヤー全面の PNG/base64 化は 8192² で GiB 級 — 選択 bbox+128px のみ。応答は生画像バイト(base64 JSON ではない)。適用前に世代タプル全一致を検査。
+7. **ワーカー**: `thread::spawn` は生成失敗で panic し得る — `thread::Builder::spawn` + Result。BinaryHeap の f32 順序は `total_cmp`。
+8. **`.dpaint` v3**: reserved u16 の再解釈は decode 側の「非 0 拒否」を version 分岐にすること(v3 で拒否したままだと新ファイルが開けない)。

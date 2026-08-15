@@ -50,7 +50,7 @@ use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{pos2, Color32, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2};
 
 use crate::canvas_view::CanvasView;
-use crate::document::{Background, Document, Interpolation, Layer, MAX_LAYERS};
+use crate::document::{Background, BlendMode, Document, Interpolation, Layer, MAX_LAYERS};
 use crate::history::{History, HistoryOp};
 use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
@@ -69,7 +69,7 @@ use crate::tools::{LassoMode, Tool, ToolCtx, ToolEvent, ToolKind};
 use crate::ui::color_panel::{self, ColorPanelCtx};
 use crate::ui::color_wheel::ColorWheelState;
 use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
-use crate::ui::layers_panel::{LayersPanelAction, RenameState};
+use crate::ui::layers_panel::{LayersPanelAction, RenameState, ThumbnailCache};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
 use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
@@ -488,10 +488,15 @@ struct Tab {
     /// リセットする(タブごとに独立、上記コメント参照)。
     next_layer_number: u32,
     /// v8 レビュー修正(SPEC §40-①): 保存後に、履歴に積まれない実変更
-    /// (レイヤー名・表示・不透明度)があったか。`History::is_at_saved_state`
-    /// が真でもこれが立っていれば `modified` は下ろさない
-    /// (`refresh_modified_after_history_move` 参照)。保存成功時にクリア。
+    /// (レイヤー名・表示・不透明度・ブレンド・アルファロック)があったか。
+    /// `History::is_at_saved_state` が真でもこれが立っていれば `modified` は
+    /// 下ろさない(`refresh_modified_after_history_move` 参照)。保存成功時に
+    /// クリア。
     meta_dirty: bool,
+    /// v12 §50.1: レイヤーサムネイルのテクスチャキャッシュ(タブごと。
+    /// `ui/layers_panel.rs` 参照)。文書を差し替える経路では
+    /// `ThumbnailCache::invalidate_all` を呼ぶこと。
+    thumbnails: ThumbnailCache,
 }
 
 impl Tab {
@@ -529,6 +534,7 @@ impl Tab {
             layer_rename: None,
             next_layer_number: 1,
             meta_dirty: false,
+            thumbnails: ThumbnailCache::default(),
         }
     }
 
@@ -1600,6 +1606,18 @@ impl DaraskApp {
                     }
                 }
                 continue;
+            }
+
+            // v12 §50.3: アルファロック中の消しゴムは全画素 no-op(α を
+            // 減らせないため)。値としては何も起きない(`Surface::set_pixel`
+            // が α を保持し RGB も元色のままになる)ので空の undo 単位も
+            // 積まれないが、「効かない」ことが分かるよう押下時に 1 回だけ
+            // トーストする(SPEC §50.3)。
+            if self.tool == ToolKind::Eraser
+                && matches!(ev, ToolEvent::Down { .. })
+                && self.active_tab().doc.active_layer().alpha_lock
+            {
+                self.show_toast("透明保護中は消しゴムは効きません".to_owned());
             }
 
             let mut used_colors = Vec::new();
@@ -2827,6 +2845,8 @@ impl DaraskApp {
         self.active_tab_mut().floating = None;
         self.select_drag = None;
         self.active_tab_mut().next_layer_number = 1;
+        // v12 §50.1: レイヤー構成ごと置き換えたのでサムネイルも捨てる。
+        self.active_tab_mut().thumbnails.invalidate_all();
         self.reset_tool_state_for_new_document();
     }
 
@@ -3771,6 +3791,10 @@ impl DaraskApp {
         // 必ず新しい番号を払い出す。
         let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
         self.active_tab_mut().doc = doc;
+        // v12 §50.1: 文書ごと差し替えたのでレイヤーサムネイルは全消去する
+        // (`content_gen` は新しい文書の 0 から始まるため、消さないと前の
+        // 文書のサムネイルが「最新」と誤判定されうる)。
+        self.active_tab_mut().thumbnails.invalidate_all();
         let mut history = History::new();
         history.set_max_steps(self.max_undo_steps as usize);
         self.active_tab_mut().history = history;
@@ -3930,6 +3954,8 @@ impl DaraskApp {
             .push(HistoryOp::ReplaceAll { before, after }, label);
         self.active_tab_mut().doc.mark_all_dirty();
         self.active_tab_mut().doc.modified = true;
+        // v12 §50.1: `ReplaceAll` はレイヤー構成・寸法ごと入れ替わる。
+        self.active_tab_mut().thumbnails.invalidate_all();
         // v11 R3 レビュー修正: `ReplaceAll` を積む操作(反転/回転/サイズ
         // 変更/キャンバスサイズ/トリミング/統合/白紙置換)は文書の座標系や
         // 構成を丸ごと変えうる。進行中の多角形なげなわ・自由なげなわの
@@ -4080,12 +4106,7 @@ impl DaraskApp {
             (
                 floating.w,
                 floating.h,
-                vec![Layer {
-                    name: "背景".to_owned(),
-                    visible: true,
-                    opacity: 255,
-                    pixels,
-                }],
+                vec![Layer::from_pixels("背景", pixels)],
                 0,
             )
         } else {
@@ -4122,6 +4143,10 @@ impl DaraskApp {
                     name: src.name.clone(),
                     visible: src.visible,
                     opacity: src.opacity,
+                    // v12 §50: ブレンド・アルファロックもレイヤーメタとして
+                    // そのまま引き継ぐ(SPEC §31 の「レイヤー構成を保つ」)。
+                    blend: src.blend,
+                    alpha_lock: src.alpha_lock,
                     pixels,
                 });
             }
@@ -4215,12 +4240,7 @@ impl DaraskApp {
         let new_doc = Document::from_duplicated_layers(
             width,
             height,
-            vec![Layer {
-                name: "背景".to_owned(),
-                visible: true,
-                opacity: 255,
-                pixels,
-            }],
+            vec![Layer::from_pixels("背景", pixels)],
             0,
         );
         self.insert_duplicated_tab(new_doc);
@@ -4467,6 +4487,10 @@ impl DaraskApp {
         self.active_tab_mut().history.push(op, label);
         self.active_tab_mut().doc.mark_all_dirty();
         self.active_tab_mut().doc.modified = true;
+        // v12 §50.1: レイヤー構造が変わると行とレイヤーの対応が変わる
+        // (並べ替えのように枚数が変わらない操作もあるため、枚数チェックだけ
+        // では足りない)。サムネイルキャッシュは全消去する。
+        self.active_tab_mut().thumbnails.invalidate_all();
     }
 
     /// SPEC §13: 「新規レイヤーは透明で名前は『レイヤー N』」。バグ修正:
@@ -4531,11 +4555,13 @@ impl DaraskApp {
                     index,
                     name,
                     before_active,
-                    // v10 §47: 生成時の既定(`Document::add_layer` と同じ)。
-                    // 追加後に変更されたら undo 時に刷新される
-                    // (`History::refresh_op_for_redo`)。
+                    // v10 §47 / v12 §50.4: 生成時の既定
+                    // (`Document::add_layer` と同じ)。追加後に変更されたら
+                    // undo 時に刷新される(`History::refresh_op_for_redo`)。
                     visible: true,
                     opacity: 255,
+                    blend: BlendMode::Normal,
+                    alpha_lock: false,
                 },
                 "レイヤーを追加",
             );
@@ -4598,6 +4624,18 @@ impl DaraskApp {
         }
     }
 
+    /// v12 §50.1: レイヤーパネルのドラッグ&ドロップ並べ替え(1 undo 単位)。
+    /// 上へ/下へボタンと同じ `MoveLayer` op を積む(隣接・非隣接とも同じ
+    /// 「取り除いて挿入」の意味論、`Document::move_layer` 参照)。同位置への
+    /// ドロップはパネル側で弾かれるが、ここでも `move_layer` の戻り値で
+    /// 二重に確かめてから履歴を積む(無意味な undo 単位を作らない)。
+    fn layer_move_to(&mut self, from: usize, to: usize) {
+        self.commit_open_gesture();
+        if self.active_tab_mut().doc.move_layer(from, to) {
+            self.push_layer_history(HistoryOp::MoveLayer { from, to }, "レイヤーの並び替え");
+        }
+    }
+
     fn layer_merge_down(&mut self) {
         self.commit_open_gesture();
         // `Document::merge_active_down` 自身の拒否条件(レイヤー1枚・
@@ -4607,14 +4645,29 @@ impl DaraskApp {
         if index == 0 || self.active_tab().doc.layers.len() <= 1 {
             return;
         }
+        // v12 §50.2: 非通常ブレンドを含む 2 枚は結合できない。パネル・メニューは
+        // グレーアウトされるが、ショートカット(Ctrl+E)からは到達しうるので
+        // ここで理由をトーストする。
+        if !self.active_tab().doc.can_merge_active_down() {
+            self.show_toast(
+                "「通常」以外のブレンドを含むレイヤーは結合できません(見た目が変わるため)"
+                    .to_owned(),
+            );
+            return;
+        }
         let upper = self.active_tab().doc.layers[index].clone();
         let lower_before = self.active_tab().doc.layers[index - 1].clone();
         if self.active_tab_mut().doc.merge_active_down() {
             // v10 §47: 結合結果レイヤーのメタ(結合直後の実値を読む —
             // `merge_active_down` の生成規則が変わってもここは追随する)。
             let merged = &self.active_tab().doc.layers[index - 1];
-            let (merged_name, merged_visible, merged_opacity) =
-                (merged.name.clone(), merged.visible, merged.opacity);
+            let (merged_name, merged_visible, merged_opacity, merged_blend, merged_alpha_lock) = (
+                merged.name.clone(),
+                merged.visible,
+                merged.opacity,
+                merged.blend,
+                merged.alpha_lock,
+            );
             self.push_layer_history(
                 HistoryOp::MergeDown {
                     index,
@@ -4623,6 +4676,8 @@ impl DaraskApp {
                     merged_name,
                     merged_visible,
                     merged_opacity,
+                    merged_blend,
+                    merged_alpha_lock,
                 },
                 "レイヤーの結合",
             );
@@ -4668,10 +4723,14 @@ impl DaraskApp {
             LayersPanelAction::MoveUp => self.layer_move_up(),
             LayersPanelAction::MoveDown => self.layer_move_down(),
             LayersPanelAction::MergeDown => self.layer_merge_down(),
+            // v12 §50.1: パネルのドラッグ&ドロップ並べ替え。
+            LayersPanelAction::Move { from, to } => self.layer_move_to(from, to),
             // v8 レビュー修正②: 履歴に積まない操作(SPEC §13)も
             // commit-first 規則(同 §13 最終項)を通す。
             LayersPanelAction::SetVisible(idx, visible) => self.set_layer_visible(idx, visible),
             LayersPanelAction::SetOpacity(opacity) => self.set_active_layer_opacity(opacity),
+            LayersPanelAction::SetBlend(blend) => self.set_active_layer_blend(blend),
+            LayersPanelAction::SetAlphaLock(locked) => self.set_active_layer_alpha_lock(locked),
             LayersPanelAction::CommitRename(idx, name) => self.commit_rename_action(idx, name),
         }
     }
@@ -4709,6 +4768,48 @@ impl DaraskApp {
         }
     }
 
+    /// v12 §50.2: アクティブレイヤーのブレンドモード(履歴には積まない)。
+    /// `set_active_layer_opacity` と同じ commit-first + `modified`/`meta_dirty`。
+    /// 合成結果が全面で変わるため `mark_all_dirty()` も必要。
+    fn set_active_layer_blend(&mut self, blend: BlendMode) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        let active = tab.doc.active_index();
+        if let Some(layer) = tab.doc.layers.get_mut(active) {
+            if layer.blend != blend {
+                layer.blend = blend;
+                tab.doc.mark_all_dirty();
+                tab.doc.modified = true;
+                tab.meta_dirty = true;
+                // 浮動片が残ったまま(選択/移動以外のツールでの貼り付け直後
+                // など)このメタ変更が起きた場合、浮動片の Esc キャンセルが
+                // `modified` を巻き戻してもこの変更ぶんは未保存のまま残す
+                // (`commit_pending_layer_rename` と同じ規則)。
+                if let Some(floating) = tab.floating.as_mut() {
+                    floating.prev_modified = true;
+                }
+            }
+        }
+    }
+
+    /// v12 §50.3: アクティブレイヤーのアルファロック(履歴には積まない)。
+    /// 表示には影響しないため dirty は不要(SPEC §50.3)。
+    fn set_active_layer_alpha_lock(&mut self, locked: bool) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        let active = tab.doc.active_index();
+        if let Some(layer) = tab.doc.layers.get_mut(active) {
+            if layer.alpha_lock != locked {
+                layer.alpha_lock = locked;
+                tab.doc.modified = true;
+                tab.meta_dirty = true;
+                if let Some(floating) = tab.floating.as_mut() {
+                    floating.prev_modified = true;
+                }
+            }
+        }
+    }
+
     /// レイヤー名変更の確定(パネルの Enter/フォーカス外し経由)。
     /// `modified` を立てる理由は旧パネル実装から引き継ぎ:
     /// `doc_is_pristine()` がリネーム済み文書を「白紙」と誤判定して
@@ -4733,6 +4834,10 @@ impl DaraskApp {
     fn refresh_modified_after_history_move(&mut self) {
         let tab = self.active_tab_mut();
         tab.doc.modified = tab.meta_dirty || !tab.history.is_at_saved_state();
+        // v12 §50.1: undo/redo/履歴ジャンプは(レイヤー構造の復元を含めて)
+        // 行とレイヤーの対応を変えうるので、サムネイルキャッシュを全消去する
+        // (undo/redo の唯一の共通出口なのでここ 1 箇所で足りる)。
+        tab.thumbnails.invalidate_all();
     }
 
     // -----------------------------------------------------------------
@@ -5170,7 +5275,9 @@ impl eframe::App for DaraskApp {
             can_delete_layer: layer_count > 1,
             can_move_layer_up: active_layer_index + 1 < layer_count,
             can_move_layer_down: active_layer_index > 0,
-            can_merge_layer_down: layer_count > 1 && active_layer_index > 0,
+            // v12 §50.2: 非通常ブレンドを含む 2 枚は結合できない(パネルの
+            // ボタンと同じ判定を `Document::can_merge_active_down` に一本化)。
+            can_merge_layer_down: self.active_tab().doc.can_merge_active_down(),
             can_flatten_layers: layer_count > 1,
             pixel_grid_visible: self.show_pixel_grid,
             recent_files: &self.recent_files,
@@ -5242,8 +5349,16 @@ impl eframe::App for DaraskApp {
         // 借用してしまうメソッド呼び出し)ではなく `Tab` への可変参照を
         // 1 回だけ取って両フィールドへ分割借用する。
         let tab = &mut self.tabs[self.active_tab];
-        let (layer_action, history_jump) =
-            side_panel::show(ui, &tab.doc, &mut tab.layer_rename, &tab.history, color_ctx);
+        let (layer_action, history_jump) = side_panel::show(
+            ui,
+            side_panel::SidePanelCtx {
+                doc: &tab.doc,
+                rename: &mut tab.layer_rename,
+                thumbnails: &mut tab.thumbnails,
+                history: &tab.history,
+            },
+            color_ctx,
+        );
         if let Some(action) = layer_action {
             self.handle_layers_panel_action(action);
         }
@@ -5945,6 +6060,329 @@ mod tests {
             app.active_tab().floating.is_some(),
             "the paste must float onto the existing (renamed) document instead"
         );
+    }
+
+    // -- v12 §50: ブレンド / アルファロック / 並べ替え -------------------
+
+    #[test]
+    fn blend_change_goes_through_the_action_path_and_marks_the_document_dirty() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.handle_layers_panel_action(LayersPanelAction::SetBlend(BlendMode::Multiply));
+        assert_eq!(app.active_tab().doc.layers[0].blend, BlendMode::Multiply);
+        assert!(app.active_tab().doc.modified);
+        assert!(
+            app.active_tab().meta_dirty,
+            "履歴に積まない実変更(SPEC §40-①)"
+        );
+        assert!(
+            !app.active_tab().doc.dirty.is_empty(),
+            "合成結果が全面で変わるため全面 dirty が必要"
+        );
+        assert!(
+            !app.active_tab().history.can_undo(),
+            "ブレンド変更は履歴に積まない(SPEC §50.2)"
+        );
+    }
+
+    #[test]
+    fn alpha_lock_toggle_goes_through_the_action_path_without_dirty_or_history() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        app.active_tab_mut().doc.dirty.clear();
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        assert!(app.active_tab().doc.layers[0].alpha_lock);
+        assert!(app.active_tab().doc.modified);
+        assert!(app.active_tab().meta_dirty);
+        assert!(
+            app.active_tab().doc.dirty.is_empty(),
+            "表示には影響しないため dirty は不要(SPEC §50.3)"
+        );
+        assert!(!app.active_tab().history.can_undo());
+    }
+
+    /// SPEC §50.3: アルファロック中のブラシは透明画素を一切変えず、
+    /// 半透明画素の α も保つ(`Surface::set_pixel` の集約点を通ることの確認)。
+    #[test]
+    fn painting_on_an_alpha_locked_layer_preserves_alpha_and_skips_transparent_pixels() {
+        let mut app = new_for_test(Document::new(20, 20, Background::Transparent));
+        // (5,5) だけ半透明の白にしておく。
+        app.active_tab_mut()
+            .doc
+            .set_pixel(5, 5, [255, 255, 255, 128]);
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::from_rgb(255, 0, 0);
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(5.5, 5.5),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(5.5, 5.5),
+                button: PointerButton::Primary,
+            },
+        ]);
+
+        let painted = app
+            .active_tab()
+            .doc
+            .get_pixel(5, 5)
+            .expect("in-bounds pixel");
+        assert_eq!(painted[3], 128, "α は元の値のまま固定される");
+        assert!(painted[0] > 200 && painted[1] < 100, "RGB は塗り色へ寄る");
+        // 隣接する完全透明の画素はブラシ半径内でも 1 バイトも変わらない。
+        assert_eq!(app.active_tab().doc.get_pixel(6, 5), Some([0, 0, 0, 0]));
+        assert_eq!(app.active_tab().doc.get_pixel(5, 6), Some([0, 0, 0, 0]));
+    }
+
+    /// v12 §50.3(追いレビュー①): ソフトブラシ(部分カバレッジ)でも、
+    /// 同じ RGB・異なる α の画素に同じ幾何で塗れば結果 RGB は一致する。
+    /// 2 箇所へ同一オフセットでクリックし、同じ相対位置の画素を比べる。
+    #[test]
+    fn soft_brush_on_an_alpha_locked_layer_interpolates_rgb_by_coverage_only() {
+        let mut app = new_for_test(Document::new(40, 20, Background::Transparent));
+        // 同じ RGB・異なる α。ブラシ中心から見て同じ相対位置に置く。
+        app.active_tab_mut()
+            .doc
+            .set_pixel(7, 5, [100, 100, 100, 64]);
+        app.active_tab_mut()
+            .doc
+            .set_pixel(27, 5, [100, 100, 100, 192]);
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        app.tool = ToolKind::Pen;
+        app.primary = Color32::from_rgb(200, 0, 0);
+        app.brush_size = 6.0;
+        app.brush_hardness = 0;
+        app.brush_opacity = 70;
+
+        for cx in [5.5f32, 25.5] {
+            app.dispatch_canvas_events(vec![
+                ToolEvent::Down {
+                    img: pos2(cx, 5.5),
+                    button: PointerButton::Primary,
+                    mods: Modifiers::NONE,
+                },
+                ToolEvent::Up {
+                    img: pos2(cx, 5.5),
+                    button: PointerButton::Primary,
+                },
+            ]);
+        }
+
+        let low = app.active_tab().doc.get_pixel(7, 5).expect("in-bounds");
+        let high = app.active_tab().doc.get_pixel(27, 5).expect("in-bounds");
+        assert_eq!(low[3], 64, "α は元値のまま");
+        assert_eq!(high[3], 192, "α は元値のまま");
+        assert_eq!(
+            [low[0], low[1], low[2]],
+            [high[0], high[1], high[2]],
+            "RGB はカバレッジだけで決まる(dst_a に依存しない)"
+        );
+        assert!(
+            low[0] > 100 && low[0] < 200,
+            "部分カバレッジなので中間色になっている: {low:?}"
+        );
+    }
+
+    /// 図形(直線ツール)も同じ規則に従う(カバレッジ 1 の置き換え = RGB は
+    /// 塗り色そのもの、α は元値のまま、透明画素は不変)。
+    #[test]
+    fn shape_tool_on_an_alpha_locked_layer_keeps_alpha_and_skips_transparent_pixels() {
+        let mut app = new_for_test(Document::new(20, 20, Background::Transparent));
+        app.active_tab_mut().doc.set_pixel(5, 5, [10, 10, 10, 64]);
+        app.active_tab_mut().doc.set_pixel(6, 5, [10, 10, 10, 192]);
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        app.tool = ToolKind::Line;
+        app.primary = Color32::from_rgb(0, 255, 0);
+        app.brush_size = 1.0;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(5.5, 5.5),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            // 図形は Drag で終点が決まる(Up の座標は使われない)。
+            ToolEvent::Drag {
+                img: pos2(6.5, 5.5),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(6.5, 5.5),
+                button: PointerButton::Primary,
+            },
+        ]);
+
+        assert_eq!(
+            app.active_tab().doc.get_pixel(5, 5),
+            Some([0, 255, 0, 64]),
+            "α は元値のまま RGB だけ塗り色になる"
+        );
+        assert_eq!(app.active_tab().doc.get_pixel(6, 5), Some([0, 255, 0, 192]));
+        assert_eq!(
+            app.active_tab().doc.get_pixel(7, 5),
+            Some([0, 0, 0, 0]),
+            "透明画素は RGBA とも不変"
+        );
+    }
+
+    /// SPEC §50.3: アルファロック中の消しゴムは全画素 no-op(空の undo 単位を
+    /// 積まない)+「効きません」トースト。
+    #[test]
+    fn erasing_on_an_alpha_locked_layer_is_a_no_op_with_a_toast() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+        app.tool = ToolKind::Eraser;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(5.5, 5.5),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(5.5, 5.5),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert_eq!(
+            app.active_tab().doc.active_pixels(),
+            before,
+            "1 バイトも変わらない"
+        );
+        assert_eq!(
+            app.active_tab().history.undo_len(),
+            undo_before,
+            "空の undo 単位を積まない"
+        );
+        assert!(
+            app.toast.as_ref().is_some_and(|t| t.0.contains("透明保護")),
+            "「効かない」ことを知らせるトーストが出る"
+        );
+    }
+
+    /// アルファロックは浮動片の確定合成・貼り付け・テキスト確定には
+    /// 適用しない(SPEC §50.3)。
+    #[test]
+    fn committing_a_floating_piece_ignores_the_alpha_lock() {
+        let mut app = new_for_test(Document::new(20, 20, Background::Transparent));
+        app.handle_layers_panel_action(LayersPanelAction::SetAlphaLock(true));
+        app.paste_pixels(2, 2, vec![255u8; 2 * 2 * 4]);
+        assert!(
+            app.active_tab().floating.is_some(),
+            "貼り付けは浮動片になる"
+        );
+        app.commit_selection();
+        let px = app.active_tab().doc.get_pixel(0, 0).expect("in-bounds");
+        assert_eq!(
+            px,
+            [255, 255, 255, 255],
+            "透明なレイヤーへの貼り付け確定はロックの影響を受けない"
+        );
+    }
+
+    /// SPEC §50.1: パネルのドラッグ&ドロップ並べ替えは 1 undo 単位。
+    #[test]
+    fn drag_and_drop_reorder_is_one_undo_unit_via_the_action_path() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.active_tab_mut().doc.layers[0].name = "0".to_owned();
+        app.layer_add();
+        app.active_tab_mut().doc.layers[1].name = "1".to_owned();
+        app.layer_add();
+        app.active_tab_mut().doc.layers[2].name = "2".to_owned();
+        let undo_before = app.active_tab().history.undo_len();
+
+        // 最下層を最上位へ(非隣接)。
+        app.handle_layers_panel_action(LayersPanelAction::Move { from: 0, to: 2 });
+        let names = |app: &DaraskApp| -> Vec<String> {
+            app.active_tab()
+                .doc
+                .layers
+                .iter()
+                .map(|l| l.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["1", "2", "0"]);
+        assert_eq!(app.active_tab().history.undo_len(), undo_before + 1);
+
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(names(&app), ["0", "1", "2"]);
+    }
+
+    /// v12 §50.1(追いレビュー③b): レイヤー構造の変更(枚数が変わらない
+    /// 並べ替えを含む)と undo/redo/履歴ジャンプでは、サムネイルキャッシュを
+    /// 全消去する(行とレイヤーの対応が変わるため、残すと別レイヤーの
+    /// サムネイルが表示される)。
+    #[test]
+    fn thumbnail_cache_is_invalidated_by_structure_changes_and_history_moves() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add();
+        app.layer_add();
+        assert_eq!(app.active_tab().doc.layers.len(), 3);
+
+        // 並べ替え(枚数は変わらない)。
+        app.active_tab_mut().thumbnails.seed_rows_for_test(3);
+        app.handle_layers_panel_action(LayersPanelAction::Move { from: 0, to: 2 });
+        assert_eq!(
+            app.active_tab().thumbnails.cached_rows(),
+            0,
+            "並べ替えでキャッシュを全消去する"
+        );
+
+        // undo(履歴の適用)。
+        app.active_tab_mut().thumbnails.seed_rows_for_test(3);
+        app.handle_menu_action(MenuAction::Undo);
+        assert_eq!(
+            app.active_tab().thumbnails.cached_rows(),
+            0,
+            "undo で全消去"
+        );
+
+        // redo。
+        app.active_tab_mut().thumbnails.seed_rows_for_test(3);
+        app.handle_menu_action(MenuAction::Redo);
+        assert_eq!(
+            app.active_tab().thumbnails.cached_rows(),
+            0,
+            "redo で全消去"
+        );
+
+        // 履歴ジャンプ。
+        app.active_tab_mut().thumbnails.seed_rows_for_test(3);
+        app.jump_history_to(0);
+        assert_eq!(
+            app.active_tab().thumbnails.cached_rows(),
+            0,
+            "履歴ジャンプで全消去"
+        );
+
+        // ReplaceAll 系(画像の統合)。
+        app.jump_history_to(2);
+        app.active_tab_mut().thumbnails.seed_rows_for_test(3);
+        app.layer_flatten();
+        assert_eq!(
+            app.active_tab().thumbnails.cached_rows(),
+            0,
+            "ReplaceAll でも全消去"
+        );
+    }
+
+    #[test]
+    fn merging_down_is_refused_with_a_toast_when_a_blend_mode_is_not_normal() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.layer_add();
+        app.handle_layers_panel_action(LayersPanelAction::SetBlend(BlendMode::Screen));
+        let undo_before = app.active_tab().history.undo_len();
+
+        app.handle_layers_panel_action(LayersPanelAction::MergeDown);
+
+        assert_eq!(app.active_tab().doc.layers.len(), 2, "結合されない");
+        assert_eq!(app.active_tab().history.undo_len(), undo_before);
+        assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("ブレンド")));
     }
 
     // -- ドラッグ中のツール切替で進行中ストロークが破棄されるバグ(修正済み) --

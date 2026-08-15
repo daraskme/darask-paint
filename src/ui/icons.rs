@@ -1201,6 +1201,76 @@ pub fn paint_about_icon(painter: &Painter, rect: Rect, color: Color32) {
     painter.line_segment([p(rect, 0.5, 0.46), p(rect, 0.5, 0.68)], st);
 }
 
+// ---------------------------------------------------------------------------
+// v12 §50.1/§50.3: レイヤーパネルのアイコン(目 / 透明保護)
+// ---------------------------------------------------------------------------
+
+/// 弧(2 次ベジェ)を折れ線として描く。目のアイコンの上下のまぶたに使う。
+fn arc_points(from: Pos2, control: Pos2, to: Pos2, segments: usize) -> Vec<Pos2> {
+    (0..=segments)
+        .map(|i| quad_bezier(from, control, to, i as f32 / segments as f32))
+        .collect()
+}
+
+/// SPEC §50.1: レイヤーの表示切替アイコン。`visible` なら「目」、非表示なら
+/// 「斜線付きの目」(チェックボックスの代わり)。`rect` は正方形前提。
+pub fn paint_eye_icon(painter: &Painter, rect: Rect, color: Color32, visible: bool) {
+    let st = line_stroke(rect, color);
+    let left = p(rect, 0.08, 0.5);
+    let right = p(rect, 0.92, 0.5);
+    // 上まぶた・下まぶた(上下対称のアーモンド形)。
+    painter.add(Shape::line(
+        arc_points(left, p(rect, 0.5, 0.10), right, 10),
+        st,
+    ));
+    painter.add(Shape::line(
+        arc_points(left, p(rect, 0.5, 0.90), right, 10),
+        st,
+    ));
+    if visible {
+        // 瞳(塗り)。非表示のときは描かない — 斜線だけの「閉じた目」にする。
+        painter.circle_filled(p(rect, 0.5, 0.5), rect.width() * 0.15, color);
+    } else {
+        painter.line_segment([p(rect, 0.14, 0.86), p(rect, 0.86, 0.14)], st);
+    }
+}
+
+/// SPEC §50.3: アルファロック(透明部分の保護)のトグルアイコン。
+/// 市松(透明を表す)の上に錠前を重ねる。`locked` のときだけ錠を閉じた形
+/// (掛け金が下向き)にし、解除時は掛け金を右に開いた形にする。
+pub fn paint_alpha_lock_icon(painter: &Painter, rect: Rect, color: Color32, locked: bool) {
+    // 背景の市松(2×2)。前面の錠と区別できるよう控えめな明度にする。
+    let checker = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 70);
+    for (cx, cy) in [(0usize, 0usize), (1, 1)] {
+        let min = p(rect, cx as f32 * 0.5, cy as f32 * 0.5);
+        let max = p(rect, (cx as f32 + 1.0) * 0.5, (cy as f32 + 1.0) * 0.5);
+        painter.rect_filled(Rect::from_min_max(min, max), 0.0, checker);
+    }
+
+    let st = line_stroke(rect, color);
+    // 錠の本体。
+    let body = Rect::from_min_max(p(rect, 0.28, 0.48), p(rect, 0.72, 0.86));
+    painter.rect_stroke(body, 2.0, st, egui::StrokeKind::Middle);
+    // 掛け金(U 字)。ロック時は本体の上に閉じ、解除時は右へずらして開く。
+    let (hasp_left, hasp_right) = if locked {
+        (p(rect, 0.38, 0.48), p(rect, 0.62, 0.48))
+    } else {
+        (p(rect, 0.62, 0.48), p(rect, 0.86, 0.48))
+    };
+    let top = pos2(
+        (hasp_left.x + hasp_right.x) * 0.5,
+        rect.min.y + rect.height() * 0.16,
+    );
+    painter.add(Shape::line(
+        arc_points(hasp_left, pos2(hasp_left.x, top.y), top, 5),
+        st,
+    ));
+    painter.add(Shape::line(
+        arc_points(top, pos2(hasp_right.x, top.y), hasp_right, 5),
+        st,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

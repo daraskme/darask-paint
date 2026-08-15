@@ -207,12 +207,22 @@ impl BrushEngine {
                         .clamp(0.0, 255.0) as u8;
                     surface.set_pixel(x, y, [original[0], original[1], original[2], new_alpha]);
                 } else {
+                    // 実効カバレッジ = スタンプのカバレッジ × ブラシ不透明度 ×
+                    // 塗り色自身の α。ロック無しなら従来どおり
+                    // `blend_over(original, [rgb, alpha])` と 1 バイトも
+                    // 変わらず、ロック時は α を保ったまま RGB だけを
+                    // このカバレッジで補間する(SPEC §50.3、
+                    // `Surface::blend_pixel` のコメント参照)。
                     let alpha = (color[3] as f32 * (coverage as f32 / 255.0) * params.opacity)
                         .round()
                         .clamp(0.0, 255.0) as u8;
-                    let blended =
-                        raster::blend_over(original, [color[0], color[1], color[2], alpha]);
-                    surface.set_pixel(x, y, blended);
+                    surface.blend_pixel(
+                        x,
+                        y,
+                        original,
+                        [color[0], color[1], color[2]],
+                        alpha as f32 / 255.0,
+                    );
                 }
             }
         }

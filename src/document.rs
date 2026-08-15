@@ -247,6 +247,66 @@ pub enum Interpolation {
     Nearest,
 }
 
+/// v12 §50.2: レイヤーのブレンドモード(既定は `Normal` = 従来の source-over)。
+///
+/// 値と順序は `.dpaint` v3(SPEC §50.4: `blend: u8` 0=通常〜4=加算)・UI の
+/// ComboBox・合成の分岐がすべて共有する単一の情報源。`.dpaint` へは
+/// `to_u8`/`from_u8` の明示変換だけで書き出す(SPEC §50.4:
+/// 「enum 値は明示変換(discriminant の直書き禁止)」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Add,
+}
+
+impl BlendMode {
+    /// UI(ComboBox)の並び順 = `.dpaint` の値順。
+    pub const ALL: [BlendMode; 5] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Add,
+    ];
+
+    /// SPEC §50.2 の日本語ラベル(ComboBox 表示用)。
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "通常",
+            BlendMode::Multiply => "乗算",
+            BlendMode::Screen => "スクリーン",
+            BlendMode::Overlay => "オーバーレイ",
+            BlendMode::Add => "加算",
+        }
+    }
+
+    /// `.dpaint` v3 の `blend: u8`(SPEC §50.4)。
+    pub fn to_u8(self) -> u8 {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Screen => 2,
+            BlendMode::Overlay => 3,
+            BlendMode::Add => 4,
+        }
+    }
+
+    /// `.dpaint` v3 の `blend: u8` から復元する(範囲外は `None` = 拒否)。
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(BlendMode::Normal),
+            1 => Some(BlendMode::Multiply),
+            2 => Some(BlendMode::Screen),
+            3 => Some(BlendMode::Overlay),
+            4 => Some(BlendMode::Add),
+            _ => None,
+        }
+    }
+}
+
 /// v2 §13/§14.1: 1 枚のレイヤー。RGBA8・行優先、`Document` と同寸。
 #[derive(Clone)]
 pub struct Layer {
@@ -255,12 +315,20 @@ pub struct Layer {
     pub visible: bool,
     /// 0-255(UI 表示は %)。
     pub opacity: u8,
+    /// v12 §50.2: ブレンドモード(既定 `Normal`)。表示/不透明度と同じく
+    /// 履歴には積まない(SPEC §13 の規則)。
+    pub blend: BlendMode,
+    /// v12 §50.3: アルファロック(透明部分の保護)。既定 OFF。ON の間は
+    /// 描画系の書き込みが `dst_a == 0` の画素を完全にスキップし、それ以外の
+    /// 画素も α を変えない(`raster::Surface::set_pixel` が唯一の集約点)。
+    pub alpha_lock: bool,
     /// `len() == width as usize * height as usize * 4`
     pub pixels: Vec<u8>,
 }
 
 impl Layer {
-    /// `fill` で塗りつぶした不透明・表示ありのレイヤーを作る。
+    /// `fill` で塗りつぶした不透明・表示ありのレイヤーを作る
+    /// (v12 §50: blend=通常・アルファロック OFF)。
     pub fn filled(name: impl Into<String>, width: u32, height: u32, fill: [u8; 4]) -> Self {
         let count = (width as usize).saturating_mul(height as usize);
         let mut pixels = Vec::with_capacity(count.saturating_mul(4));
@@ -271,6 +339,22 @@ impl Layer {
             name: name.into(),
             visible: true,
             opacity: 255,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
+            pixels,
+        }
+    }
+
+    /// 画素バッファを与えて「通常・表示あり・不透明」のレイヤーを作る
+    /// (読み込み・統合・置換など、既定メタで作る全経路の単一の入口。
+    /// v12 §50 でメタが 2 つ増えたときに書き漏らしが起きないようにする)。
+    pub fn from_pixels(name: impl Into<String>, pixels: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            visible: true,
+            opacity: 255,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
             pixels,
         }
     }
@@ -303,6 +387,17 @@ pub struct Document {
     /// 前フレーム以降に変更された領域群(合成の再計算・テクスチャ部分更新用、
     /// v4 §16.1: セグメント単位、`DirtyRegion` 参照)。
     pub dirty: DirtyRegion,
+    /// v12 §50.1: **画素内容の世代カウンタ**(レイヤーサムネイルのキャッシュ
+    /// 無効化に使う唯一の情報源)。「成功した変更」の共通出口
+    /// (`History` の適用 / `commit_stroke` / `ReplaceAll` = `apply_snapshot` /
+    /// レイヤー構造変更 / 全画像変換)でのみ**単調増加**する。
+    ///
+    /// ARCHITECTURE.md §22.8-4: undo でも巻き戻さない(undo は「新しい内容」
+    /// であってサムネイルは作り直す必要がある)。また `Layer` の `clone` には
+    /// 含めない(undo 枝で世代が衝突しないよう `Document` 側に 1 本だけ持つ)。
+    /// 表示/不透明度/ブレンドの変更ではサムネイルの内容が変わらない
+    /// (SPEC §50.1: 「内容はそのレイヤーの画素のみ」)ため増やさない。
+    pub content_gen: u64,
 }
 
 impl Document {
@@ -324,12 +419,7 @@ impl Document {
     /// 画像ファイルを読み込んだ直後のドキュメント(SPEC §13:「ファイルを
     /// 開いた直後は『背景』レイヤー1枚」)。`io::load_image` から使う。
     pub fn from_loaded(width: u32, height: u32, pixels: Vec<u8>, path: PathBuf) -> Self {
-        let layer = Layer {
-            name: "背景".to_owned(),
-            visible: true,
-            opacity: 255,
-            pixels,
-        };
+        let layer = Layer::from_pixels("背景", pixels);
         Self::from_layers(width, height, vec![layer], Some(path))
     }
 
@@ -372,6 +462,7 @@ impl Document {
             path,
             modified: false,
             dirty: DirtyRegion::new(),
+            content_gen: 0,
         };
         doc.recomposite_full();
         doc
@@ -407,6 +498,7 @@ impl Document {
             path,
             modified,
             dirty: DirtyRegion::new(),
+            content_gen: 0,
         };
         let mut refs = Vec::new();
         refs.try_reserve_exact(doc.layers.len())
@@ -454,13 +546,22 @@ impl Document {
     /// `clip`(v4 §16.3: 選択があるときの描画クリップ)は `Surface::set_pixel`
     /// が内部で見る。選択が無ければ `None` を渡すこと(コストがゼロになる、
     /// ARCHITECTURE.md §16.10-2)。
+    ///
+    /// v12 §50.3: アクティブレイヤーの `alpha_lock` もここで `Surface` へ
+    /// 渡す(`clip` と同じ「書き込みの唯一の集約点で見る」設計。
+    /// `raster::Surface::set_pixel` のドキュメント参照)。これにより
+    /// ブラシ/鉛筆/消しゴム/図形/グラデーション/色調補正のすべてが、
+    /// 呼び出し側を一切変えずに透明保護へ従う。
     pub fn active_surface_mut<'a>(&'a mut self, clip: Option<&'a SelMask>) -> Surface<'a> {
         let (width, height) = (self.width, self.height);
+        let idx = self.active_index();
+        let alpha_lock = self.layers[idx].alpha_lock;
         Surface {
             width,
             height,
-            pixels: &mut self.active_layer_mut().pixels,
+            pixels: &mut self.layers[idx].pixels,
             clip,
+            alpha_lock,
         }
     }
 
@@ -515,6 +616,15 @@ impl Document {
             x1: self.width as i32,
             y1: self.height as i32,
         });
+    }
+
+    /// v12 §50.1: 画素内容が変わったことを記録する(`content_gen` を 1 増やす)。
+    /// レイヤーサムネイルのキャッシュはこの値だけを見て再生成を判断するため、
+    /// 「成功した変更」の共通出口(このモジュールの各構造/画像操作、
+    /// `history.rs` の `apply_before`/`apply_after`/`commit_stroke`)から
+    /// 必ず呼ぶこと。飽和加算なので u64 の桁溢れでもパニックしない。
+    pub fn bump_content_gen(&mut self) {
+        self.content_gen = self.content_gen.saturating_add(1);
     }
 
     /// 可視レイヤーを下から straight-alpha + レイヤー不透明度で `rect` の
@@ -588,6 +698,9 @@ impl Document {
         self.active = snap.active.min(self.layers.len().saturating_sub(1));
         self.composite = vec![0u8; self.width as usize * self.height as usize * 4];
         self.mark_all_dirty();
+        // v12 §50.1: スナップショット復元(undo/redo の `ReplaceAll`・
+        // 履歴ジャンプ)も画素内容の変更境界。
+        self.bump_content_gen();
     }
 
     /// クリップボードからの「白紙時の置き換え貼り付け」(SPEC §6)専用:
@@ -595,15 +708,11 @@ impl Document {
     pub fn replace_with_single_layer(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
         self.width = width;
         self.height = height;
-        self.layers = vec![Layer {
-            name: "背景".to_owned(),
-            visible: true,
-            opacity: 255,
-            pixels,
-        }];
+        self.layers = vec![Layer::from_pixels("背景", pixels)];
         self.active = 0;
         self.composite = vec![0u8; width as usize * height as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     // -----------------------------------------------------------------
@@ -617,6 +726,7 @@ impl Document {
             flip_horizontal_buffer(&mut layer.pixels, w);
         }
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// 上下反転。サイズは変わらない。
@@ -626,6 +736,7 @@ impl Document {
             flip_vertical_buffer(&mut layer.pixels, w, h);
         }
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// 右に 90° 回転。幅と高さが入れ替わる。
@@ -638,6 +749,7 @@ impl Document {
         self.height = w;
         self.composite = vec![0u8; self.width as usize * self.height as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// 左に 90° 回転。幅と高さが入れ替わる。
@@ -650,6 +762,7 @@ impl Document {
         self.height = w;
         self.composite = vec![0u8; self.width as usize * self.height as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// 画像サイズ変更(SPEC §7: 補間 = バイリニア / ニアレスト)。
@@ -662,6 +775,7 @@ impl Document {
         self.height = new_height;
         self.composite = vec![0u8; new_width as usize * new_height as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// キャンバスサイズ変更(SPEC §7: 既存画像は左上基準で配置、拡張部分は
@@ -675,6 +789,7 @@ impl Document {
         self.height = new_height;
         self.composite = vec![0u8; new_width as usize * new_height as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     /// `rect`(画像座標、境界外は自動クランプ)へトリミングする
@@ -691,6 +806,7 @@ impl Document {
         self.height = new_h;
         self.composite = vec![0u8; new_w as usize * new_h as usize * 4];
         self.mark_all_dirty();
+        self.bump_content_gen();
     }
 
     // -----------------------------------------------------------------
@@ -714,14 +830,10 @@ impl Document {
         let insert_at = self.active_index() + 1;
         self.layers.insert(
             insert_at,
-            Layer {
-                name,
-                visible: true,
-                opacity: 255,
-                pixels: vec![0u8; width as usize * height as usize * 4],
-            },
+            Layer::from_pixels(name, vec![0u8; width as usize * height as usize * 4]),
         );
         self.active = insert_at;
+        self.bump_content_gen();
         true
     }
 
@@ -736,6 +848,7 @@ impl Document {
         let insert_at = idx + 1;
         self.layers.insert(insert_at, dup);
         self.active = insert_at;
+        self.bump_content_gen();
         true
     }
 
@@ -750,45 +863,73 @@ impl Document {
         let idx = self.active_index();
         self.layers.remove(idx);
         self.active = idx.min(self.layers.len().saturating_sub(1));
+        self.bump_content_gen();
+        true
+    }
+
+    /// v12 §50.1: レイヤーの並べ替え(**`from` を取り除いて `to` へ挿入**)。
+    /// `to` は取り除いた後の列における最終的な添字なので、逆操作はちょうど
+    /// `move_layer(to, from)` になる(`history.rs` の `MoveLayer` の undo/redo が
+    /// これを使う)。移動したレイヤーがアクティブのまま追随する。
+    ///
+    /// 旧仕様(v11 まで)の隣接 swap は「上へ/下へ」でしか使われず、隣接では
+    /// swap と remove→insert が一致するため、旧 `.dpaint` の `MoveLayer`
+    /// (隣接添字のみ)はこの新意味論でもそのまま正しく再生できる
+    /// (SPEC §50.1)。範囲外・同一添字は何もせず `false`(パニックしない)。
+    /// アクティブ添字は「どのレイヤーがアクティブか」の**同一性**を保つよう
+    /// 挿入規則で再計算する(`moved_active_index`)。移動したレイヤー自身が
+    /// アクティブなら移動先へ追随し、別のレイヤーがアクティブならそのレイヤーを
+    /// 指したままになる。この規則は自身の逆操作(`move_layer(to, from)`)で
+    /// ちょうど元へ戻るため、`history.rs` の undo/redo は添字を代入せず
+    /// これに委譲するだけでよい。
+    pub fn move_layer(&mut self, from: usize, to: usize) -> bool {
+        let len = self.layers.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        self.active = moved_active_index(self.active_index(), from, to);
+        self.bump_content_gen();
         true
     }
 
     /// アクティブレイヤーを 1 つ上へ移動する(SPEC §13: 「上へ」)。既に
-    /// 最上位なら `false`。
+    /// 最上位なら `false`。v12 §50.1 で `move_layer`(隣接挿入)へ統一した。
     pub fn move_active_layer_up(&mut self) -> bool {
         let idx = self.active_index();
         if idx + 1 >= self.layers.len() {
             return false;
         }
-        self.layers.swap(idx, idx + 1);
-        self.active = idx + 1;
-        true
+        self.move_layer(idx, idx + 1)
     }
 
     /// アクティブレイヤーを 1 つ下へ移動する(SPEC §13: 「下へ」)。既に
-    /// 最下位なら `false`。
+    /// 最下位なら `false`。v12 §50.1 で `move_layer`(隣接挿入)へ統一した。
     pub fn move_active_layer_down(&mut self) -> bool {
         let idx = self.active_index();
         if idx == 0 {
             return false;
         }
-        self.layers.swap(idx, idx - 1);
-        self.active = idx - 1;
-        true
+        self.move_layer(idx, idx - 1)
     }
 
     /// アクティブレイヤーを直下のレイヤーへ結合する(SPEC §13: 「下と結合」、
     /// レイヤーが 1 枚 or アクティブが最下位なら無効)。結合後のレイヤーは
     /// 不透明度 255・表示ありになり(両レイヤーの見た目をそのまま焼き込む
-    /// ため)、名前は下側レイヤーのものを引き継ぐ。
+    /// ため)、名前は下側レイヤーのものを引き継ぐ。v12 §50.2: ブレンドは
+    /// 「通常」・アルファロックは OFF に戻る(見た目を焼き込んだ結果なので、
+    /// 結合前のメタは意味を持たない)。
+    ///
+    /// v12 §50.2 の結合制限: どちらかが「通常」以外のブレンドなら
+    /// **結合できない**(非通常ブレンドは下の累積 backdrop に依存するため、
+    /// 2 枚だけの焼き込みでは見た目を保存できない)。呼び出し側は
+    /// `can_merge_active_down` でボタン・メニューを無効化する。
     pub fn merge_active_down(&mut self) -> bool {
-        if self.layers.len() <= 1 {
+        if !self.can_merge_active_down() {
             return false;
         }
         let upper_idx = self.active_index();
-        if upper_idx == 0 {
-            return false;
-        }
         let lower_idx = upper_idx - 1;
         let (width, height) = (self.width, self.height);
         let merged = composite_two(
@@ -798,15 +939,31 @@ impl Document {
             height,
         );
         let name = self.layers[lower_idx].name.clone();
-        self.layers[lower_idx] = Layer {
-            name,
-            visible: true,
-            opacity: 255,
-            pixels: merged,
-        };
+        self.layers[lower_idx] = Layer::from_pixels(name, merged);
         self.layers.remove(upper_idx);
         self.active = lower_idx;
+        self.bump_content_gen();
         true
+    }
+
+    /// v12 §50.2: 「下と結合」が実行可能か(パネルのボタン・メニューの
+    /// 有効/無効判定と `merge_active_down` の唯一の情報源)。レイヤーが
+    /// 1 枚 / アクティブが最下位 / 結合対象 2 枚のどちらかが「通常」以外の
+    /// ブレンド、のいずれかなら `false`。
+    pub fn can_merge_active_down(&self) -> bool {
+        if self.layers.len() <= 1 {
+            return false;
+        }
+        let upper_idx = self.active_index();
+        if upper_idx == 0 {
+            return false;
+        }
+        let normal = |idx: usize| {
+            self.layers
+                .get(idx)
+                .is_some_and(|l| l.blend == BlendMode::Normal)
+        };
+        normal(upper_idx) && normal(upper_idx - 1)
     }
 
     /// 画像の統合(SPEC §13: メニュー「画像の統合」)。可視レイヤーの合成
@@ -829,13 +986,9 @@ impl Document {
             composite_layers(&refs, width, full, &mut out);
             out
         };
-        self.layers = vec![Layer {
-            name: "背景".to_owned(),
-            visible: true,
-            opacity: 255,
-            pixels: merged,
-        }];
+        self.layers = vec![Layer::from_pixels("背景", merged)];
         self.active = 0;
+        self.bump_content_gen();
         true
     }
 }
@@ -878,6 +1031,19 @@ fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) 
     let x1 = rect.x1 as usize;
     let row_bytes = (x1 - x0) * 4;
 
+    // v12 §50.2: ブレンド関数の解決は**合成開始時に 1 回だけ**行う
+    // (レイヤー×行ごとの `match` を消す)。`MAX_LAYERS` 枚ぶんのスタック配列
+    // なので追加のヒープ確保は無い(`layers` は `Document` の不変条件により
+    // 常に `MAX_LAYERS` 以下。万一超えた場合の余剰レイヤーは表から外れて
+    // 「通常」扱いになるだけで、パニックも UB も起きない)。
+    let mut blends: [Option<BlendFn>; MAX_LAYERS] = [None; MAX_LAYERS];
+    let mut all_normal = true;
+    for (i, layer) in layers.iter().take(MAX_LAYERS).enumerate() {
+        let resolved = blend_function(layer.blend);
+        all_normal &= resolved.is_none();
+        blends[i] = resolved;
+    }
+
     for y in rect.y0..rect.y1 {
         let row_start = (y as usize * w + x0) * 4;
         let row_end = row_start + row_bytes;
@@ -886,7 +1052,29 @@ fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) 
         };
         // 各画素は透明(acc=[0,0,0,0])から積み上げる(v1 の意味論どおり)。
         out_row.fill(0);
-        for layer in layers {
+        if all_normal {
+            // 全レイヤー「通常」の文書(圧倒的多数)は、v11 までと**同一の**
+            // ループをそのまま通す(fast path。結果はバイト単位で一致)。
+            for layer in layers {
+                if !layer.visible || layer.opacity == 0 {
+                    continue;
+                }
+                let Some(layer_row) = layer.pixels.get(row_start..row_end) else {
+                    continue;
+                };
+                let opacity = layer.opacity;
+                for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
+                    let mut s = [src[0], src[1], src[2], src[3]];
+                    if opacity != 255 {
+                        s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
+                    }
+                    let d = [dst[0], dst[1], dst[2], dst[3]];
+                    dst.copy_from_slice(&raster::blend_over(d, s));
+                }
+            }
+            continue;
+        }
+        for (i, layer) in layers.iter().enumerate() {
             if !layer.visible || layer.opacity == 0 {
                 continue;
             }
@@ -894,16 +1082,110 @@ fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) 
                 continue;
             };
             let opacity = layer.opacity;
-            for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
-                let mut s = [src[0], src[1], src[2], src[3]];
-                if opacity != 255 {
-                    s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
+            match blends.get(i).copied().flatten() {
+                None => {
+                    for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
+                        let mut s = [src[0], src[1], src[2], src[3]];
+                        if opacity != 255 {
+                            s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
+                        }
+                        let d = [dst[0], dst[1], dst[2], dst[3]];
+                        dst.copy_from_slice(&raster::blend_over(d, s));
+                    }
                 }
-                let d = [dst[0], dst[1], dst[2], dst[3]];
-                dst.copy_from_slice(&raster::blend_over(d, s));
+                Some(blend) => {
+                    for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
+                        let mut s = [src[0], src[1], src[2], src[3]];
+                        if opacity != 255 {
+                            s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
+                        }
+                        let d = [dst[0], dst[1], dst[2], dst[3]];
+                        dst.copy_from_slice(&blend_pixel(d, s, blend));
+                    }
+                }
             }
         }
     }
+}
+
+/// v12 §50.1: レイヤーを `from` から `to` へ動かしたときの新しいアクティブ
+/// 添字(`Document::move_layer` と `history.rs` の undo/redo が共有する純関数)。
+///
+/// 「どのレイヤーがアクティブか」の同一性を保つ:
+/// - `active == from` → 移動したレイヤー自身なので `to` へ追随する
+/// - `from < active <= to` → 1 つ前へ詰まる
+/// - `to <= active < from` → 1 つ後ろへずれる
+/// - それ以外 → 不変
+///
+/// この写像は `move_layer(to, from)`(逆操作)で必ず元の値へ戻る。
+fn moved_active_index(active: usize, from: usize, to: usize) -> usize {
+    if active == from {
+        to
+    } else if from < active && active <= to {
+        active - 1
+    } else if to <= active && active < from {
+        active + 1
+    } else {
+        active
+    }
+}
+
+/// v12 §50.2: 解決済みのブレンド関数(`composite_layers` が合成開始時に
+/// レイヤーごと 1 回だけ引く)。
+type BlendFn = fn(f32, f32) -> f32;
+
+/// v12 §50.2: ブレンド関数 `B(Cb, Cs)`(0.0..1.0 の encoded sRGB 上で計算)。
+/// 「通常」だけは `None` を返し、呼び出し側(`composite_layers`)が従来の
+/// source-over の fast path を選ぶ(ARCHITECTURE.md §22.8-1)。
+fn blend_function(mode: BlendMode) -> Option<BlendFn> {
+    match mode {
+        BlendMode::Normal => None,
+        BlendMode::Multiply => Some(|cb, cs| cb * cs),
+        BlendMode::Screen => Some(|cb, cs| 1.0 - (1.0 - cb) * (1.0 - cs)),
+        // オーバーレイ = hard-light(Cs, Cb)(SPEC §50.2: Cb ≤ 0.5 なら
+        // 2·Cb·Cs、そうでなければ 1 − 2(1−Cb)(1−Cs))。
+        BlendMode::Overlay => Some(|cb, cs| {
+            if cb <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }),
+        // 加算は W3C の分離ブレンドには無いが、定番のクランプ和として実装する
+        // (SPEC §50.2)。
+        BlendMode::Add => Some(|cb, cs| (cb + cs).min(1.0)),
+    }
+}
+
+/// v12 §50.2 の 2 段階合成(W3C compositing-1 の「ブレンド → 合成」)。
+///
+/// ```text
+/// αs = src_a(呼び出し側でレイヤー不透明度を掛け済み)
+/// Cr = (1 − αb)·Cs + αb·B(Cb, Cs)      // ブレンド後の source 色
+/// αo = αs + αb·(1 − αs)
+/// co = αs·Cr + αb·(1 − αs)·Cb          // premultiplied 出力
+/// Co = αo > 0 ? co / αo : 0            // straight RGB(αo=0 は透明黒)
+/// ```
+///
+/// 丸め規則は `raster::blend_over` と同じ(最後に ×255 して四捨五入・クランプ)
+/// に固定する(SPEC §50.2: 「丸め規則は実装で固定してテストで検証する」)。
+fn blend_pixel(dst: [u8; 4], src: [u8; 4], blend: BlendFn) -> [u8; 4] {
+    let alpha_s = src[3] as f32 / 255.0;
+    let alpha_b = dst[3] as f32 / 255.0;
+    let alpha_o = alpha_s + alpha_b * (1.0 - alpha_s);
+    if alpha_o <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let mut out = [0u8; 4];
+    for c in 0..3 {
+        let cs = src[c] as f32 / 255.0;
+        let cb = dst[c] as f32 / 255.0;
+        let cr = (1.0 - alpha_b) * cs + alpha_b * blend(cb, cs);
+        let co = alpha_s * cr + alpha_b * (1.0 - alpha_s) * cb;
+        out[c] = ((co / alpha_o) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    out[3] = (alpha_o * 255.0).round().clamp(0.0, 255.0) as u8;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,12 +1463,16 @@ mod tests {
             name: "背景".to_owned(),
             visible: true,
             opacity: 255,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
             pixels: vec![10, 20, 30, 255],
         };
         let top = Layer {
             name: "上".to_owned(),
             visible: false,
             opacity: 255,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
             pixels: vec![200, 210, 220, 255],
         };
         let doc = Document::try_from_snapshot_owned(
@@ -1921,6 +2207,327 @@ mod tests {
         let mut doc = Document::new(1, 1, Background::White);
         doc.active = 99;
         assert_eq!(doc.active_index(), 0);
+    }
+
+    // -- v12 §50.1: MoveLayer の意味論(取り除いて挿入)------------------
+
+    #[test]
+    fn move_layer_removes_and_inserts_for_non_adjacent_targets() {
+        let mut doc = Document::new(1, 1, Background::White);
+        doc.layers[0].name = "0".to_owned();
+        for name in ["1", "2", "3"] {
+            assert!(doc.add_layer(name.to_owned()));
+        }
+        let names =
+            |doc: &Document| -> Vec<String> { doc.layers.iter().map(|l| l.name.clone()).collect() };
+        assert_eq!(names(&doc), ["0", "1", "2", "3"]);
+
+        // 最下層を最上位へ(非隣接): swap なら ["3","1","2","0"] になるが、
+        // 挿入なら ["1","2","3","0"]。
+        doc.active = 0;
+        assert!(doc.move_layer(0, 3));
+        assert_eq!(names(&doc), ["1", "2", "3", "0"]);
+        assert_eq!(doc.active, 3, "移動したレイヤーがアクティブのまま追随する");
+
+        // 逆操作(to → from)で完全に元へ戻る = undo の実装がこれで足りる。
+        assert!(doc.move_layer(3, 0));
+        assert_eq!(names(&doc), ["0", "1", "2", "3"]);
+        assert_eq!(doc.active, 0);
+    }
+
+    /// v12 §50.1(追いレビュー②): **アクティブでない**レイヤーを動かしても、
+    /// アクティブなのは常に同じレイヤー(同一性)であること。
+    #[test]
+    fn move_layer_keeps_the_same_layer_active_when_another_layer_moves() {
+        let mut doc = Document::new(1, 1, Background::White);
+        doc.layers[0].name = "0".to_owned();
+        for name in ["1", "2", "3"] {
+            assert!(doc.add_layer(name.to_owned()));
+        }
+        let active_name = |doc: &Document| doc.active_layer().name.clone();
+
+        // 下から上へ(active より下のレイヤーが上へ抜ける → 1 つ詰まる)。
+        doc.active = 2;
+        assert_eq!(active_name(&doc), "2");
+        assert!(doc.move_layer(0, 3));
+        assert_eq!(doc.active, 1);
+        assert_eq!(active_name(&doc), "2");
+
+        // 上から下へ(active より上のレイヤーが下へ入る → 1 つずれる)。
+        assert!(doc.move_layer(3, 0));
+        assert_eq!(doc.active, 2);
+        assert_eq!(active_name(&doc), "2");
+
+        // 完全に範囲外の移動(active を跨がない)では添字が動かない。
+        doc.active = 0;
+        assert!(doc.move_layer(2, 3));
+        assert_eq!(doc.active, 0);
+        assert_eq!(active_name(&doc), "0");
+    }
+
+    #[test]
+    fn moved_active_index_is_reversible_for_every_index_pair() {
+        // 逆操作 `move_layer(to, from)` で必ず元の active に戻る(履歴の
+        // undo/redo がこの写像だけに委譲できる根拠)。
+        for len in 1..=6usize {
+            for from in 0..len {
+                for to in 0..len {
+                    for active in 0..len {
+                        let moved = moved_active_index(active, from, to);
+                        assert!(moved < len, "len={len} from={from} to={to} active={active}");
+                        assert_eq!(
+                            moved_active_index(moved, to, from),
+                            active,
+                            "len={len} from={from} to={to} active={active}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn move_layer_rejects_out_of_range_and_same_index() {
+        let mut doc = Document::new(1, 1, Background::White);
+        assert!(doc.add_layer("上".to_owned()));
+        assert!(!doc.move_layer(0, 0), "同一添字は no-op");
+        assert!(!doc.move_layer(0, 5), "範囲外はパニックせず false");
+        assert!(!doc.move_layer(9, 0));
+        assert_eq!(doc.layers.len(), 2);
+    }
+
+    #[test]
+    fn move_active_layer_up_matches_insertion_semantics_for_adjacent_layers() {
+        // 隣接では swap(v11 まで)と remove→insert(v12)が一致することの
+        // ピン止め(旧 `.dpaint` の MoveLayer 互換の根拠、SPEC §50.1)。
+        let mut doc = Document::new(1, 1, Background::White);
+        doc.layers[0].name = "0".to_owned();
+        for name in ["1", "2"] {
+            assert!(doc.add_layer(name.to_owned()));
+        }
+        doc.active = 0;
+        assert!(doc.move_active_layer_up());
+        let names: Vec<String> = doc.layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names, ["1", "0", "2"]);
+        assert_eq!(doc.active, 1);
+    }
+
+    // -- v12 §50.2: ブレンドモード -------------------------------------
+
+    /// 2 枚(下=不透明の backdrop、上=不透明の source)の合成結果 1 画素。
+    fn blend_two(mode: BlendMode, backdrop: [u8; 4], source: [u8; 4], opacity: u8) -> [u8; 4] {
+        let mut doc = Document::new(1, 1, Background::Transparent);
+        doc.layers[0].pixels = backdrop.to_vec();
+        assert!(doc.add_layer("上".to_owned()));
+        doc.layers[1].pixels = source.to_vec();
+        doc.layers[1].blend = mode;
+        doc.layers[1].opacity = opacity;
+        doc.recomposite_full();
+        [
+            doc.composite[0],
+            doc.composite[1],
+            doc.composite[2],
+            doc.composite[3],
+        ]
+    }
+
+    #[test]
+    fn blend_normal_is_byte_identical_to_the_v11_source_over_path() {
+        // SPEC §50.2:「通常モードは従来の source-over と結果完全一致」。
+        // 部分 α・部分不透明度を含む代表値で `raster::blend_over` の
+        // 逐次適用と 1 バイトも違わないことを確認する。
+        for backdrop in [[10u8, 200, 30, 255], [0, 0, 0, 0], [90, 90, 90, 128]] {
+            for source in [[200u8, 20, 60, 255], [200, 20, 60, 128], [1, 2, 3, 0]] {
+                for opacity in [255u8, 128, 64] {
+                    let mut expected_src = source;
+                    if opacity != 255 {
+                        expected_src[3] = ((source[3] as u32 * opacity as u32) / 255) as u8;
+                    }
+                    let expected = raster::blend_over(
+                        raster::blend_over([0, 0, 0, 0], backdrop),
+                        expected_src,
+                    );
+                    assert_eq!(
+                        blend_two(BlendMode::Normal, backdrop, source, opacity),
+                        expected,
+                        "backdrop={backdrop:?} source={source:?} opacity={opacity}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blend_modes_match_the_spec_formulas_on_opaque_pixels() {
+        // 不透明どうしなら αb=αs=1 なので Co = B(Cb, Cs) そのもの。
+        let backdrop = [100, 128, 200, 255];
+        let source = [50, 128, 25, 255];
+        // 乗算: Cb·Cs
+        assert_eq!(
+            blend_two(BlendMode::Multiply, backdrop, source, 255),
+            [20, 64, 20, 255]
+        );
+        // スクリーン: 1−(1−Cb)(1−Cs)
+        assert_eq!(
+            blend_two(BlendMode::Screen, backdrop, source, 255),
+            [130, 192, 205, 255]
+        );
+        // オーバーレイ: Cb ≤ 0.5 → 2·Cb·Cs、他は 1−2(1−Cb)(1−Cs)
+        assert_eq!(
+            blend_two(BlendMode::Overlay, backdrop, source, 255),
+            [39, 128, 156, 255]
+        );
+        // 加算: min(1, Cb+Cs)
+        assert_eq!(
+            blend_two(BlendMode::Add, backdrop, source, 255),
+            [150, 255, 225, 255]
+        );
+    }
+
+    #[test]
+    fn blend_over_transparent_backdrop_behaves_like_normal() {
+        // αb = 0 なら Cr = Cs(ブレンド相手が居ない)ため、どのモードでも
+        // 通常と同じ結果になる(SPEC §50.2 の 2 段階式の帰結)。
+        let source = [200, 20, 60, 200];
+        let expected = blend_two(BlendMode::Normal, [0, 0, 0, 0], source, 255);
+        for mode in BlendMode::ALL {
+            assert_eq!(
+                blend_two(mode, [0, 0, 0, 0], source, 255),
+                expected,
+                "{}",
+                mode.label()
+            );
+        }
+    }
+
+    #[test]
+    fn blend_with_partial_alpha_uses_the_two_stage_formula() {
+        // αb=0.5(128)・αs=0.5(128)の乗算。手計算:
+        //   αb=128/255≈0.50196, αs 同値, Cb=Cs=0.50196
+        //   Cr=(1−αb)Cs+αb(Cb·Cs)=0.5*0.50196+0.50196*0.25196≈0.37647
+        //   αo=αs+αb(1−αs)≈0.75209
+        //   co=αs·Cr+αb(1−αs)Cb≈0.18899+0.12549≈0.31448 → Co≈0.41815 → 107
+        let out = blend_two(
+            BlendMode::Multiply,
+            [128, 128, 128, 128],
+            [128, 128, 128, 128],
+            255,
+        );
+        assert_eq!(out[3], 192, "αo = αs + αb(1−αs)");
+        assert_eq!(out[0], 107);
+        assert_eq!(out[0], out[1]);
+        assert_eq!(out[1], out[2]);
+    }
+
+    #[test]
+    fn blend_layer_opacity_scales_source_alpha_before_blending() {
+        // 不透明度 0% はレイヤーが存在しないのと同じ(既存の早期 continue)。
+        assert_eq!(
+            blend_two(
+                BlendMode::Multiply,
+                [10, 20, 30, 255],
+                [200, 200, 200, 255],
+                0
+            ),
+            [10, 20, 30, 255]
+        );
+        // 不透明度 100% と 50% では結果が異なる(αs が効いている)。
+        let full = blend_two(
+            BlendMode::Multiply,
+            [10, 20, 30, 255],
+            [200, 200, 200, 255],
+            255,
+        );
+        let half = blend_two(
+            BlendMode::Multiply,
+            [10, 20, 30, 255],
+            [200, 200, 200, 255],
+            128,
+        );
+        assert_ne!(full, half);
+    }
+
+    #[test]
+    fn flatten_all_bakes_the_blended_result() {
+        // SPEC §50.2:「画像の統合は常に可(見た目=合成結果そのもの)」。
+        let mut doc = Document::new(1, 1, Background::Transparent);
+        doc.layers[0].pixels = vec![100, 128, 200, 255];
+        assert!(doc.add_layer("上".to_owned()));
+        doc.layers[1].pixels = vec![50, 128, 25, 255];
+        doc.layers[1].blend = BlendMode::Multiply;
+        doc.recomposite_full();
+        let composite = doc.composite.clone();
+        assert!(doc.flatten_all());
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].pixels, composite);
+        assert_eq!(doc.layers[0].blend, BlendMode::Normal);
+    }
+
+    #[test]
+    fn merge_active_down_is_refused_when_either_layer_is_not_normal() {
+        // SPEC §50.2 の結合制限。
+        let mut doc = Document::new(1, 1, Background::White);
+        assert!(doc.add_layer("上".to_owned()));
+        assert!(doc.can_merge_active_down());
+
+        doc.layers[1].blend = BlendMode::Screen;
+        assert!(!doc.can_merge_active_down(), "上が非通常なら不可");
+        assert!(!doc.merge_active_down());
+        assert_eq!(doc.layers.len(), 2, "拒否時は何も変わらない");
+
+        doc.layers[1].blend = BlendMode::Normal;
+        doc.layers[0].blend = BlendMode::Multiply;
+        assert!(!doc.can_merge_active_down(), "下が非通常でも不可");
+        assert!(!doc.merge_active_down());
+
+        doc.layers[0].blend = BlendMode::Normal;
+        assert!(doc.can_merge_active_down());
+        assert!(doc.merge_active_down());
+        assert_eq!(doc.layers.len(), 1);
+        assert!(!doc.layers[0].alpha_lock, "結合結果は既定メタに戻る");
+    }
+
+    // -- v12 §50.1: content_gen(サムネイル世代)-------------------------
+
+    #[test]
+    fn content_gen_increases_only_on_successful_content_changes() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let start = doc.content_gen;
+
+        // 失敗する構造操作は世代を進めない。
+        assert!(!doc.remove_active_layer());
+        assert!(!doc.move_active_layer_up());
+        assert!(!doc.flatten_all());
+        assert_eq!(doc.content_gen, start);
+
+        // メタ変更(表示・不透明度・ブレンド・ロック)も画素は変えない。
+        doc.layers[0].visible = false;
+        doc.layers[0].opacity = 128;
+        doc.layers[0].blend = BlendMode::Screen;
+        doc.layers[0].alpha_lock = true;
+        doc.mark_all_dirty();
+        assert_eq!(doc.content_gen, start, "表示系のメタ変更では増えない");
+
+        // 成功する構造・画像操作は必ず進める。
+        assert!(doc.add_layer("上".to_owned()));
+        let after_add = doc.content_gen;
+        assert!(after_add > start);
+        doc.flip_horizontal();
+        assert!(doc.content_gen > after_add);
+    }
+
+    #[test]
+    fn content_gen_is_not_carried_by_layer_clones_or_snapshots() {
+        // ARCHITECTURE.md §22.8-4: 世代は Document 側の 1 本だけ。
+        // スナップショット復元も「新しい内容」として単調に進む。
+        let mut doc = Document::new(2, 2, Background::White);
+        let snap = doc.snapshot();
+        let before = doc.content_gen;
+        doc.apply_snapshot(&snap);
+        assert!(
+            doc.content_gen > before,
+            "復元でも巻き戻らず前進する(undo でサムネイルを作り直すため)"
+        );
     }
 
     // -- v4 §16.1: recomposite の行スライス化(回帰検知用の緩い時間上限) ------

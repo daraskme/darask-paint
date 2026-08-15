@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::document::{composite_two, DocSnapshot, Document, IRect, Layer};
+use crate::document::{composite_two, BlendMode, DocSnapshot, Document, IRect, Layer};
 
 /// タイルサイズ(ARCHITECTURE.md §6: 256×256)。
 const TILE_SIZE: i32 = 256;
@@ -69,6 +69,9 @@ pub enum HistoryOp {
     /// v10 §47(`.dpaint` v2): `visible`/`opacity` を追加した。undo 時に
     /// `refresh_op_for_redo` が現在値へ刷新するため、追加後に変更した
     /// 表示・不透明度・名前が redo で失われない(SPEC §40-7 の残課題解消)。
+    ///
+    /// v12 §50.4: `blend`/`alpha_lock` も同じ理由で保持する(追加後に変更した
+    /// ブレンド・透明保護が redo で失われないようにする)。
     AddLayer {
         index: usize,
         name: String,
@@ -76,6 +79,8 @@ pub enum HistoryOp {
         before_active: usize,
         visible: bool,
         opacity: u8,
+        blend: BlendMode,
+        alpha_lock: bool,
     },
     /// アクティブレイヤーの複製(`layer_duplicate`)。undo=`index` の削除、
     /// redo=保持している `layer`(複製結果そのもの)を再挿入する。
@@ -90,9 +95,16 @@ pub enum HistoryOp {
         layer: Layer,
         before_active: usize,
     },
-    /// レイヤーの入れ替え(`layer_move_up`/`layer_move_down`)。`from`/`to` は
-    /// スワップする 2 添字(スワップは自身の逆操作なので undo/redo とも同じ
-    /// スワップを行い、アクティブ添字だけを向きに応じて書き分ける)。
+    /// レイヤーの並べ替え(`layer_move_up`/`layer_move_down`/パネルの
+    /// ドラッグ&ドロップ)。
+    ///
+    /// v12 §50.1 で意味論を変更した: 旧仕様は「`from`/`to` をスワップ」
+    /// だったが、ドラッグ&ドロップの非隣接移動ではスワップだと間のレイヤーの
+    /// 並びが壊れる(ARCHITECTURE.md §22.8-2)。新仕様は
+    /// **「`from` を取り除いて `to` へ挿入」**(`Document::move_layer`)で、
+    /// undo はちょうど `to` → `from` の同じ操作になる。`.dpaint` の符号化
+    /// (添字 2 つ)は不変で、旧ファイルの `MoveLayer` は隣接添字しか持たない
+    /// (= swap と挿入が一致する)ため読込互換。
     MoveLayer { from: usize, to: usize },
     /// 下と結合(`layer_merge_down`)。undo=結合前の 2 レイヤーへ復元、
     /// redo=`lower_before`/`upper` から結合結果を再計算する(結合結果自体は
@@ -113,6 +125,11 @@ pub enum HistoryOp {
         merged_name: String,
         merged_visible: bool,
         merged_opacity: u8,
+        /// v12 §50.4: 結合結果レイヤーのブレンド・透明保護(結合直後は
+        /// 通常/OFF だが、その後ユーザーが変更していれば undo 時に
+        /// `refresh_op_for_redo` が刷新する)。
+        merged_blend: BlendMode,
+        merged_alpha_lock: bool,
     },
     /// サイズ・レイヤー構成が丸ごと変わりうる操作(resize/crop/rotate/
     /// canvas resize/貼り付けによるドキュメント全体置き換え/画像の統合等)。
@@ -539,6 +556,10 @@ impl History {
             let pixels = &layer.pixels;
             if let Some(op) = stroke.finish(doc.width, pixels) {
                 doc.modified = true;
+                // v12 §50.1: 実際に画素が変わったストローク確定だけが
+                // サムネイル再生成の対象(before==after で抑制された確定では
+                // 世代を増やさない)。
+                doc.bump_content_gen();
                 self.push(op, label);
             }
         }
@@ -670,9 +691,14 @@ impl History {
                 name,
                 visible,
                 opacity,
+                blend,
+                alpha_lock,
                 ..
             } => {
                 if let Some(layer) = doc.layers.get(*index) {
+                    // `byte_size` が数えるのは `name.len()` だけ(v12 §50.4 で
+                    // 増えた `blend`/`alpha_lock` はどちらも Copy のスカラで
+                    // ヒープを持たない)ため、会計の補正は名前長のみでよい。
                     self.bytes_used = self
                         .bytes_used
                         .saturating_sub(name.len())
@@ -680,6 +706,8 @@ impl History {
                     name.clone_from(&layer.name);
                     *visible = layer.visible;
                     *opacity = layer.opacity;
+                    *blend = layer.blend;
+                    *alpha_lock = layer.alpha_lock;
                 }
             }
             HistoryOp::DuplicateLayer { index, layer, .. } => {
@@ -695,6 +723,8 @@ impl History {
                 merged_name,
                 merged_visible,
                 merged_opacity,
+                merged_blend,
+                merged_alpha_lock,
                 ..
             } => {
                 // undo で分割される直前の「結合結果レイヤー」(index-1)の
@@ -707,6 +737,8 @@ impl History {
                     merged_name.clone_from(&merged.name);
                     *merged_visible = merged.visible;
                     *merged_opacity = merged.opacity;
+                    *merged_blend = merged.blend;
+                    *merged_alpha_lock = merged.alpha_lock;
                 }
             }
             _ => {}
@@ -786,14 +818,10 @@ impl History {
     }
 }
 
-/// `a`/`b` が両方とも範囲内なら入れ替える(範囲外ならパニックせず何もしない、
-/// CLAUDE.md 鉄則)。`HistoryOp::MoveLayer` は自身の逆操作が同じスワップに
-/// なるため、undo/redo 双方から呼ぶ。
-fn swap_layers(doc: &mut Document, a: usize, b: usize) {
-    if a < doc.layers.len() && b < doc.layers.len() {
-        doc.layers.swap(a, b);
-    }
-}
+// v12 §50.1: `HistoryOp::MoveLayer` の適用は `Document::move_layer`
+// (`from` を取り除いて `to` へ挿入)へ委譲する。範囲外・同一添字は
+// `move_layer` 自身が安全に弾く(パニックしない、CLAUDE.md 鉄則)。
+// undo は `to`→`from` の同じ操作なので、undo/redo は向きだけを変えて呼ぶ。
 
 fn apply_before(doc: &mut Document, op: &HistoryOp) {
     match op {
@@ -835,8 +863,10 @@ fn apply_before(doc: &mut Document, op: &HistoryOp) {
             doc.mark_all_dirty();
         }
         HistoryOp::MoveLayer { from, to } => {
-            swap_layers(doc, *from, *to);
-            doc.active = *from;
+            // undo は「`to` に居るレイヤーを取り除いて `from` へ戻す」。
+            // アクティブ添字は `Document::move_layer` が挿入規則で再計算する
+            // (ここで代入するとアクティブレイヤーの同一性が壊れる)。
+            doc.move_layer(*to, *from);
             doc.mark_all_dirty();
         }
         HistoryOp::MergeDown {
@@ -860,6 +890,9 @@ fn apply_before(doc: &mut Document, op: &HistoryOp) {
         }
     }
     doc.modified = true;
+    // v12 §50.1: 履歴の適用(undo)は画素内容の変更境界。undo でも世代は
+    // 巻き戻さず単調に増やす(ARCHITECTURE.md §22.8-4)。
+    doc.bump_content_gen();
 }
 
 fn apply_after(doc: &mut Document, op: &HistoryOp) {
@@ -878,6 +911,8 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             name,
             visible,
             opacity,
+            blend,
+            alpha_lock,
             ..
         } => {
             let (width, height) = (doc.width, doc.height);
@@ -888,8 +923,11 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
                     name: name.clone(),
                     // v10 §47: 追加後に変更されたメタも redo で復元する
                     // (`refresh_op_for_redo` が undo 時に刷新した値)。
+                    // v12 §50.4 でブレンド・透明保護も同じ扱いになった。
                     visible: *visible,
                     opacity: *opacity,
+                    blend: *blend,
+                    alpha_lock: *alpha_lock,
                     pixels: vec![0u8; width as usize * height as usize * 4],
                 },
             );
@@ -910,8 +948,9 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             doc.mark_all_dirty();
         }
         HistoryOp::MoveLayer { from, to } => {
-            swap_layers(doc, *from, *to);
-            doc.active = *to;
+            // アクティブ添字の追随は `Document::move_layer` に委譲する
+            // (`apply_before` と対称)。
+            doc.move_layer(*from, *to);
             doc.mark_all_dirty();
         }
         HistoryOp::MergeDown {
@@ -921,6 +960,8 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
             merged_name,
             merged_visible,
             merged_opacity,
+            merged_blend,
+            merged_alpha_lock,
         } => {
             // 結合の redo=保持している 2 レイヤーから結合結果を再計算する
             // (結合済みの画素そのものは保持しない、メモリ節約)。メタは
@@ -935,6 +976,8 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
                     name: merged_name.clone(),
                     visible: *merged_visible,
                     opacity: *merged_opacity,
+                    blend: *merged_blend,
+                    alpha_lock: *merged_alpha_lock,
                     pixels: merged,
                 };
             }
@@ -949,6 +992,8 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
         }
     }
     doc.modified = true;
+    // v12 §50.1: 履歴の適用(redo)も画素内容の変更境界(`apply_before` と対称)。
+    doc.bump_content_gen();
 }
 
 #[cfg(test)]
@@ -1091,6 +1136,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "レイヤーを追加",
         );
@@ -1153,6 +1200,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "レイヤーを追加",
         );
@@ -1775,6 +1824,8 @@ mod tests {
                 before_active,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "レイヤーを追加",
         );
@@ -1862,7 +1913,8 @@ mod tests {
         let mut doc = Document::new(1, 1, Background::White);
         doc.layers
             .push(crate::document::Layer::filled("上", 1, 1, [1, 1, 1, 1]));
-        // move_active_layer_down(idx=1) が行うのと同じスワップを直接再現する。
+        // move_active_layer_down(idx=1) が行うのと同じ移動を直接再現する
+        // (隣接なので v11 の swap と v12 の remove→insert は一致する)。
         doc.layers.swap(0, 1);
         doc.active = 0;
 
@@ -1880,6 +1932,137 @@ mod tests {
         assert!(history.redo(&mut doc));
         assert_eq!(doc.active, 0);
         assert_eq!(doc.layers[0].pixels, vec![1, 1, 1, 1]);
+    }
+
+    /// v12 §50.1: `MoveLayer` は「取り除いて挿入」。非隣接の並べ替え
+    /// (ドラッグ&ドロップ)でも undo/redo が完全に往復する
+    /// (ARCHITECTURE.md §22.8-2: swap のままだと間のレイヤーが壊れる)。
+    #[test]
+    fn move_layer_history_round_trips_for_non_adjacent_targets() {
+        let mut doc = Document::new(1, 1, Background::White);
+        doc.layers[0].name = "0".to_owned();
+        for name in ["1", "2", "3"] {
+            assert!(doc.add_layer(name.to_owned()));
+        }
+        let names =
+            |doc: &Document| -> Vec<String> { doc.layers.iter().map(|l| l.name.clone()).collect() };
+
+        // パネルのドロップ相当: 最下層(0)を最上位(3)へ(移動したレイヤーが
+        // アクティブのケース)。
+        doc.active = 0;
+        assert!(doc.move_layer(0, 3));
+        assert_eq!(names(&doc), ["1", "2", "3", "0"]);
+        let mut history = History::new();
+        history.push(
+            HistoryOp::MoveLayer { from: 0, to: 3 },
+            "レイヤーの並び替え",
+        );
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(names(&doc), ["0", "1", "2", "3"], "undo は完全に元へ戻す");
+        assert_eq!(doc.active, 0);
+
+        assert!(history.redo(&mut doc));
+        assert_eq!(names(&doc), ["1", "2", "3", "0"]);
+        assert_eq!(doc.active, 3);
+    }
+
+    /// v12 §50.1(追いレビュー②): **アクティブでない**レイヤーを非隣接に
+    /// 動かしても、直後・undo・redo のどの段階でも「同じレイヤー」が
+    /// アクティブであること(履歴が添字を直接代入していると壊れる)。
+    #[test]
+    fn move_layer_history_preserves_the_active_layer_identity_in_both_directions() {
+        for (from, to) in [(0usize, 3usize), (3, 0)] {
+            let mut doc = Document::new(1, 1, Background::White);
+            doc.layers[0].name = "0".to_owned();
+            for name in ["1", "2", "3"] {
+                assert!(doc.add_layer(name.to_owned()));
+            }
+            // 動かすレイヤーとは別の「2」をアクティブにしておく。
+            doc.active = 2;
+            let active_name = |doc: &Document| doc.active_layer().name.clone();
+            assert_eq!(active_name(&doc), "2");
+
+            assert!(doc.move_layer(from, to));
+            assert_eq!(active_name(&doc), "2", "移動直後 (from={from}, to={to})");
+
+            let mut history = History::new();
+            history.push(HistoryOp::MoveLayer { from, to }, "レイヤーの並び替え");
+
+            assert!(history.undo(&mut doc));
+            assert_eq!(active_name(&doc), "2", "undo 後 (from={from}, to={to})");
+            let names: Vec<String> = doc.layers.iter().map(|l| l.name.clone()).collect();
+            assert_eq!(names, ["0", "1", "2", "3"]);
+
+            assert!(history.redo(&mut doc));
+            assert_eq!(active_name(&doc), "2", "redo 後 (from={from}, to={to})");
+        }
+    }
+
+    /// v12 §50.4: 追加後に変更したブレンド・アルファロックが undo→redo で
+    /// 失われない(v10 §47 の刷新機構の拡張)。
+    #[test]
+    fn redo_of_add_layer_preserves_blend_and_alpha_lock_changed_after_the_add() {
+        let mut doc = Document::new(4, 4, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("レイヤー 1".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "レイヤー 1".to_owned(),
+                before_active: 0,
+                visible: true,
+                opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
+            },
+            "レイヤーを追加",
+        );
+        doc.layers[1].blend = BlendMode::Overlay;
+        doc.layers[1].alpha_lock = true;
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.layers.len(), 1);
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc.layers[1].blend, BlendMode::Overlay);
+        assert!(doc.layers[1].alpha_lock);
+    }
+
+    /// v12 §50.4: 結合結果レイヤーのブレンド・アルファロックも同様。
+    #[test]
+    fn redo_of_merge_down_preserves_blend_and_alpha_lock_changed_after_the_merge() {
+        let mut doc = Document::new(2, 2, Background::White);
+        doc.layers
+            .push(crate::document::Layer::filled("上", 2, 2, [9, 9, 9, 255]));
+        doc.active = 1;
+        let upper = doc.layers[1].clone();
+        let lower_before = doc.layers[0].clone();
+        assert!(doc.merge_active_down());
+
+        let mut history = History::new();
+        history.push(
+            HistoryOp::MergeDown {
+                index: 1,
+                upper,
+                lower_before,
+                merged_name: doc.layers[0].name.clone(),
+                merged_visible: true,
+                merged_opacity: 255,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
+            },
+            "レイヤーの結合",
+        );
+        // 結合後に変更したメタ(履歴に積まれない)。
+        doc.layers[0].blend = BlendMode::Multiply;
+        doc.layers[0].alpha_lock = true;
+
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.layers.len(), 2);
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].blend, BlendMode::Multiply);
+        assert!(doc.layers[0].alpha_lock);
     }
 
     #[test]
@@ -1905,6 +2088,8 @@ mod tests {
                 merged_name: "背景".to_owned(),
                 merged_visible: true,
                 merged_opacity: 255,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
             },
             "レイヤーの結合",
         );

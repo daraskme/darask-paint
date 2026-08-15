@@ -2373,6 +2373,7 @@ mod tests {
             height: h,
             pixels: &mut pixels,
             clip: None,
+            alpha_lock: false,
         };
         raster::fill_ellipse(
             &mut surface,

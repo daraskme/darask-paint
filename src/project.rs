@@ -18,7 +18,13 @@ const MAGIC: &[u8; 8] = b"DPAINT\x1a\0";
 /// v10 §47: v2 = AddLayer に visible/opacity、MergeDown に結合結果メタ
 /// (`merged_*`)を追加した符号化。読み込みは v1(v0.7〜v0.9)も受け付ける
 /// (`parse_chunks`/`decode_op` の分岐参照)。
-const VERSION: u16 = 2;
+///
+/// v12 §50.4: v3 = Layer レコードの `reserved u16`(v1/v2 では 0 必須)を
+/// `blend: u8` + `flags: u8`(bit0 = alpha_lock)として**同じ 2 バイトのまま
+/// 再解釈**し、AddLayer/MergeDown の redo 用メタにも同じ 2 バイトを足した
+/// 符号化。後続フィールドのオフセットは v2 から変わらない。書き込みは常に
+/// v3、読み込みは v1/v2/v3 のすべてに対応する。
+const VERSION: u16 = 3;
 const ENDIAN_LITTLE: u8 = 1;
 const HEADER_SIZE: u8 = 16;
 const TILE_SIZE: u32 = 256;
@@ -359,12 +365,59 @@ fn copy_tile(
     Ok(tile)
 }
 
+/// v12 §50.4: Layer レコードの `flags: u8`(bit0 = alpha_lock、他ビットは
+/// 0 必須)。`blend: u8` と合わせて v1/v2 の `reserved u16` と同じ 2 バイトを
+/// 占める(後続フィールドのオフセット不変)。
+const LAYER_FLAG_ALPHA_LOCK: u8 = 0b0000_0001;
+/// 現時点で定義済みのビット全体(これ以外のビットが立っていれば拒否する)。
+const LAYER_FLAGS_KNOWN: u8 = LAYER_FLAG_ALPHA_LOCK;
+
+/// v12 §50.4: レイヤーメタの 2 バイト(blend + flags)を書く。v1/v2 は
+/// `reserved u16 = 0` のまま(旧アプリが読める形)。
+fn put_layer_meta(
+    out: &mut Vec<u8>,
+    blend: crate::document::BlendMode,
+    alpha_lock: bool,
+    version: u16,
+) {
+    if version >= 3 {
+        put_u8(out, blend.to_u8());
+        put_u8(out, if alpha_lock { LAYER_FLAG_ALPHA_LOCK } else { 0 });
+    } else {
+        put_u16(out, 0);
+    }
+}
+
+/// v12 §50.4: レイヤーメタの 2 バイトを読む。v1/v2 は `reserved u16` が 0 で
+/// あることを検証し、通常ブレンド・ロック無しで補完する(ARCHITECTURE.md
+/// §22.8-8: 「非 0 拒否」は必ず version 分岐にすること)。
+fn read_layer_meta(
+    reader: &mut Reader<'_>,
+    version: u16,
+) -> Result<(crate::document::BlendMode, bool), String> {
+    if version >= 3 {
+        let blend = crate::document::BlendMode::from_u8(reader.u8()?)
+            .ok_or_else(|| "レイヤーのブレンドモードが不正です".to_owned())?;
+        let flags = reader.u8()?;
+        if flags & !LAYER_FLAGS_KNOWN != 0 {
+            return Err("レイヤーのフラグが不正です".to_owned());
+        }
+        Ok((blend, flags & LAYER_FLAG_ALPHA_LOCK != 0))
+    } else {
+        if reader.u16()? != 0 {
+            return Err("レイヤーの予約領域が不正です".to_owned());
+        }
+        Ok((crate::document::BlendMode::Normal, false))
+    }
+}
+
 fn encode_layer(
     out: &mut Vec<u8>,
     layer: &Layer,
     width: u32,
     height: u32,
     tiles: &mut TileStore,
+    version: u16,
 ) -> Result<(), String> {
     if layer.pixels.len() != pixel_len(width, height)? {
         return Err("レイヤー画素長が不正です".to_owned());
@@ -386,7 +439,7 @@ fn encode_layer(
     put_string(out, &layer.name)?;
     put_u8(out, u8::from(layer.visible));
     put_u8(out, layer.opacity);
-    put_u16(out, 0);
+    put_layer_meta(out, layer.blend, layer.alpha_lock, version);
     put_u32(out, columns);
     put_u32(out, rows);
     put_u32(out, tile_count);
@@ -407,6 +460,7 @@ fn encode_snapshot(
     out: &mut Vec<u8>,
     snapshot: &DocSnapshot,
     tiles: &mut TileStore,
+    version: u16,
 ) -> Result<(), String> {
     pixel_len(snapshot.width, snapshot.height)?;
     if snapshot.layers.is_empty() || snapshot.layers.len() > MAX_LAYERS {
@@ -421,12 +475,17 @@ fn encode_snapshot(
     put_len(out, snapshot.active, "アクティブレイヤー")?;
     put_len(out, snapshot.layers.len(), "レイヤー数")?;
     for layer in &snapshot.layers {
-        encode_layer(out, layer, snapshot.width, snapshot.height, tiles)?;
+        encode_layer(out, layer, snapshot.width, snapshot.height, tiles, version)?;
     }
     Ok(())
 }
 
-fn encode_document(out: &mut Vec<u8>, doc: &Document, tiles: &mut TileStore) -> Result<(), String> {
+fn encode_document(
+    out: &mut Vec<u8>,
+    doc: &Document,
+    tiles: &mut TileStore,
+    version: u16,
+) -> Result<(), String> {
     pixel_len(doc.width, doc.height)?;
     if doc.layers.is_empty() || doc.layers.len() > MAX_LAYERS || doc.active >= doc.layers.len() {
         return Err("ドキュメントのレイヤー構造が不正です".to_owned());
@@ -437,7 +496,7 @@ fn encode_document(out: &mut Vec<u8>, doc: &Document, tiles: &mut TileStore) -> 
     put_len(out, doc.active, "アクティブレイヤー")?;
     put_len(out, doc.layers.len(), "レイヤー数")?;
     for layer in &doc.layers {
-        encode_layer(out, layer, doc.width, doc.height, tiles)?;
+        encode_layer(out, layer, doc.width, doc.height, tiles, version)?;
     }
     Ok(())
 }
@@ -487,8 +546,10 @@ fn encode_op(
             before_active,
             visible,
             opacity,
+            blend,
+            alpha_lock,
         } => {
-            let encoded_len = 14usize
+            let encoded_len = 16usize
                 .checked_add(name.len())
                 .ok_or_else(|| "レイヤー追加情報が大きすぎます".to_owned())?;
             try_reserve_exact(out, encoded_len, "レイヤー追加情報")?;
@@ -500,6 +561,11 @@ fn encode_op(
             if version >= 2 {
                 put_u8(out, u8::from(*visible));
                 put_u8(out, *opacity);
+                // v12 §50.4(v3): ブレンド + フラグ(Layer レコードと同じ
+                // 2 バイト表現)。v2 以下では書かない。
+                if version >= 3 {
+                    put_layer_meta(out, *blend, *alpha_lock, version);
+                }
             }
         }
         HistoryOp::DuplicateLayer {
@@ -515,7 +581,7 @@ fn encode_op(
             try_reserve_exact(out, 8, "レイヤー履歴情報")?;
             put_len(out, *index, "レイヤー番号")?;
             put_len(out, *before_active, "レイヤー番号")?;
-            encode_layer(out, layer, width, height, tiles)?;
+            encode_layer(out, layer, width, height, tiles, version)?;
         }
         HistoryOp::MoveLayer { from, to } => {
             try_reserve_exact(out, 8, "レイヤー移動情報")?;
@@ -529,21 +595,27 @@ fn encode_op(
             merged_name,
             merged_visible,
             merged_opacity,
+            merged_blend,
+            merged_alpha_lock,
         } => {
-            try_reserve_exact(out, 6, "レイヤー結合情報")?;
+            try_reserve_exact(out, 8, "レイヤー結合情報")?;
             put_len(out, *index, "レイヤー番号")?;
             // v10 §47(v2): 結合結果レイヤーのメタを upper/lower の前に置く。
             if version >= 2 {
                 put_string(out, merged_name)?;
                 put_u8(out, u8::from(*merged_visible));
                 put_u8(out, *merged_opacity);
+                // v12 §50.4(v3): 結合結果のブレンド + フラグ。
+                if version >= 3 {
+                    put_layer_meta(out, *merged_blend, *merged_alpha_lock, version);
+                }
             }
-            encode_layer(out, upper, width, height, tiles)?;
-            encode_layer(out, lower_before, width, height, tiles)?;
+            encode_layer(out, upper, width, height, tiles, version)?;
+            encode_layer(out, lower_before, width, height, tiles, version)?;
         }
         HistoryOp::ReplaceAll { before, after } => {
-            encode_snapshot(out, before, tiles)?;
-            encode_snapshot(out, after, tiles)?;
+            encode_snapshot(out, before, tiles, version)?;
+            encode_snapshot(out, after, tiles, version)?;
         }
     }
     Ok(())
@@ -722,7 +794,7 @@ fn encode_project_payloads(
 
     let mut tiles = TileStore::default();
     let mut document_payload = Vec::new();
-    encode_document(&mut document_payload, doc, &mut tiles)?;
+    encode_document(&mut document_payload, doc, &mut tiles, version)?;
 
     let mut revisions_payload = Vec::new();
     try_reserve_exact(&mut revisions_payload, 8, "履歴ヘッダ")?;
@@ -990,6 +1062,7 @@ fn decode_layer(
     reader: &mut Reader<'_>,
     tiles: &[&[u8]],
     budget: &mut ProjectMemoryBudget,
+    version: u16,
 ) -> Result<(Layer, u32, u32), String> {
     let width = reader.u32()?;
     let height = reader.u32()?;
@@ -1001,7 +1074,9 @@ fn decode_layer(
         _ => return Err("レイヤー表示値が不正です".to_owned()),
     };
     let opacity = reader.u8()?;
-    let reserved = reader.u16()?;
+    // v12 §50.4: v3 は同じ 2 バイトを blend + flags として読む(v1/v2 は
+    // 0 検証のうえ通常/ロック無しで補完)。
+    let (blend, alpha_lock) = read_layer_meta(reader, version)?;
     let columns = reader.u32()?;
     let rows = reader.u32()?;
     let count = reader.u32()?;
@@ -1010,7 +1085,7 @@ fn decode_layer(
         .0
         .checked_mul(expected_grid.1)
         .ok_or_else(|| "タイル数が大きすぎます".to_owned())?;
-    if reserved != 0 || (columns, rows) != expected_grid || count != expected_count {
+    if (columns, rows) != expected_grid || count != expected_count {
         return Err("レイヤーのタイル格子が不正です".to_owned());
     }
     require_minimum_remaining(reader, count as usize, 4, "レイヤータイル参照")?;
@@ -1043,6 +1118,8 @@ fn decode_layer(
             name,
             visible,
             opacity,
+            blend,
+            alpha_lock,
             pixels,
         },
         width,
@@ -1054,6 +1131,7 @@ fn decode_snapshot(
     reader: &mut Reader<'_>,
     tiles: &[&[u8]],
     budget: &mut ProjectMemoryBudget,
+    version: u16,
 ) -> Result<DocSnapshot, String> {
     let width = reader.u32()?;
     let height = reader.u32()?;
@@ -1073,7 +1151,7 @@ fn decode_snapshot(
     let mut layers = Vec::new();
     try_reserve_exact(&mut layers, layer_count, "スナップショットレイヤー")?;
     for _ in 0..layer_count {
-        let (layer, layer_width, layer_height) = decode_layer(reader, tiles, budget)?;
+        let (layer, layer_width, layer_height) = decode_layer(reader, tiles, budget, version)?;
         if (layer_width, layer_height) != (width, height) {
             return Err("レイヤー寸法がドキュメントと一致しません".to_owned());
         }
@@ -1197,18 +1275,26 @@ fn decode_op(
             } else {
                 (true, 255)
             };
+            // v12 §50.4: v3 は追加レイヤーのブレンド/フラグも持つ。
+            let (blend, alpha_lock) = if version >= 3 {
+                read_layer_meta(reader, version)?
+            } else {
+                (crate::document::BlendMode::Normal, false)
+            };
             Ok(HistoryOp::AddLayer {
                 index,
                 before_active,
                 name,
                 visible,
                 opacity,
+                blend,
+                alpha_lock,
             })
         }
         3 | 4 => {
             let index = decode_index(reader)?;
             let before_active = decode_index(reader)?;
-            let (layer, width, height) = decode_layer(reader, tiles, budget)?;
+            let (layer, width, height) = decode_layer(reader, tiles, budget, version)?;
             if (width, height) != dimensions {
                 return Err("履歴レイヤーの寸法が一致しません".to_owned());
             }
@@ -1238,30 +1324,50 @@ fn decode_op(
                 let merged_name = reader.string(budget)?;
                 let merged_visible = decode_bool(reader)?;
                 let merged_opacity = reader.u8()?;
-                Some((merged_name, merged_visible, merged_opacity))
+                // v12 §50.4: v3 は結合結果のブレンド/フラグも持つ。
+                let (merged_blend, merged_alpha_lock) = if version >= 3 {
+                    read_layer_meta(reader, version)?
+                } else {
+                    (crate::document::BlendMode::Normal, false)
+                };
+                Some((
+                    merged_name,
+                    merged_visible,
+                    merged_opacity,
+                    merged_blend,
+                    merged_alpha_lock,
+                ))
             } else {
                 None
             };
-            let (upper, upper_width, upper_height) = decode_layer(reader, tiles, budget)?;
-            let (lower_before, lower_width, lower_height) = decode_layer(reader, tiles, budget)?;
+            let (upper, upper_width, upper_height) = decode_layer(reader, tiles, budget, version)?;
+            let (lower_before, lower_width, lower_height) =
+                decode_layer(reader, tiles, budget, version)?;
             if (upper_width, upper_height) != dimensions
                 || (lower_width, lower_height) != dimensions
             {
                 return Err("結合履歴のレイヤー寸法が一致しません".to_owned());
             }
-            let (merged_name, merged_visible, merged_opacity) = match v2_meta {
-                Some(meta) => meta,
-                None => {
-                    // v1 互換: 旧 redo 実装(`apply_after` の旧ハードコード)と
-                    // 同じ「下レイヤーの名前・表示 ON・不透明度 255」を導出
-                    // する。導出した clone はファイルから読んだ文字列ではない
-                    // ため、復元メモリ会計へ手動で算入する
-                    // (`loaded_project_memory_bytes` 側と対称)。
-                    let derived = lower_before.name.clone();
-                    budget.add_heap_buffer(derived.len())?;
-                    (derived, true, 255)
-                }
-            };
+            let (merged_name, merged_visible, merged_opacity, merged_blend, merged_alpha_lock) =
+                match v2_meta {
+                    Some(meta) => meta,
+                    None => {
+                        // v1 互換: 旧 redo 実装(`apply_after` の旧ハードコード)と
+                        // 同じ「下レイヤーの名前・表示 ON・不透明度 255」を導出
+                        // する。導出した clone はファイルから読んだ文字列ではない
+                        // ため、復元メモリ会計へ手動で算入する
+                        // (`loaded_project_memory_bytes` 側と対称)。
+                        let derived = lower_before.name.clone();
+                        budget.add_heap_buffer(derived.len())?;
+                        (
+                            derived,
+                            true,
+                            255,
+                            crate::document::BlendMode::Normal,
+                            false,
+                        )
+                    }
+                };
             Ok(HistoryOp::MergeDown {
                 index,
                 upper,
@@ -1269,11 +1375,13 @@ fn decode_op(
                 merged_name,
                 merged_visible,
                 merged_opacity,
+                merged_blend,
+                merged_alpha_lock,
             })
         }
         7 => Ok(HistoryOp::ReplaceAll {
-            before: decode_snapshot(reader, tiles, budget)?,
-            after: decode_snapshot(reader, tiles, budget)?,
+            before: decode_snapshot(reader, tiles, budget, version)?,
+            after: decode_snapshot(reader, tiles, budget, version)?,
         }),
         _ => Err("未対応の履歴操作です".to_owned()),
     }
@@ -1593,7 +1701,7 @@ fn decode_project(bytes: &[u8], path: Option<PathBuf>) -> Result<(Document, Hist
     let mut budget = ProjectMemoryBudget::with_encoded_len(bytes.len())?;
     let tiles = decode_tiles(chunks.tiles, meta.tile_count, &mut budget)?;
     let mut document_reader = Reader::new(chunks.document);
-    let snapshot = decode_snapshot(&mut document_reader, &tiles, &mut budget)?;
+    let snapshot = decode_snapshot(&mut document_reader, &tiles, &mut budget, chunks.version)?;
     document_reader.finish("DOCS chunk")?;
     // `Document::try_from_snapshot_owned` が作る合成画像バッファも予算へ含める。
     budget.add_heap_buffer(pixel_len(snapshot.width, snapshot.height)?)?;
@@ -1811,7 +1919,7 @@ pub fn load(path: &Path) -> Result<(Document, History), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Background;
+    use crate::document::{Background, BlendMode};
 
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -1869,6 +1977,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "レイヤーを追加",
         );
@@ -1908,6 +2018,8 @@ mod tests {
                 merged_name: doc.layers[0].name.clone(),
                 merged_visible: doc.layers[0].visible,
                 merged_opacity: doc.layers[0].opacity,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
             },
             "レイヤーの結合",
         );
@@ -1937,6 +2049,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "レイヤーを追加",
         );
@@ -1951,6 +2065,8 @@ mod tests {
                 merged_name: doc.layers[0].name.clone(),
                 merged_visible: true,
                 merged_opacity: 255,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
             },
             "レイヤーの結合",
         );
@@ -1972,6 +2088,213 @@ mod tests {
         assert_eq!(loaded.layers[0].name, "背景", "v1 既定=下レイヤー名");
     }
 
+    // -- v12 §50.4: `.dpaint` v3(blend + flags)-------------------------
+
+    /// 書き込みは常に v3(ヘッダのバイトを直接確認する)。
+    #[test]
+    fn saving_writes_version_three_headers() {
+        let doc = Document::new(2, 2, Background::White);
+        let history = History::new();
+        let encoded = encode_project(&doc, &history).expect("encode");
+        assert_eq!(&encoded[8..10], &3u16.to_le_bytes());
+    }
+
+    /// v3 はレイヤーのブレンド・アルファロックを往復する(現在の文書側)。
+    #[test]
+    fn v3_round_trips_layer_blend_and_alpha_lock() {
+        let mut doc = Document::new(2, 2, Background::White);
+        assert!(doc.add_layer("効果".to_owned()));
+        doc.layers[0].blend = BlendMode::Multiply;
+        doc.layers[0].alpha_lock = true;
+        doc.layers[1].blend = BlendMode::Add;
+        doc.layers[1].alpha_lock = false;
+        let history = History::new();
+
+        let encoded = encode_project(&doc, &history).expect("encode v3");
+        let (loaded, _) = decode_project(&encoded, None).expect("decode v3");
+        assert_eq!(loaded.layers[0].blend, BlendMode::Multiply);
+        assert!(loaded.layers[0].alpha_lock);
+        assert_eq!(loaded.layers[1].blend, BlendMode::Add);
+        assert!(!loaded.layers[1].alpha_lock);
+    }
+
+    /// v3 は AddLayer / MergeDown の redo 用メタ(§50.4)も往復する。
+    #[test]
+    fn v3_round_trip_preserves_blend_and_alpha_lock_edits_across_save_and_redo() {
+        let mut doc = Document::new(2, 2, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("レイヤー 1".to_owned()));
+        history.push(
+            HistoryOp::AddLayer {
+                index: 1,
+                name: "レイヤー 1".to_owned(),
+                before_active: 0,
+                visible: true,
+                opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
+            },
+            "レイヤーを追加",
+        );
+        // 追加後のメタ変更(履歴に積まれない、SPEC §13/§50)。
+        doc.layers[1].blend = BlendMode::Overlay;
+        doc.layers[1].alpha_lock = true;
+        assert!(history.undo(&mut doc));
+
+        let encoded = encode_project(&doc, &history).expect("encode v3");
+        let (mut loaded, mut loaded_history) = decode_project(&encoded, None).expect("decode v3");
+        assert!(loaded_history.redo(&mut loaded), "redo the AddLayer");
+        assert_eq!(loaded.layers[1].blend, BlendMode::Overlay);
+        assert!(loaded.layers[1].alpha_lock);
+    }
+
+    #[test]
+    fn v3_round_trip_preserves_merged_layer_blend_and_alpha_lock() {
+        let mut doc = Document::new(2, 2, Background::White);
+        let mut history = History::new();
+        assert!(doc.add_layer("上".to_owned()));
+        let upper = doc.layers[1].clone();
+        let lower_before = doc.layers[0].clone();
+        assert!(doc.merge_active_down());
+        history.push(
+            HistoryOp::MergeDown {
+                index: 1,
+                upper,
+                lower_before,
+                merged_name: doc.layers[0].name.clone(),
+                merged_visible: true,
+                merged_opacity: 255,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
+            },
+            "レイヤーの結合",
+        );
+        doc.layers[0].blend = BlendMode::Screen;
+        doc.layers[0].alpha_lock = true;
+        assert!(history.undo(&mut doc));
+
+        let encoded = encode_project(&doc, &history).expect("encode v3");
+        let (mut loaded, mut loaded_history) = decode_project(&encoded, None).expect("decode v3");
+        assert!(loaded_history.redo(&mut loaded), "redo the MergeDown");
+        assert_eq!(loaded.layers[0].blend, BlendMode::Screen);
+        assert!(loaded.layers[0].alpha_lock);
+    }
+
+    /// v1/v2 の実バイトは今も読め、ブレンドは「通常」・ロック無しへ補完される
+    /// (旧 reserved u16 = 0 の検証は version 分岐に移した —
+    /// ARCHITECTURE.md §22.8-8)。
+    #[test]
+    fn v1_and_v2_files_load_as_normal_blend_without_alpha_lock() {
+        let mut doc = Document::new(2, 2, Background::White);
+        assert!(doc.add_layer("上".to_owned()));
+        // 現在の文書には v3 でしか表現できないメタが載っているが、
+        // v1/v2 で書けば単に落ちる(旧形式の意味論どおり)。
+        doc.layers[1].blend = BlendMode::Multiply;
+        doc.layers[1].alpha_lock = true;
+        let history = History::new();
+
+        for version in [1u16, 2] {
+            let encoded = encode_project_with_version(&doc, &history, version)
+                .unwrap_or_else(|e| panic!("encode as legacy v{version}: {e}"));
+            assert_eq!(&encoded[8..10], &version.to_le_bytes());
+            let (loaded, _) = decode_project(&encoded, None)
+                .unwrap_or_else(|e| panic!("current loader must accept v{version}: {e}"));
+            assert_eq!(loaded.layers[1].blend, BlendMode::Normal);
+            assert!(!loaded.layers[1].alpha_lock);
+        }
+    }
+
+    /// v3 の `blend` は 0..=4 のみ(範囲外は拒否 — SPEC §50.4)。
+    #[test]
+    fn decoding_rejects_an_out_of_range_blend_value_in_v3() {
+        let doc = Document::new(2, 2, Background::White);
+        let history = History::new();
+        let encoded = encode_project(&doc, &history).expect("encode");
+        let chunks = parse_chunks(&encoded).expect("parse");
+        let mut document = chunks.document.to_vec();
+        let meta_at = layer_meta_offset_in_document(&document);
+        assert_eq!(document[meta_at], 0, "blend=通常 の位置を特定できた");
+        document[meta_at] = 5;
+        let rebuilt = rebuild_with_document(&encoded, &document);
+        let Err(error) = decode_project(&rebuilt, None) else {
+            panic!("blend=5 は拒否されなければならない");
+        };
+        assert!(error.contains("ブレンド"), "unexpected error: {error}");
+    }
+
+    /// v3 の `flags` は bit0(alpha_lock)以外が 0 であること(SPEC §50.4:
+    /// 「v3 内での前方拡張はしない」)。
+    #[test]
+    fn decoding_rejects_unknown_layer_flag_bits_in_v3() {
+        let doc = Document::new(2, 2, Background::White);
+        let history = History::new();
+        let encoded = encode_project(&doc, &history).expect("encode");
+        let chunks = parse_chunks(&encoded).expect("parse");
+        let mut document = chunks.document.to_vec();
+        let flags_at = layer_meta_offset_in_document(&document) + 1;
+        assert_eq!(document[flags_at], 0);
+        document[flags_at] = 0b10;
+        let rebuilt = rebuild_with_document(&encoded, &document);
+        let Err(error) = decode_project(&rebuilt, None) else {
+            panic!("未知のフラグビットは拒否されなければならない");
+        };
+        assert!(error.contains("フラグ"), "unexpected error: {error}");
+
+        // bit0 だけなら受理され、アルファロックとして復元される。
+        let mut ok = chunks.document.to_vec();
+        ok[flags_at] = 0b1;
+        let rebuilt = rebuild_with_document(&encoded, &ok);
+        let (loaded, _) = decode_project(&rebuilt, None).expect("bit0 は正当なフラグ");
+        assert!(loaded.layers[0].alpha_lock);
+    }
+
+    /// v1/v2 の `reserved u16` は今も 0 必須(version 分岐が効いていること)。
+    #[test]
+    fn decoding_rejects_a_non_zero_reserved_field_in_v1() {
+        let doc = Document::new(2, 2, Background::White);
+        let history = History::new();
+        let encoded = encode_project_with_version(&doc, &history, 1).expect("encode v1");
+        let chunks = parse_chunks(&encoded).expect("parse");
+        let mut document = chunks.document.to_vec();
+        let reserved_at = layer_meta_offset_in_document(&document);
+        document[reserved_at] = 1;
+        let rebuilt = rebuild_with_document(&encoded, &document);
+        let Err(error) = decode_project(&rebuilt, None) else {
+            panic!("v1 の reserved != 0 は拒否されなければならない");
+        };
+        assert!(error.contains("予約"), "unexpected error: {error}");
+    }
+
+    /// DOCS chunk 内、最初のレイヤーレコードの blend/flags(旧 reserved u16)の
+    /// 位置。レイアウト: width/height/active/layer_count(16B)+ レイヤー
+    /// (width/height(8B)+ 名前長(4B)+ 名前 + visible(1B)+ opacity(1B))。
+    fn layer_meta_offset_in_document(document: &[u8]) -> usize {
+        let name_len_at = 16 + 8;
+        let name_len = u32::from_le_bytes([
+            document[name_len_at],
+            document[name_len_at + 1],
+            document[name_len_at + 2],
+            document[name_len_at + 3],
+        ]) as usize;
+        name_len_at + 4 + name_len + 2
+    }
+
+    /// DOCS chunk を差し替えて CRC を引き直す(`rebuild_with_revisions` の
+    /// DOCS 版)。
+    fn rebuild_with_document(encoded: &[u8], document: &[u8]) -> Vec<u8> {
+        let chunks = parse_chunks(encoded).expect("parse");
+        let mut out = encoded[..16].to_vec();
+        for (tag, payload) in [
+            (CHUNK_META, chunks.meta),
+            (CHUNK_TILES, chunks.tiles),
+            (CHUNK_DOCUMENT, document),
+            (CHUNK_REVISIONS, chunks.revisions),
+        ] {
+            append_chunk(&mut out, tag, payload).expect("append");
+        }
+        out
+    }
+
     #[test]
     fn decoding_rejects_an_invalid_bool_flag_in_v2() {
         let mut doc = Document::new(2, 2, Background::White);
@@ -1984,6 +2307,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "追加",
         );
@@ -2118,6 +2443,8 @@ mod tests {
             name: "上レイヤー".to_owned(),
             visible: false,
             opacity: 123,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
             pixels: vec![0; 4 * 3 * 4],
         });
         doc.active = 1;
@@ -2239,6 +2566,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "追加",
         );
@@ -2303,6 +2632,8 @@ mod tests {
             name: merged_name.clone(),
             visible: true,
             opacity: 255,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
             pixels: merged,
         };
         doc.layers.remove(1);
@@ -2317,6 +2648,8 @@ mod tests {
                 merged_name,
                 merged_visible: true,
                 merged_opacity: 255,
+                merged_blend: BlendMode::Normal,
+                merged_alpha_lock: false,
             },
             "結合",
         );
@@ -2348,6 +2681,8 @@ mod tests {
                 before_active: 0,
                 visible: true,
                 opacity: 255,
+                blend: BlendMode::Normal,
+                alpha_lock: false,
             },
             "追加",
         );

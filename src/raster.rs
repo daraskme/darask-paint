@@ -33,6 +33,17 @@ pub struct Surface<'a> {
     /// 自動的にクリップに従う。`None` なら従来どおり(ARCHITECTURE.md
     /// §16.10-2: 「選択が無いときのコストがゼロであること」)。
     pub clip: Option<&'a SelMask>,
+    /// v12 §50.3: アルファロック(透明部分の保護)。`clip` と全く同じ設計で、
+    /// **書き込みの唯一の集約点である `set_pixel` だけがこれを見る** ため、
+    /// ブラシ/鉛筆/消しゴム/図形/グラデーション/色調補正など `set_pixel` 経由で
+    /// 書くすべての経路が自動的にロックへ従う(`flood_fill` の行スライス
+    /// 直書きだけは別途 alpha-aware にしてある)。
+    ///
+    /// `Document::active_surface_mut` がアクティブレイヤーの
+    /// `Layer::alpha_lock` をそのまま渡す。浮動片の確定合成・貼り付け・
+    /// テキスト確定は `Surface` ではなく `Document::set_pixel` を通るため、
+    /// SPEC §50.3 の「適用しない」がそのまま成立する。
+    pub alpha_lock: bool,
 }
 
 impl<'a> Surface<'a> {
@@ -51,6 +62,22 @@ impl<'a> Surface<'a> {
 
     /// `(x, y)` にピクセル値を書く。範囲外、または `clip` があってその画素が
     /// 選択されていなければ何もしない(パニックしない)。
+    ///
+    /// v12 §50.3(アルファロック): `alpha_lock` が立っているときは
+    /// - 書き込み先の α が 0 の画素 → **RGBA とも完全に不変**(何も書かない。
+    ///   「書いてから α を戻す」と透明画素の RGB が汚れるため、
+    ///   ARCHITECTURE.md §22.8-3 でこの実装は禁止されている)、
+    /// - α が 0 より大きい画素 → **α は元の値のまま**、RGB だけを書く。
+    ///
+    /// `set_pixel` は「画素を `color` で**置き換える**」経路(図形の塗り・
+    /// 色調補正・浮動片以外の一括代入など)専用。ロック時はカバレッジ 1 の
+    /// 補間、すなわち RGB を丸ごと `color` の RGB にするのが置き換えの
+    /// 忠実な対応物になる(ロック無しでも RGB は `color` になる)。
+    ///
+    /// 部分カバレッジで**合成**する経路(ブラシ/鉛筆のスタンプ・
+    /// グラデーション)は `blend_pixel` を使うこと — こちらは source-over の
+    /// 結果 RGB(比率が `dst_a` に依存する)ではなく、SPEC §50.3 が要求する
+    /// 「RGB のみカバレッジ補間」を行う。
     pub fn set_pixel(&mut self, x: i32, y: i32, color: [u8; 4]) {
         if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
             return;
@@ -62,8 +89,58 @@ impl<'a> Surface<'a> {
         }
         let idx = (y as usize * self.width as usize + x as usize) * 4;
         if let Some(slice) = self.pixels.get_mut(idx..idx + 4) {
+            if self.alpha_lock {
+                if slice[3] == 0 {
+                    return;
+                }
+                slice[0..3].copy_from_slice(&color[0..3]);
+                return;
+            }
             slice.copy_from_slice(&color);
         }
+    }
+
+    /// 部分カバレッジの合成書き込み(ブラシ/鉛筆のスタンプ・グラデーションの
+    /// 共通経路)。`base` は「合成の土台にする画素」(ストローク開始前の
+    /// 元画素)、`src_rgb`/`coverage`(0.0–1.0、ブラシ不透明度・ソース色の α を
+    /// 掛け込んだ**実効カバレッジ**)が塗る色と被覆率。
+    ///
+    /// - アルファロック無し: 従来どおり `blend_over(base, [src_rgb, coverage])`
+    ///   の結果をそのまま書く(v11 までと 1 バイトも変わらない)。
+    /// - アルファロック有り(SPEC §50.3): `dst_a == 0` は**計算前にスキップ**、
+    ///   それ以外は α を元値のまま固定し
+    ///   `out_rgb = dst_rgb + coverage × (src_rgb − dst_rgb)` を書く。
+    ///   source-over の結果 RGB は `dst_a` に依存して塗り色へ寄る度合いが
+    ///   変わってしまうため、ロック時に流用してはいけない(同じ RGB で α だけ
+    ///   違う 2 画素に同じカバレッジで塗ったとき、結果 RGB が食い違う)。
+    pub fn blend_pixel(&mut self, x: i32, y: i32, base: [u8; 4], src_rgb: [u8; 3], coverage: f32) {
+        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return;
+        }
+        if let Some(clip) = self.clip {
+            if !clip.contains(x, y) {
+                return;
+            }
+        }
+        let idx = (y as usize * self.width as usize + x as usize) * 4;
+        let Some(slice) = self.pixels.get_mut(idx..idx + 4) else {
+            return;
+        };
+        if self.alpha_lock {
+            if slice[3] == 0 {
+                return;
+            }
+            let coverage = coverage.clamp(0.0, 1.0);
+            for c in 0..3 {
+                let dst = base[c] as f32;
+                let value = dst + coverage * (src_rgb[c] as f32 - dst);
+                slice[c] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            return;
+        }
+        let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let blended = blend_over(base, [src_rgb[0], src_rgb[1], src_rgb[2], alpha]);
+        slice.copy_from_slice(&blended);
     }
 
     /// `flood_fill` の `before_write` コールバックが CoW タイル退避のために
@@ -542,9 +619,22 @@ pub fn flood_fill(
         }
         let byte_start = span_start * 4;
         let byte_len = span_len * 4;
+        let alpha_lock = surface.alpha_lock;
         if let Some(row) = surface.pixels.get_mut(byte_start..byte_start + byte_len) {
-            for px in row.chunks_exact_mut(4) {
-                px.copy_from_slice(&color);
+            // v12 §50.3: 塗りつぶしは `set_pixel` を通らない直接代入なので、
+            // ここで同じアルファロック規則(α=0 は完全不変・それ以外は α 固定
+            // で RGB のみ)を実装する。ロック無しは従来どおりの一括代入。
+            if alpha_lock {
+                for px in row.chunks_exact_mut(4) {
+                    if px[3] == 0 {
+                        continue;
+                    }
+                    px[0..3].copy_from_slice(&color[0..3]);
+                }
+            } else {
+                for px in row.chunks_exact_mut(4) {
+                    px.copy_from_slice(&color);
+                }
             }
         }
         bounds = Some(match bounds {
@@ -849,6 +939,124 @@ pub fn adjust_hsl_pixel(px: [u8; 4], dh: i32, ds: i32, dl: i32) -> [u8; 4] {
     [r, g, b, px[3]]
 }
 
+// ---------------------------------------------------------------------------
+// v12 §50.1: レイヤーサムネイルの縮小(ui/layers_panel.rs が使う純関数)
+// ---------------------------------------------------------------------------
+
+/// サムネイルに焼き込む市松模様の 1 マス(サムネイル画素単位)。
+const THUMBNAIL_CHECKER_CELL: u32 = 4;
+/// 市松の明色・暗色(`canvas_view::draw_checkerboard` と同じ階調)。
+const THUMBNAIL_CHECKER_LIGHT: [u8; 3] = [205, 205, 205];
+const THUMBNAIL_CHECKER_DARK: [u8; 3] = [165, 165, 165];
+
+/// 1 出力画素あたりに読む元画素の最大数(軸ごと)。
+///
+/// box 平均は本来セル内の全画素を読むが、それでは 8192×8192 のレイヤー 1 枚の
+/// サムネイル 1 枚に 6700 万画素の読み出しが必要になり、ストローク確定のたびに
+/// 数百 ms の停止を招く(SPEC §0 の軽さ・§50.1 の「毎フレーム禁止」の趣旨に
+/// 反する)。セル内を等間隔に間引いて最大 8×8=64 点の平均にすることで、
+/// 元画像の大きさによらず 1 枚あたりの計算量を `tw*th*64` 以下に抑える。
+/// セルが 8 画素以下(= 40×30 のサムネイルなら 320×240 までの元画像)の
+/// ときは間引きが起きず、厳密な box 平均と完全に一致する。
+const THUMBNAIL_MAX_SAMPLES_PER_AXIS: u32 = 8;
+
+/// SPEC §50.1: レイヤーサムネイル用の縮小(box 平均・縦横比維持・市松下地の
+/// 焼き込み)。戻り値は `(tw, th, RGBA バイト列)` で、α は常に 255
+/// (市松を焼き込み済みなので、テクスチャ側で透明合成する必要がない)。
+///
+/// - 拡大はしない(元が `max_w`×`max_h` 以下ならそのままの寸法)。
+/// - 平均は premultiplied で行い(半透明画素の RGB が過大評価されない)、
+///   出力直前に straight へ戻してから市松の上に載せる。
+/// - `pixels` の長さが足りない・寸法が 0 のときは空(`(0, 0, vec![])`)を返す
+///   (パニックしない、CLAUDE.md 鉄則)。
+pub fn thumbnail_rgba(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    max_w: u32,
+    max_h: u32,
+) -> (u32, u32, Vec<u8>) {
+    let empty = (0, 0, Vec::new());
+    if width == 0 || height == 0 || max_w == 0 || max_h == 0 {
+        return empty;
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(4));
+    if expected.is_none_or(|len| pixels.len() < len) {
+        return empty;
+    }
+
+    // 縦横比を保ったまま max_w×max_h に収める(拡大はしない)。
+    let (tw, th) = if width <= max_w && height <= max_h {
+        (width, height)
+    } else {
+        let scale = (max_w as f32 / width as f32).min(max_h as f32 / height as f32);
+        (
+            ((width as f32 * scale).round() as u32).clamp(1, max_w),
+            ((height as f32 * scale).round() as u32).clamp(1, max_h),
+        )
+    };
+
+    let mut out = vec![0u8; tw as usize * th as usize * 4];
+    let w = width as u64;
+    let h = height as u64;
+    for oy in 0..th {
+        let y0 = (oy as u64 * h / th as u64) as u32;
+        let y1 = (((oy as u64 + 1) * h / th as u64) as u32)
+            .max(y0 + 1)
+            .min(height);
+        let step_y = ((y1 - y0) / THUMBNAIL_MAX_SAMPLES_PER_AXIS).max(1);
+        for ox in 0..tw {
+            let x0 = (ox as u64 * w / tw as u64) as u32;
+            let x1 = (((ox as u64 + 1) * w / tw as u64) as u32)
+                .max(x0 + 1)
+                .min(width);
+            let step_x = ((x1 - x0) / THUMBNAIL_MAX_SAMPLES_PER_AXIS).max(1);
+
+            let mut sum = [0f32; 3];
+            let mut sum_a = 0f32;
+            let mut count = 0f32;
+            let mut y = y0;
+            while y < y1 {
+                let row = y as usize * width as usize;
+                let mut x = x0;
+                while x < x1 {
+                    let idx = (row + x as usize) * 4;
+                    if let Some(px) = pixels.get(idx..idx + 4) {
+                        let a = px[3] as f32 / 255.0;
+                        sum[0] += px[0] as f32 * a;
+                        sum[1] += px[1] as f32 * a;
+                        sum[2] += px[2] as f32 * a;
+                        sum_a += a;
+                    }
+                    count += 1.0;
+                    x += step_x;
+                }
+                y += step_y;
+            }
+
+            let alpha = if count > 0.0 { sum_a / count } else { 0.0 };
+            let checker = if ((ox / THUMBNAIL_CHECKER_CELL) + (oy / THUMBNAIL_CHECKER_CELL))
+                .is_multiple_of(2)
+            {
+                THUMBNAIL_CHECKER_LIGHT
+            } else {
+                THUMBNAIL_CHECKER_DARK
+            };
+            let out_idx = (oy as usize * tw as usize + ox as usize) * 4;
+            for c in 0..3 {
+                // premultiplied 平均 → straight へ戻す → 市松の上に載せる。
+                let straight = if sum_a > 0.0 { sum[c] / sum_a } else { 0.0 };
+                let value = straight * alpha + checker[c] as f32 * (1.0 - alpha);
+                out[out_idx + c] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            out[out_idx + 3] = 255;
+        }
+    }
+    (tw, th, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +1086,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stamp_round(&mut s, 10.0, 10.0, 3.0, [255, 0, 0, 255], false);
         assert_eq!(s.get_pixel(10, 10), Some([255, 0, 0, 255]));
@@ -891,6 +1100,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let (cx, cy, r) = (20.0, 20.0, 5.0);
         stamp_round(&mut s, cx, cy, r, [255, 0, 0, 255], false);
@@ -909,6 +1119,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stamp_round(&mut s, 5.0, 5.0, 2.0, [0, 0, 0, 0], true);
         assert_eq!(s.get_pixel(5, 5), Some([0, 0, 0, 0]));
@@ -922,6 +1133,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         // 画像外の中心・画像の四隅すべてで OOB 書き込みが起きないこと。
         stamp_round(&mut s, -5.0, -5.0, 4.0, [1, 2, 3, 4], false);
@@ -939,6 +1151,7 @@ mod tests {
             height: 0,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stamp_round(&mut s, 0.0, 0.0, 3.0, [1, 2, 3, 4], false);
         assert_eq!(buf.len(), 0);
@@ -952,6 +1165,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let touched = stamp_round(&mut s, 10.0, 10.0, 3.0, [255, 0, 0, 255], false);
         assert!(!touched.is_empty());
@@ -972,6 +1186,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
         let neighbors = [(9, 9), (10, 9), (9, 10), (10, 10)];
@@ -993,6 +1208,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stamp_round(&mut s, 10.0, 10.0, 0.5, [255, 0, 0, 255], false);
         assert_eq!(s.get_pixel(13, 10), Some([0, 0, 0, 0]));
@@ -1019,6 +1235,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stroke_segment(&mut s, (5.0, 5.0), (30.0, 30.0), 2.0, [1, 2, 3, 4], false);
         assert_eq!(s.get_pixel(5, 5), Some([1, 2, 3, 4]));
@@ -1033,6 +1250,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stroke_segment(&mut s, (0.0, 5.0), (59.0, 5.0), 3.0, [1, 2, 3, 4], false);
         for x in 0..60 {
@@ -1048,6 +1266,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stroke_segment(&mut s, (5.0, 5.0), (5.0, 5.0), 2.0, [9, 9, 9, 9], false);
         assert_eq!(s.get_pixel(5, 5), Some([9, 9, 9, 9]));
@@ -1061,6 +1280,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         stroke_segment(
             &mut s,
@@ -1081,6 +1301,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let touched = stroke_segment(&mut s, (5.0, 5.0), (30.0, 20.0), 2.0, [1, 2, 3, 4], false);
         let expected = segment_bounds((5.0, 5.0), (30.0, 20.0), 2.0).clamp_to(40, 40);
@@ -1207,6 +1428,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         draw_rect_outline(&mut s, (5.0, 5.0, 30.0, 20.0), 2.0, [255, 0, 0, 255]);
         // 4 辺の中点付近が塗られていること。
@@ -1226,6 +1448,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         fill_rect(&mut s, (5.0, 5.0, 10.0, 10.0), [1, 2, 3, 4]);
         assert_eq!(s.get_pixel(7, 7), Some([1, 2, 3, 4]));
@@ -1241,6 +1464,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         fill_rect(&mut s, (10.0, 10.0, 5.0, 5.0), [1, 2, 3, 4]);
         assert_eq!(s.get_pixel(7, 7), Some([1, 2, 3, 4]));
@@ -1254,6 +1478,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         draw_rect_outline(&mut s, (-20.0, -20.0, 50.0, 50.0), 4.0, [1, 2, 3, 4]);
         fill_rect(&mut s, (-20.0, -20.0, 50.0, 50.0), [1, 2, 3, 4]);
@@ -1270,6 +1495,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         fill_ellipse(&mut s, (5.0, 5.0, 35.0, 35.0), [9, 9, 9, 255]);
         assert_eq!(s.get_pixel(20, 20), Some([9, 9, 9, 255]));
@@ -1285,6 +1511,7 @@ mod tests {
             height: 40,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         draw_ellipse_outline(&mut s, (5.0, 5.0, 35.0, 35.0), 2.0, [9, 9, 9, 255]);
         // 中心付近は塗られていない(枠線のみ)。
@@ -1301,6 +1528,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         draw_ellipse_outline(&mut s, (2.0, 10.0, 18.0, 10.0), 2.0, [1, 2, 3, 4]);
         assert_eq!(buf.len(), 20 * 20 * 4);
@@ -1317,6 +1545,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         for y in 0..10 {
             s.set_pixel(5, y, [0, 0, 0, 255]);
@@ -1339,6 +1568,7 @@ mod tests {
             height: 1,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         s.set_pixel(2, 0, [240, 240, 240, 255]); // 白との差 15
         s.set_pixel(3, 0, [200, 200, 200, 255]); // 白との差 55
@@ -1359,6 +1589,7 @@ mod tests {
             height: 4,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let touched = flood_fill(&mut s, 0, 0, [255, 255, 255, 255], 0, |_, _| {});
         assert_eq!(buf, before);
@@ -1373,6 +1604,7 @@ mod tests {
             height: 4,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         flood_fill(&mut s, -1, -1, [1, 2, 3, 4], 0, |_, _| {});
         flood_fill(&mut s, 100, 100, [1, 2, 3, 4], 0, |_, _| {});
@@ -1387,6 +1619,7 @@ mod tests {
             height: 0,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
         assert_eq!(buf.len(), 0);
@@ -1400,6 +1633,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let touched = flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
         assert_eq!(
@@ -1422,6 +1656,7 @@ mod tests {
             height: 1,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let mut snapshots: Vec<Vec<[u8; 4]>> = Vec::new();
         flood_fill(&mut s, 0, 0, [1, 2, 3, 255], 0, |surf, rect| {
@@ -1451,6 +1686,7 @@ mod tests {
             height: 4000,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let start = std::time::Instant::now();
         flood_fill(&mut s, 0, 0, [1, 2, 3, 4], 0, |_, _| {});
@@ -1487,6 +1723,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: Some(&clip),
+            alpha_lock: false,
         };
         s.set_pixel(2, 2, [1, 2, 3, 255]); // クリップ内。
         s.set_pixel(7, 2, [9, 9, 9, 255]); // クリップ外。
@@ -1508,6 +1745,7 @@ mod tests {
             height: 4,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         s.set_pixel(3, 3, [7, 7, 7, 255]);
         assert_eq!(s.get_pixel(3, 3), Some([7, 7, 7, 255]));
@@ -1531,6 +1769,7 @@ mod tests {
             height: 20,
             pixels: &mut buf,
             clip: Some(&clip),
+            alpha_lock: false,
         };
         // 中心をクリップ境界(x=10)にまたがせて描く。
         stamp_round(&mut s, 10.0, 10.0, 5.0, [255, 0, 0, 255], false);
@@ -1565,6 +1804,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: Some(&clip),
+            alpha_lock: false,
         };
         let touched = flood_fill(&mut s, 0, 0, [1, 2, 3, 255], 0, |_, _| {});
         assert_eq!(s.get_pixel(0, 0), Some([1, 2, 3, 255]));
@@ -1597,6 +1837,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: Some(&clip),
+            alpha_lock: false,
         };
         // (7, 0) はクリップ外。
         let touched = flood_fill(&mut s, 7, 0, [1, 2, 3, 255], 0, |_, _| {});
@@ -1631,6 +1872,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let mask = flood_mask(&s, 0, 0, 0);
         assert_eq!(
@@ -1658,6 +1900,7 @@ mod tests {
             height: 1,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         // tolerance 10: (2,0) の差 20 は許容値を超えるので選択は途切れる。
         let strict = flood_mask(&s, 0, 0, 10);
@@ -1679,6 +1922,7 @@ mod tests {
             height: 4,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         assert!(flood_mask(&s, -1, -1, 0).is_empty());
         assert!(flood_mask(&s, 100, 100, 0).is_empty());
@@ -1692,6 +1936,7 @@ mod tests {
             height: 0,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         assert!(flood_mask(&s, 0, 0, 0).is_empty());
     }
@@ -1713,6 +1958,7 @@ mod tests {
             height: 10,
             pixels: &mut buf,
             clip: Some(&clip),
+            alpha_lock: false,
         };
         let mask = flood_mask(&s, 0, 0, 0);
         assert!(mask.contains(4, 9));
@@ -1733,6 +1979,7 @@ mod tests {
             height: 6,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let _ = flood_mask(&s, 0, 0, 0);
         assert_eq!(buf, original);
@@ -1753,6 +2000,7 @@ mod tests {
             height: h as u32,
             pixels: &mut buf,
             clip: None,
+            alpha_lock: false,
         };
         let start = std::time::Instant::now();
         let mask = flood_mask(&s, 0, 0, 0);
@@ -1974,6 +2222,303 @@ mod tests {
     fn adjust_hsl_pixel_preserves_alpha() {
         let out = adjust_hsl_pixel([10, 20, 30, 44], 45, 10, -10);
         assert_eq!(out[3], 44);
+    }
+
+    // -- v12 §50.3: アルファロック(透明部分の保護)----------------------
+
+    /// `set_pixel` は書き込みの唯一の集約点なので、ここが正しければ
+    /// ブラシ/鉛筆/図形/グラデーション/色調補正のすべてが従う。
+    #[test]
+    fn alpha_lock_skips_fully_transparent_pixels_entirely() {
+        let mut buf = make_buffer(2, 1, [0, 0, 0, 0]);
+        buf[4..8].copy_from_slice(&[10, 20, 30, 128]); // (1,0) は半透明。
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        s.set_pixel(0, 0, [200, 200, 200, 255]);
+        assert_eq!(
+            s.get_pixel(0, 0),
+            Some([0, 0, 0, 0]),
+            "dst_a==0 は RGBA とも完全不変(RGB を汚さない)"
+        );
+        s.set_pixel(1, 0, [200, 210, 220, 255]);
+        assert_eq!(
+            s.get_pixel(1, 0),
+            Some([200, 210, 220, 128]),
+            "dst_a>0 は α を保ったまま RGB だけ書く"
+        );
+    }
+
+    #[test]
+    fn alpha_lock_off_writes_rgba_exactly_as_before() {
+        let mut buf = make_buffer(1, 1, [0, 0, 0, 0]);
+        let mut s = Surface {
+            width: 1,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: false,
+        };
+        s.set_pixel(0, 0, [200, 210, 220, 255]);
+        assert_eq!(s.get_pixel(0, 0), Some([200, 210, 220, 255]));
+    }
+
+    #[test]
+    fn alpha_lock_combines_with_the_selection_clip() {
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 1,
+                y1: 1,
+            },
+            mask: vec![255u8],
+        };
+        let mut buf = make_buffer(2, 1, [5, 5, 5, 200]);
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: Some(&clip),
+            alpha_lock: true,
+        };
+        s.set_pixel(0, 0, [1, 2, 3, 255]);
+        s.set_pixel(1, 0, [1, 2, 3, 255]);
+        assert_eq!(s.get_pixel(0, 0), Some([1, 2, 3, 200]));
+        assert_eq!(s.get_pixel(1, 0), Some([5, 5, 5, 200]), "クリップ外は不変");
+    }
+
+    /// SPEC §50.3: 「塗りつぶしの直接書き込み経路も alpha-aware に変更する」。
+    #[test]
+    fn flood_fill_is_alpha_aware_when_the_layer_is_alpha_locked() {
+        // 左半分だけ不透明な帯。塗りつぶしは全域(許容値 255 で連結)を
+        // 走査するが、透明画素は 1 バイトも変えてはいけない。
+        let mut buf = make_buffer(4, 1, [0, 0, 0, 0]);
+        for x in 0..2 {
+            buf[x * 4..x * 4 + 4].copy_from_slice(&[0, 0, 0, 255]);
+        }
+        let mut s = Surface {
+            width: 4,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        flood_fill(&mut s, 0, 0, [255, 0, 0, 255], 255, |_, _| {});
+        assert_eq!(s.get_pixel(0, 0), Some([255, 0, 0, 255]));
+        assert_eq!(s.get_pixel(1, 0), Some([255, 0, 0, 255]));
+        assert_eq!(
+            s.get_pixel(2, 0),
+            Some([0, 0, 0, 0]),
+            "透明画素は RGBA とも不変"
+        );
+        assert_eq!(s.get_pixel(3, 0), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn flood_fill_preserves_alpha_of_semi_transparent_pixels_when_locked() {
+        let mut buf = make_buffer(2, 1, [10, 10, 10, 100]);
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        flood_fill(&mut s, 0, 0, [1, 2, 3, 255], 0, |_, _| {});
+        assert_eq!(s.get_pixel(0, 0), Some([1, 2, 3, 100]));
+        assert_eq!(s.get_pixel(1, 0), Some([1, 2, 3, 100]));
+    }
+
+    /// v12 §50.3(追いレビュー①): ロック時の RGB は**カバレッジ補間**で
+    /// あり、source-over の結果 RGB(比率が `dst_a` に依存する)ではない。
+    /// 同じ RGB で α だけ違う 2 画素に同じカバレッジで塗ったら、出力 RGB は
+    /// 一致し、α はそれぞれ元の値のまま残らなければならない。
+    #[test]
+    fn alpha_lock_interpolates_rgb_by_coverage_independently_of_dst_alpha() {
+        let mut buf = make_buffer(2, 1, [100, 100, 100, 0]);
+        buf[3] = 64;
+        buf[7] = 192;
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        let src_rgb = [200, 0, 0];
+        s.blend_pixel(0, 0, [100, 100, 100, 64], src_rgb, 0.5);
+        s.blend_pixel(1, 0, [100, 100, 100, 192], src_rgb, 0.5);
+
+        // 100 + 0.5*(200-100) = 150 / 100 + 0.5*(0-100) = 50
+        assert_eq!(s.get_pixel(0, 0), Some([150, 50, 50, 64]));
+        assert_eq!(s.get_pixel(1, 0), Some([150, 50, 50, 192]));
+
+        // 参考: source-over の結果 RGB を流用していた旧実装だと、この 2 画素の
+        // RGB は一致しない(dst_a に依存して塗り色へ寄る度合いが変わる)。
+        let over_low = blend_over([100, 100, 100, 64], [200, 0, 0, 128]);
+        let over_high = blend_over([100, 100, 100, 192], [200, 0, 0, 128]);
+        assert_ne!(over_low[0], over_high[0]);
+    }
+
+    #[test]
+    fn alpha_lock_blend_pixel_skips_transparent_and_clamps_coverage() {
+        let mut buf = make_buffer(3, 1, [10, 20, 30, 0]);
+        buf[7] = 255; // (1,0) は不透明。
+        buf[11] = 128; // (2,0) は半透明。
+        let mut s = Surface {
+            width: 3,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        s.blend_pixel(0, 0, [10, 20, 30, 0], [255, 255, 255], 1.0);
+        assert_eq!(
+            s.get_pixel(0, 0),
+            Some([10, 20, 30, 0]),
+            "dst_a==0 は計算前にスキップ(RGB を汚さない)"
+        );
+        s.blend_pixel(1, 0, [10, 20, 30, 255], [255, 255, 255], 2.0);
+        assert_eq!(
+            s.get_pixel(1, 0),
+            Some([255, 255, 255, 255]),
+            "カバレッジは 0..1 にクランプされる"
+        );
+        s.blend_pixel(2, 0, [10, 20, 30, 128], [255, 255, 255], 0.0);
+        assert_eq!(
+            s.get_pixel(2, 0),
+            Some([10, 20, 30, 128]),
+            "カバレッジ 0 は元色のまま"
+        );
+    }
+
+    /// ロックが無いときの `blend_pixel` は従来の `blend_over` と 1 バイトも
+    /// 変わらない(ブラシ・グラデーションの既存挙動の回帰)。
+    #[test]
+    fn blend_pixel_without_alpha_lock_matches_blend_over_exactly() {
+        for base in [[10u8, 200, 30, 255], [0, 0, 0, 0], [90, 90, 90, 128]] {
+            for src in [[200u8, 20, 60, 255], [200, 20, 60, 128], [1, 2, 3, 0]] {
+                let mut buf = base.to_vec();
+                let mut s = Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: &mut buf,
+                    clip: None,
+                    alpha_lock: false,
+                };
+                s.blend_pixel(0, 0, base, [src[0], src[1], src[2]], src[3] as f32 / 255.0);
+                assert_eq!(
+                    s.get_pixel(0, 0),
+                    Some(blend_over(base, src)),
+                    "base={base:?} src={src:?}"
+                );
+            }
+        }
+    }
+
+    // -- v12 §50.1: サムネイル縮小(`thumbnail_rgba`)---------------------
+
+    #[test]
+    fn thumbnail_keeps_aspect_ratio_and_never_upscales() {
+        let (tw, th, _) = thumbnail_rgba(&make_buffer(80, 60, [0, 0, 0, 255]), 80, 60, 40, 30);
+        assert_eq!((tw, th), (40, 30));
+        // 横長: 幅が上限に張り付き、高さは比率で決まる。
+        let (tw, th, _) = thumbnail_rgba(&make_buffer(400, 100, [0, 0, 0, 255]), 400, 100, 40, 30);
+        assert_eq!((tw, th), (40, 10));
+        // 縦長: 高さが上限に張り付く。
+        let (tw, th, _) = thumbnail_rgba(&make_buffer(100, 400, [0, 0, 0, 255]), 100, 400, 40, 30);
+        assert_eq!((tw, th), (8, 30));
+        // 小さい画像は拡大しない。
+        let (tw, th, _) = thumbnail_rgba(&make_buffer(5, 4, [0, 0, 0, 255]), 5, 4, 40, 30);
+        assert_eq!((tw, th), (5, 4));
+    }
+
+    #[test]
+    fn thumbnail_of_an_opaque_flat_color_is_that_color_everywhere() {
+        let (tw, th, out) = thumbnail_rgba(&make_buffer(64, 64, [12, 34, 56, 255]), 64, 64, 40, 30);
+        assert_eq!((tw, th), (30, 30));
+        assert!(out.chunks_exact(4).all(|p| p == [12, 34, 56, 255]));
+    }
+
+    #[test]
+    fn thumbnail_of_a_fully_transparent_layer_is_the_checkerboard() {
+        let (tw, th, out) = thumbnail_rgba(&make_buffer(8, 8, [9, 9, 9, 0]), 8, 8, 40, 30);
+        assert_eq!((tw, th), (8, 8));
+        // 市松の 2 色だけが現れ、α は常に 255(下地を焼き込み済み)。
+        assert!(out.chunks_exact(4).all(|p| p[3] == 255));
+        assert_eq!(&out[0..3], &THUMBNAIL_CHECKER_LIGHT);
+        let idx = THUMBNAIL_CHECKER_CELL as usize * 4;
+        assert_eq!(&out[idx..idx + 3], &THUMBNAIL_CHECKER_DARK);
+    }
+
+    #[test]
+    fn thumbnail_averages_the_source_box_exactly_for_small_images() {
+        // 2×2 → 1×1 は 4 画素の平均そのもの(間引きが起きない寸法)。
+        let mut buf = Vec::new();
+        for px in [
+            [0u8, 0, 0, 255],
+            [100, 100, 100, 255],
+            [200, 200, 200, 255],
+            [255, 255, 255, 255],
+        ] {
+            buf.extend_from_slice(&px);
+        }
+        let (tw, th, out) = thumbnail_rgba(&buf, 2, 2, 1, 1);
+        assert_eq!((tw, th), (1, 1));
+        let expected = ((100 + 200 + 255) as f32 / 4.0).round() as u8;
+        assert_eq!(out[0], expected);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn thumbnail_average_is_alpha_weighted() {
+        // 透明画素の RGB は結果に寄与しない(premultiplied 平均)。
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[255u8, 0, 0, 255]);
+        buf.extend_from_slice(&[0, 255, 0, 0]);
+        let (_, _, out) = thumbnail_rgba(&buf, 2, 1, 1, 1);
+        // α は 0.5、RGB は赤のまま → 市松と半々で合成される。
+        let checker = THUMBNAIL_CHECKER_LIGHT[0] as f32;
+        let expected_r = (255.0 * 0.5 + checker * 0.5).round() as u8;
+        assert_eq!(out[0], expected_r);
+        // 緑は「透明画素の 255」ではなく 0(寄与なし)と市松の合成になる。
+        let expected_g = (0.0 * 0.5 + checker * 0.5).round() as u8;
+        assert_eq!(out[1], expected_g, "透明な緑は混ざらない");
+    }
+
+    #[test]
+    fn thumbnail_rejects_degenerate_inputs_without_panicking() {
+        assert_eq!(thumbnail_rgba(&[], 0, 0, 40, 30), (0, 0, Vec::new()));
+        assert_eq!(
+            thumbnail_rgba(&[1, 2, 3, 4], 4, 4, 40, 30),
+            (0, 0, Vec::new()),
+            "画素長が寸法に足りない入力は空を返す"
+        );
+        assert_eq!(
+            thumbnail_rgba(&make_buffer(4, 4, [0, 0, 0, 0]), 4, 4, 0, 30),
+            (0, 0, Vec::new())
+        );
+    }
+
+    /// 巨大なレイヤーでもサムネイル 1 枚の計算量が有界であること
+    /// (間引き上限。SPEC §50.1「毎フレーム禁止」= 1 枚が重すぎてもいけない)。
+    #[test]
+    fn thumbnail_of_a_huge_layer_is_fast() {
+        let buf = make_buffer(4000, 4000, [10, 20, 30, 255]);
+        let start = std::time::Instant::now();
+        let (tw, th, out) = thumbnail_rgba(&buf, 4000, 4000, 40, 30);
+        let elapsed = start.elapsed();
+        assert_eq!((tw, th), (30, 30));
+        assert!(out.chunks_exact(4).all(|p| p == [10, 20, 30, 255]));
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "4000x4000 のサムネイル 1 枚が {elapsed:?} もかかっている"
+        );
     }
 
     #[test]
