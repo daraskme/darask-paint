@@ -264,6 +264,59 @@ struct TextEditState {
     /// `Response::lost_focus()` が「ボックス外クリック」を検知できなくなる
     /// (`draw_text_edit_overlay` 参照)。
     needs_focus: bool,
+    /// v12 §52: 縦書きプレビューのキャッシュ。**入力(テキスト+設定)が
+    /// 変わったフレームだけ**作り直す(タイピングの無いフレームでは
+    /// 再計算しない = アイドル CPU 0%、SPEC §52)。
+    preview: Option<TextPreviewCache>,
+}
+
+/// v12 §52: 縦書きプレビューのキャッシュ。
+///
+/// 追いレビュー①: **成功・失敗を問わず** `key` を更新する。失敗(大きすぎる
+/// テキスト・壊れたフォント)のときに `None` へ落として鍵を捨てると、同じ
+/// 入力を表示しているだけの静止フレームで毎フレーム再試行してしまい、
+/// アイドル CPU 0% を破る。`result` が `None` は「この入力では描けない」を
+/// 意味し、入力が変わるまで再試行しない。
+struct TextPreviewCache {
+    key: TextPreviewKey,
+    result: Option<TextPreview>,
+}
+
+/// 縦書きプレビュー 1 枚(テクスチャ + 画像座標での寸法)。
+struct TextPreview {
+    texture: egui::TextureHandle,
+    /// 画像座標での寸法(画面上は zoom/ppp を掛けて描く)。
+    size: (u32, u32),
+}
+
+/// プレビューを作り直すべきかの判定に使う入力一式(これが等しい間は
+/// 再ラスタライズしない)。
+#[derive(Clone, PartialEq)]
+struct TextPreviewKey {
+    text: String,
+    px_size: f32,
+    color: Color32,
+    char_spacing: u8,
+    line_spacing: u8,
+}
+
+impl TextPreviewKey {
+    /// 追いレビュー③: 照合の前に `String` を作らない。借用した `buffer` と
+    /// スカラ値を先に比べ、**変わっていたときだけ**所有 `String` を作る。
+    fn matches(
+        &self,
+        text: &str,
+        px_size: f32,
+        color: Color32,
+        char_spacing: u8,
+        line_spacing: u8,
+    ) -> bool {
+        self.px_size == px_size
+            && self.color == color
+            && self.char_spacing == char_spacing
+            && self.line_spacing == line_spacing
+            && self.text == text
+    }
 }
 
 /// 未保存ガード(SPEC §8)が「保存/破棄を選んだ後に何をするか」を覚えておく
@@ -416,6 +469,10 @@ struct StartupToolState {
     last_fill_tool: ToolKind,
     /// v12 §51.2: `W` が戻る先(自動選択/選択ブラシ)。
     last_wand_tool: ToolKind,
+    /// v12 §52: テキストの文字間・行間(設定ファイルの値を UI の範囲へ
+    /// クランプしたもの)。
+    text_char_spacing: u8,
+    text_line_spacing: u8,
 }
 
 impl StartupToolState {
@@ -464,6 +521,12 @@ impl StartupToolState {
             last_marquee_tool,
             last_fill_tool,
             last_wand_tool,
+            text_char_spacing: settings
+                .text_char_spacing
+                .min(settings::MAX_TEXT_CHAR_SPACING),
+            text_line_spacing: settings
+                .text_line_spacing
+                .min(settings::MAX_TEXT_LINE_SPACING),
         }
     }
 }
@@ -725,6 +788,15 @@ pub struct DaraskApp {
     text_font: Option<Arc<Vec<u8>>>,
     /// SPEC §19: フォントサイズ 8–144px(デフォルト 24)。
     text_font_size: f32,
+    /// v12 §52: 縦書き(既定 OFF、設定に永続化)。
+    text_vertical: bool,
+    /// v12 §52: 文字間 0〜50px(縦横とも字送りへの加算)。
+    text_char_spacing: u8,
+    /// v12 §52: 行間 0〜100px(横=行送り・縦=列間への加算)。
+    text_line_spacing: u8,
+    /// v12 §52: 縦書きプレビューを実際にラスタライズした回数(テスト専用の
+    /// 観測点。「入力が変わったフレームだけ再生成する」ことを固定する)。
+    text_preview_rasterizations: u32,
     /// 編集中のテキストボックス(`None` なら非編集中)。
     text_edit: Option<TextEditState>,
 
@@ -974,6 +1046,11 @@ impl DaraskApp {
             next_floating_id: 0,
             text_font,
             text_font_size: DEFAULT_TEXT_FONT_SIZE,
+            // v12 §52: 縦書き・文字間・行間は設定から復元する(§26)。
+            text_vertical: settings.text_vertical,
+            text_char_spacing: startup.text_char_spacing,
+            text_line_spacing: startup.text_line_spacing,
+            text_preview_rasterizations: 0,
             text_edit: None,
             modal: None,
             pending_action: None,
@@ -3133,6 +3210,7 @@ impl DaraskApp {
             pos: img,
             buffer: String::new(),
             needs_focus: true,
+            preview: None,
         });
     }
 
@@ -3185,11 +3263,48 @@ impl DaraskApp {
             return None;
         };
         let rgba = color_to_straight_rgba(self.primary);
-        let (w, h, pixels) = text::rasterize_text(&font_bytes, text, self.text_font_size, rgba);
-        if w == 0 || h == 0 {
-            None
+        match self.rasterize_text_with_current_options(&font_bytes, text, rgba) {
+            Ok((w, h, pixels)) if w > 0 && h > 0 => Some((w, h, pixels)),
+            Ok(_) => None,
+            Err(error) => {
+                // SPEC §52: 「寸法・確保は checked 演算とし、失敗はエラーを
+                // 返す」。呼び出し側(ここ)はトーストで知らせるだけで、
+                // パニックも部分描画もしない。
+                self.show_toast(error.message().to_owned());
+                None
+            }
+        }
+    }
+
+    /// v12 §52: 現在のオプション(縦書き・文字間・行間・フォントサイズ)で
+    /// ラスタライズする共通経路(確定とプレビューが同じ結果になるよう、
+    /// 両方ここを通す)。
+    fn rasterize_text_with_current_options(
+        &self,
+        font_bytes: &[u8],
+        text: &str,
+        rgba: [u8; 4],
+    ) -> Result<(u32, u32, Vec<u8>), text::TextRasterError> {
+        let char_spacing = self.text_char_spacing as f32;
+        let line_spacing = self.text_line_spacing as f32;
+        if self.text_vertical {
+            text::rasterize_text_vertical(
+                font_bytes,
+                text,
+                self.text_font_size,
+                rgba,
+                char_spacing,
+                line_spacing,
+            )
         } else {
-            Some((w, h, pixels))
+            text::rasterize_text(
+                font_bytes,
+                text,
+                self.text_font_size,
+                rgba,
+                char_spacing,
+                line_spacing,
+            )
         }
     }
 
@@ -3249,7 +3364,7 @@ impl DaraskApp {
     /// インラインのテキスト入力ボックス(egui TextEdit、複数行、IME
     /// 対応)を表示」)。呼び出し順は `dispatch_canvas_events` の**後**
     /// (`ui()` 内の呼び出し箇所のコメント参照)。
-    fn draw_text_edit_overlay(&mut self, ui: &mut egui::Ui) {
+    fn draw_text_edit_overlay(&mut self, ui: &mut egui::Ui, painter: &egui::Painter) {
         let Some(state) = self.text_edit.take() else {
             return;
         };
@@ -3257,6 +3372,7 @@ impl DaraskApp {
             pos,
             mut buffer,
             needs_focus,
+            mut preview,
         } = state;
         let screen_pos = self.active_tab().view.img_to_screen_pos(pos);
         // ARCHITECTURE.md §15.3: 「表示フォントサイズ ≈ size × zoom / ppp
@@ -3264,7 +3380,15 @@ impl DaraskApp {
         let display_size = (self.text_font_size * self.active_tab().view.zoom
             / self.active_tab().view.ppp())
         .clamp(TEXT_PREVIEW_MIN_PX, TEXT_PREVIEW_MAX_PX);
-        let color = self.primary;
+        // v12 §52: 縦書き中は入力ボックスの文字を薄くする。入力(横書き)と
+        // 縦書きプレビューが同じ位置に重なるため、そのままだと両方が濃く
+        // 描かれて読みにくい(入力位置・キャレットは見える必要があるので
+        // 消しはしない)。
+        let color = if self.text_vertical {
+            self.primary.gamma_multiply(0.35)
+        } else {
+            self.primary
+        };
 
         let mut lost_focus = false;
         let mut area = egui::Area::new(egui::Id::new("darask_text_edit_area"))
@@ -3305,14 +3429,126 @@ impl DaraskApp {
             lost_focus = response.lost_focus();
         });
 
+        // v12 §52: 縦書きのときだけ、確定と同じラスタライザでプレビューを
+        // 作ってクリック位置へ重ね描きする(横書きは TextEdit の表示自体が
+        // 最終結果とほぼ同じなので不要)。**入力が変わったフレームだけ**
+        // 作り直す(`refresh_text_preview`)。
+        if self.text_vertical {
+            self.refresh_text_preview(ui.ctx(), &buffer, &mut preview);
+            if let Some(rendered) = preview.as_ref().and_then(|cache| cache.result.as_ref()) {
+                self.draw_text_preview(painter, pos, rendered);
+            }
+        } else {
+            // 横書きへ戻したらテクスチャを解放する。
+            preview = None;
+        }
+
         self.text_edit = Some(TextEditState {
             pos,
             buffer,
             needs_focus: false,
+            preview,
         });
         if lost_focus {
             self.commit_pending_text_edit();
         }
+    }
+
+    /// v12 §52: 縦書きプレビューのキャッシュ更新。テキスト・色・サイズ・
+    /// 文字間・行間のいずれかが変わったフレームだけ再ラスタライズして
+    /// テクスチャを差し替える(同じ入力のフレームでは**何もしない** —
+    /// タイピングの無いフレームで再計算しないことがアイドル CPU 0% の条件、
+    /// SPEC §52)。ラスタライズ失敗時はプレビューを消すだけでトーストは
+    /// 出さない(毎フレーム出てしまうため。確定時に `rasterize_pending_text`
+    /// が同じエラーを 1 回だけ知らせる)。
+    fn refresh_text_preview(
+        &mut self,
+        ctx: &egui::Context,
+        buffer: &str,
+        preview: &mut Option<TextPreviewCache>,
+    ) {
+        if buffer.is_empty() {
+            // 空文字列はラスタライズ自体が不要(鍵も持たない)。
+            *preview = None;
+            return;
+        }
+        let Some(font_bytes) = self.text_font.clone() else {
+            *preview = None;
+            return;
+        };
+        // 追いレビュー③: 借用のまま照合し、変わっていなければ何もしない
+        // (成功・失敗どちらのキャッシュでも同じ判定)。
+        if preview.as_ref().is_some_and(|cache| {
+            cache.key.matches(
+                buffer,
+                self.text_font_size,
+                self.primary,
+                self.text_char_spacing,
+                self.text_line_spacing,
+            )
+        }) {
+            return;
+        }
+        let key = TextPreviewKey {
+            text: buffer.to_owned(),
+            px_size: self.text_font_size,
+            color: self.primary,
+            char_spacing: self.text_char_spacing,
+            line_spacing: self.text_line_spacing,
+        };
+        let rgba = color_to_straight_rgba(self.primary);
+        self.text_preview_rasterizations = self.text_preview_rasterizations.saturating_add(1);
+        let rasterized = self.rasterize_text_with_current_options(&font_bytes, buffer, rgba);
+        // 追いレビュー①: 失敗しても鍵は必ず更新する(同じ入力で再試行しない)。
+        let Ok((w, h, pixels)) = rasterized else {
+            *preview = Some(TextPreviewCache { key, result: None });
+            return;
+        };
+        if w == 0 || h == 0 {
+            *preview = Some(TextPreviewCache { key, result: None });
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        match preview.as_mut().and_then(|cache| cache.result.as_mut()) {
+            // 寸法が同じならテクスチャを使い回す(id を増やし続けない)。
+            Some(existing) if existing.size == (w, h) => {
+                existing.texture.set(image, egui::TextureOptions::LINEAR);
+                if let Some(cache) = preview.as_mut() {
+                    cache.key = key;
+                }
+            }
+            _ => {
+                let texture = ctx.load_texture(
+                    "darask_text_vertical_preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                *preview = Some(TextPreviewCache {
+                    key,
+                    result: Some(TextPreview {
+                        texture,
+                        size: (w, h),
+                    }),
+                });
+            }
+        }
+    }
+
+    /// 縦書きプレビューをクリック位置(画像座標)へ、現在のズームで描く。
+    fn draw_text_preview(&self, painter: &egui::Painter, pos: Pos2, preview: &TextPreview) {
+        let view = &self.active_tab().view;
+        let scale = view.zoom / view.ppp();
+        let top_left = view.img_to_screen_pos(pos);
+        let size = egui::vec2(preview.size.0 as f32 * scale, preview.size.1 as f32 * scale);
+        if size.x <= 0.0 || size.y <= 0.0 {
+            return;
+        }
+        painter.image(
+            preview.texture.id(),
+            egui::Rect::from_min_size(top_left, size),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4019,6 +4255,10 @@ impl DaraskApp {
     /// (`ui()` 冒頭の更新箇所参照)。
     fn current_settings(&self) -> Settings {
         Settings {
+            // v12 §52: テキストの縦書き・文字間・行間(SPEC §26)。
+            text_vertical: self.text_vertical,
+            text_char_spacing: self.text_char_spacing,
+            text_line_spacing: self.text_line_spacing,
             window_width: self.window_size.x.round().max(1.0) as u32,
             window_height: self.window_size.y.round().max(1.0) as u32,
             window_maximized: self.window_maximized,
@@ -5738,6 +5978,9 @@ impl eframe::App for DaraskApp {
                     gradient_kind: &mut self.gradient.kind,
                     gradient_colors: &mut self.gradient.colors,
                     text_font_size: &mut self.text_font_size,
+                    text_vertical: &mut self.text_vertical,
+                    text_char_spacing: &mut self.text_char_spacing,
+                    text_line_spacing: &mut self.text_line_spacing,
                     lasso_mode: self.lasso_mode,
                     magic_wand_tolerance: &mut self.magic_wand_tolerance,
                     transparent_selection: &mut self.transparent_selection,
@@ -5856,7 +6099,7 @@ impl eframe::App for DaraskApp {
                 // フレームの Down イベントを「未編集」と誤認して同じ位置に
                 // 即座に新しい編集を開始してしまう(ARCHITECTURE.md §15.6-1
                 // と同種の確定順序の罠)。
-                self.draw_text_edit_overlay(ui);
+                self.draw_text_edit_overlay(ui, &output.painter);
             });
 
         self.show_modal(ui.ctx());
@@ -6065,6 +6308,10 @@ mod tests {
             next_floating_id: 0,
             text_font: None,
             text_font_size: DEFAULT_TEXT_FONT_SIZE,
+            text_vertical: false,
+            text_char_spacing: settings::DEFAULT_TEXT_CHAR_SPACING,
+            text_line_spacing: settings::DEFAULT_TEXT_LINE_SPACING,
+            text_preview_rasterizations: 0,
             text_edit: None,
             modal: None,
             pending_action: None,
@@ -10956,6 +11203,198 @@ mod tests {
             "shift-drag must produce a square selection, got {bbox:?}"
         );
         assert_eq!(bbox.width(), 20);
+    }
+
+    // -- v12 §52: 縦書きテキスト ------------------------------------------
+
+    /// SPEC §52: 縦書きプレビューは「テキスト・設定が変わったフレームだけ」
+    /// 再ラスタライズする(タイピングの無いフレームでは再計算しない =
+    /// アイドル CPU 0%)。
+    #[test]
+    fn vertical_text_preview_is_regenerated_only_when_the_input_changes() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(200, 200, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.text_vertical = true;
+        let ctx = egui::Context::default();
+        let mut preview = None;
+
+        // 同じ入力で 3 フレーム回してもラスタライズは 1 回だけ。
+        for _ in 0..3 {
+            app.refresh_text_preview(&ctx, "あい", &mut preview);
+        }
+        assert_eq!(app.text_preview_rasterizations, 1);
+        assert!(preview.is_some(), "プレビューが作られている");
+
+        // テキストが変われば作り直す。
+        app.refresh_text_preview(&ctx, "あいう", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 2);
+
+        // 設定(文字間)が変われば作り直す。
+        app.text_char_spacing = 8;
+        app.refresh_text_preview(&ctx, "あいう", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 3);
+        // 同じ設定のままなら増えない。
+        app.refresh_text_preview(&ctx, "あいう", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 3);
+
+        // 色が変わっても作り直す(確定と同じ見た目にするため)。
+        app.primary = Color32::from_rgb(1, 2, 3);
+        app.refresh_text_preview(&ctx, "あいう", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 4);
+
+        // 空文字列ならプレビューを捨てる(ラスタライズもしない)。
+        app.refresh_text_preview(&ctx, "", &mut preview);
+        assert!(preview.is_none());
+        assert_eq!(app.text_preview_rasterizations, 4);
+    }
+
+    /// v12 §52(追いレビュー①): ラスタライズに**失敗した入力**も鍵ごと
+    /// キャッシュし、同じ入力のフレームでは再試行しない(静止フレームで
+    /// 毎回失敗を繰り返すとアイドル CPU 0% を破るため)。
+    #[test]
+    fn failed_text_preview_is_cached_and_not_retried_every_frame() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.text_vertical = true;
+        app.text_font_size = 144.0;
+        let ctx = egui::Context::default();
+        let mut preview = None;
+        let huge: String = std::iter::repeat_n('あ', 4000).collect();
+
+        for _ in 0..5 {
+            app.refresh_text_preview(&ctx, &huge, &mut preview);
+        }
+        assert_eq!(
+            app.text_preview_rasterizations, 1,
+            "大きすぎる入力でも試行は 1 回だけ"
+        );
+        assert!(
+            preview.as_ref().is_some_and(|c| c.result.is_none()),
+            "失敗も鍵ごとキャッシュされる(描画はしない)"
+        );
+
+        // 入力が変われば再試行する(そして今度は成功する)。
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 2);
+        assert!(preview.as_ref().is_some_and(|c| c.result.is_some()));
+    }
+
+    #[test]
+    fn broken_font_preview_is_cached_and_not_retried_every_frame() {
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        // 壊れたフォント(解析に失敗する)。
+        app.text_font = Some(Arc::new(vec![1, 2, 3, 4]));
+        app.text_vertical = true;
+        let ctx = egui::Context::default();
+        let mut preview = None;
+
+        for _ in 0..4 {
+            app.refresh_text_preview(&ctx, "あ", &mut preview);
+        }
+        assert_eq!(app.text_preview_rasterizations, 1);
+        assert!(preview.as_ref().is_some_and(|c| c.result.is_none()));
+    }
+
+    /// SPEC §52: 縦書き ON の確定は縦書きラスタライザを使う(= 同じ文字列でも
+    /// 横書きとは寸法が違う浮動片になる)。
+    #[test]
+    fn committing_text_uses_the_vertical_rasterizer_when_enabled() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(400, 400, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.tool = ToolKind::Text;
+
+        // 横書きで確定。
+        app.begin_text_edit(pos2(10.0, 10.0));
+        if let Some(state) = app.text_edit.as_mut() {
+            state.buffer = "あいう".to_owned();
+        }
+        app.commit_pending_text_edit();
+        let horizontal = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .map(|f| (f.w, f.h))
+            .expect("浮動片ができる");
+        app.cancel_floating();
+
+        // 縦書きで確定。
+        app.text_vertical = true;
+        app.begin_text_edit(pos2(10.0, 10.0));
+        if let Some(state) = app.text_edit.as_mut() {
+            state.buffer = "あいう".to_owned();
+        }
+        app.commit_pending_text_edit();
+        let vertical = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .map(|f| (f.w, f.h))
+            .expect("浮動片ができる");
+
+        assert!(horizontal.0 > horizontal.1, "横書きは横長: {horizontal:?}");
+        assert!(vertical.1 > vertical.0, "縦書きは縦長: {vertical:?}");
+    }
+
+    /// SPEC §52: ラスタライズ失敗(大きすぎる)はトーストで知らせ、浮動片は
+    /// 作らない(パニックしない)。
+    #[test]
+    fn oversized_text_shows_a_toast_instead_of_committing() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.text_font_size = 144.0;
+        app.tool = ToolKind::Text;
+        app.begin_text_edit(pos2(0.0, 0.0));
+        if let Some(state) = app.text_edit.as_mut() {
+            state.buffer = std::iter::repeat_n('あ', 4000).collect();
+        }
+
+        app.commit_pending_text_edit();
+
+        assert!(
+            app.active_tab().floating.is_none(),
+            "確定しない(浮動片を作らない)"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("大きすぎます")),
+            "大きすぎる旨のトーストが出る"
+        );
+    }
+
+    /// v12 §52: 文字間・行間は設定に永続化される(SPEC §26)。
+    #[test]
+    fn text_options_round_trip_through_settings() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.text_vertical = true;
+        app.text_char_spacing = 12;
+        app.text_line_spacing = 34;
+
+        let saved = app.current_settings();
+        assert!(saved.text_vertical);
+        assert_eq!(saved.text_char_spacing, 12);
+        assert_eq!(saved.text_line_spacing, 34);
+
+        let restored = settings::parse(&settings::serialize(&saved));
+        assert!(restored.text_vertical);
+        assert_eq!(restored.text_char_spacing, 12);
+        assert_eq!(restored.text_line_spacing, 34);
     }
 
     // -- v12 §51: モザイク・選択ブラシ ------------------------------------

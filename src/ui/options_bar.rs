@@ -17,6 +17,7 @@ use eframe::egui;
 
 use crate::keymap::{self, Action};
 use crate::raster::GradientKind;
+use crate::settings;
 use crate::tools::gradient::GradientColors;
 use crate::tools::shapes::ShapeMode;
 use crate::tools::{LassoMode, ToolKind};
@@ -45,6 +46,12 @@ pub struct OptionsBarCtx<'a> {
     pub gradient_colors: &'a mut GradientColors,
     /// SPEC §19: テキストツールのフォントサイズ(8–144px、デフォルト 24)。
     pub text_font_size: &'a mut f32,
+    /// v12 §52: 縦書き(既定 OFF)。
+    pub text_vertical: &'a mut bool,
+    /// v12 §52: 文字間 0〜50px(縦横とも字送りへの加算)。
+    pub text_char_spacing: &'a mut u8,
+    /// v12 §52: 行間 0〜100px(横=行送り・縦=列間への加算)。
+    pub text_line_spacing: &'a mut u8,
     /// v4 §22: なげなわの自由/多角形モード(Shift+L で切替)。表示専用
     /// (直接編集はできない。ここに出すのは ARCHITECTURE.md §16.10-10:
     /// 「巡回系はオプションバーの整合を忘れない」ため)。
@@ -72,6 +79,9 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
         gradient_kind,
         gradient_colors,
         text_font_size,
+        text_vertical,
+        text_char_spacing,
+        text_line_spacing,
         lasso_mode,
         magic_wand_tolerance,
         transparent_selection,
@@ -98,6 +108,9 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
                     gradient_kind,
                     gradient_colors,
                     text_font_size,
+                    text_vertical,
+                    text_char_spacing,
+                    text_line_spacing,
                     lasso_mode,
                     magic_wand_tolerance,
                     transparent_selection,
@@ -121,6 +134,9 @@ fn show_tool_specific(
     gradient_kind: &mut GradientKind,
     gradient_colors: &mut GradientColors,
     text_font_size: &mut f32,
+    text_vertical: &mut bool,
+    text_char_spacing: &mut u8,
+    text_line_spacing: &mut u8,
     lasso_mode: LassoMode,
     magic_wand_tolerance: &mut u8,
     transparent_selection: &mut bool,
@@ -172,9 +188,36 @@ fn show_tool_specific(
             );
         }
         // SPEC §19: 「オプションバー: フォントサイズ 8–144px(デフォルト 24)」。
+        // v12 §52: 縦書きチェック + 文字間 0〜50px + 行間 0〜100px
+        // (文字間・行間は横書きにも効く)。
         ToolKind::Text => {
             ui.label("フォントサイズ:");
             ui.add(egui::Slider::new(text_font_size, 8.0..=144.0).suffix("px"));
+            ui.separator();
+            ui.checkbox(text_vertical, "縦書き")
+                .on_hover_text("ON: 右の列から左へ縦に組む(改行で新しい列が左に増えます)");
+            ui.label("文字間:");
+            let mut chars = *text_char_spacing as i32;
+            if ui
+                .add(
+                    egui::Slider::new(&mut chars, 0..=settings::MAX_TEXT_CHAR_SPACING as i32)
+                        .suffix("px"),
+                )
+                .changed()
+            {
+                *text_char_spacing = chars.clamp(0, settings::MAX_TEXT_CHAR_SPACING as i32) as u8;
+            }
+            ui.label("行間:");
+            let mut lines = *text_line_spacing as i32;
+            if ui
+                .add(
+                    egui::Slider::new(&mut lines, 0..=settings::MAX_TEXT_LINE_SPACING as i32)
+                        .suffix("px"),
+                )
+                .changed()
+            {
+                *text_line_spacing = lines.clamp(0, settings::MAX_TEXT_LINE_SPACING as i32) as u8;
+            }
         }
         // v4 §22: なげなわのモードは Shift+L でだけ切り替える(ここは表示
         // 専用。ARCHITECTURE.md §16.10-10 の「オプションバーの整合」)。

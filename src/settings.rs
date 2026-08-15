@@ -64,6 +64,14 @@ pub const DEFAULT_BRUSH_HARDNESS: u8 = 100;
 pub const DEFAULT_BRUSH_OPACITY: u8 = 100;
 pub const DEFAULT_BRUSH_SMOOTHING: u8 = 0;
 
+/// v12 §52: テキストの文字間・行間(既定 0px)と、その入力範囲
+/// (文字間 0〜50px / 行間 0〜100px。オプションバーのスライダーと
+/// 設定ファイルの防御的クランプが同じ値を参照する)。
+pub const DEFAULT_TEXT_CHAR_SPACING: u8 = 0;
+pub const DEFAULT_TEXT_LINE_SPACING: u8 = 0;
+pub const MAX_TEXT_CHAR_SPACING: u8 = 50;
+pub const MAX_TEXT_LINE_SPACING: u8 = 100;
+
 /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。
 /// `history.rs::DEFAULT_MAX_STEPS`(`History::new()` の既定値)と同じ 50 だが、
 /// あちらは `usize`・こちら側は設定ファイルの値域を表す `u32` で、モジュールも
@@ -103,6 +111,12 @@ pub struct Settings {
     pub secondary: Color32,
     pub user_palette: Vec<Color32>,
     pub last_tool: ToolKind,
+    /// v12 §52: テキストツールの縦書き(既定 OFF)。
+    pub text_vertical: bool,
+    /// v12 §52: テキストの文字間(0〜50px)。
+    pub text_char_spacing: u8,
+    /// v12 §52: テキストの行間(0〜100px)。
+    pub text_line_spacing: u8,
     pub show_pixel_grid: bool,
     /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。設定
     /// ダイアログの OK で更新され、開いている全タブへ即座に反映される
@@ -126,6 +140,9 @@ impl Default for Settings {
             brush_opacity: DEFAULT_BRUSH_OPACITY,
             pencil_mode: false,
             brush_smoothing: DEFAULT_BRUSH_SMOOTHING,
+            text_vertical: false,
+            text_char_spacing: DEFAULT_TEXT_CHAR_SPACING,
+            text_line_spacing: DEFAULT_TEXT_LINE_SPACING,
             fill_tolerance: 0,
             magic_wand_tolerance: 0,
             rect_mode: ShapeMode::Outline,
@@ -166,6 +183,13 @@ impl Settings {
         self.max_undo_steps = self
             .max_undo_steps
             .clamp(MIN_MAX_UNDO_STEPS, MAX_MAX_UNDO_STEPS);
+    }
+
+    /// v12 §52: 文字間・行間を SPEC の入力範囲へクランプする(手編集・破損
+    /// した設定ファイルからの防御。`clamp_max_undo_steps` と同じ流儀)。
+    fn clamp_text_spacing(&mut self) {
+        self.text_char_spacing = self.text_char_spacing.min(MAX_TEXT_CHAR_SPACING);
+        self.text_line_spacing = self.text_line_spacing.min(MAX_TEXT_LINE_SPACING);
     }
 }
 
@@ -361,6 +385,22 @@ pub fn parse(text: &str) -> Settings {
                     settings.brush_smoothing = v;
                 }
             }
+            // v12 §52: テキストの縦書き・文字間・行間(SPEC §26 の永続化対象)。
+            "text.vertical" => {
+                if let Some(v) = parse_bool(value) {
+                    settings.text_vertical = v;
+                }
+            }
+            "text.char_spacing" => {
+                if let Ok(v) = value.parse::<u8>() {
+                    settings.text_char_spacing = v;
+                }
+            }
+            "text.line_spacing" => {
+                if let Ok(v) = value.parse::<u8>() {
+                    settings.text_line_spacing = v;
+                }
+            }
             "tool.fill_tolerance" => {
                 if let Ok(v) = value.parse::<u8>() {
                     settings.fill_tolerance = v;
@@ -437,6 +477,7 @@ pub fn parse(text: &str) -> Settings {
 
     settings.clamp_window_dims();
     settings.clamp_max_undo_steps();
+    settings.clamp_text_spacing();
     settings
 }
 
@@ -453,6 +494,7 @@ pub fn serialize(settings: &Settings) -> String {
     let mut s = settings.clone();
     s.clamp_window_dims();
     s.clamp_max_undo_steps();
+    s.clamp_text_spacing();
 
     let mut out = String::new();
     push_line(&mut out, "window.width", &s.window_width.to_string());
@@ -466,6 +508,17 @@ pub fn serialize(settings: &Settings) -> String {
     push_line(&mut out, "brush.opacity", &s.brush_opacity.to_string());
     push_line(&mut out, "brush.pencil", bool_tag(s.pencil_mode));
     push_line(&mut out, "brush.smoothing", &s.brush_smoothing.to_string());
+    push_line(&mut out, "text.vertical", bool_tag(s.text_vertical));
+    push_line(
+        &mut out,
+        "text.char_spacing",
+        &s.text_char_spacing.to_string(),
+    );
+    push_line(
+        &mut out,
+        "text.line_spacing",
+        &s.text_line_spacing.to_string(),
+    );
     push_line(
         &mut out,
         "tool.fill_tolerance",
@@ -608,6 +661,9 @@ mod tests {
             brush_opacity: 77,
             pencil_mode: true,
             brush_smoothing: 33,
+            text_vertical: true,
+            text_char_spacing: 7,
+            text_line_spacing: 21,
             fill_tolerance: 10,
             magic_wand_tolerance: 20,
             rect_mode: ShapeMode::Fill,
