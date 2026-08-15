@@ -678,12 +678,16 @@ pub fn load() -> Settings {
     }
 }
 
-/// 終了時・最近使ったファイル更新時に呼ぶ(`app.rs`)。書き込み失敗
-/// (権限・ディスク満杯等)は無視する(起動・終了を妨げない、SPEC §26)。
-pub fn save(settings: &Settings) {
-    if let Some(path) = settings_file_path() {
-        let _ = save_to_path(&path, settings);
-    }
+/// 終了時・最近使ったファイル更新時に呼ぶ(`app.rs`)。呼び出し側が
+/// 非モーダル警告を一度だけ表示できるよう、書き込み失敗を返す。
+pub fn save(settings: &Settings) -> std::io::Result<()> {
+    let path = settings_file_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "設定ファイルの保存先を取得できません",
+        )
+    })?;
+    save_to_path(&path, settings)
 }
 
 #[cfg(test)]

@@ -29,6 +29,33 @@ pub enum ConfirmOutcome {
     Cancel,
 }
 
+fn apply_dialog_keys(ctx: &egui::Context, outcome: &mut DialogOutcome, enter_confirms: bool) {
+    if *outcome != DialogOutcome::Pending {
+        return;
+    }
+    if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        *outcome = DialogOutcome::Cancelled;
+    } else if enter_confirms && ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+        *outcome = DialogOutcome::Confirmed;
+    }
+}
+
+fn dialog_first_frame(ctx: &egui::Context, id: egui::Id) -> bool {
+    let frame = ctx.cumulative_frame_nr();
+    let state_id = id.with("last_frame");
+    ctx.data_mut(|data| {
+        let previous = data.get_temp::<u64>(state_id);
+        data.insert_temp(state_id, frame);
+        previous.is_none_or(|previous| frame > previous.saturating_add(1))
+    })
+}
+
+fn focus_on_first_frame(response: &egui::Response, first_frame: bool) {
+    if first_frame {
+        response.request_focus();
+    }
+}
+
 /// 「新規」ダイアログ(SPEC §7: 幅・高さ(1-8192、デフォルト 1280×720)、
 /// 背景 = 白/透明)。
 pub fn show_new(
@@ -38,9 +65,11 @@ pub fn show_new(
     background: &mut Background,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_new")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_new");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("新規作成");
-        size_fields(ui, width, height);
+        size_fields(ui, width, height, first_frame);
         ui.horizontal(|ui| {
             ui.label("背景:");
             ui.radio_value(background, Background::White, "白");
@@ -52,6 +81,7 @@ pub fn show_new(
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     outcome
 }
 
@@ -68,15 +98,16 @@ pub fn show_image_resize(
     orig_height: u32,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_image_resize")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_image_resize");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("画像サイズ変更");
         ui.horizontal(|ui| {
             ui.label("幅:");
             let mut w = *width;
-            if ui
-                .add(egui::DragValue::new(&mut w).range(1..=8192))
-                .changed()
-            {
+            let response = ui.add(egui::DragValue::new(&mut w).range(1..=8192));
+            focus_on_first_frame(&response, first_frame);
+            if response.changed() {
                 *width = w.clamp(1, 8192);
                 if *keep_aspect && orig_width > 0 {
                     *height = ((*width as f32) * (orig_height as f32 / orig_width as f32))
@@ -112,6 +143,7 @@ pub fn show_image_resize(
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     outcome
 }
 
@@ -119,26 +151,33 @@ pub fn show_image_resize(
 /// 拡張部分は透明)。
 pub fn show_canvas_resize(ctx: &egui::Context, width: &mut u32, height: &mut u32) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_canvas_resize")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_canvas_resize");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("キャンバスサイズ変更");
         ui.weak("既存の画像は左上基準で配置され、拡張された部分は透明になります。");
-        size_fields(ui, width, height);
+        size_fields(ui, width, height, first_frame);
         ui.separator();
         confirm_buttons(ui, &mut outcome);
     });
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     outcome
 }
 
 /// JPEG 品質ダイアログ(SPEC §8: 1-100、デフォルト 90)。
 pub fn show_jpeg_quality(ctx: &egui::Context, quality: &mut u8) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_jpeg_quality")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_jpeg_quality");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("JPEG 品質");
         let mut q = *quality as i32;
-        if ui.add(egui::Slider::new(&mut q, 1..=100)).changed() {
+        let response = ui.add(egui::Slider::new(&mut q, 1..=100));
+        focus_on_first_frame(&response, first_frame);
+        if response.changed() {
             *quality = q.clamp(1, 100) as u8;
         }
         ui.separator();
@@ -154,6 +193,7 @@ pub fn show_jpeg_quality(ctx: &egui::Context, quality: &mut u8) -> DialogOutcome
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     outcome
 }
 
@@ -168,27 +208,31 @@ pub fn show_brightness_contrast(
 ) -> (DialogOutcome, bool) {
     let mut outcome = DialogOutcome::Pending;
     let mut changed = false;
-    let modal =
-        egui::Modal::new(egui::Id::new("darask_dialog_brightness_contrast")).show(ctx, |ui| {
-            ui.heading("明るさ・コントラスト");
-            ui.horizontal(|ui| {
-                ui.label("明るさ:");
-                if ui.add(egui::Slider::new(brightness, -100..=100)).changed() {
-                    changed = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("コントラスト:");
-                if ui.add(egui::Slider::new(contrast, -100..=100)).changed() {
-                    changed = true;
-                }
-            });
-            ui.separator();
-            confirm_buttons(ui, &mut outcome);
+    let dialog_id = egui::Id::new("darask_dialog_brightness_contrast");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
+        ui.heading("明るさ・コントラスト");
+        ui.horizontal(|ui| {
+            ui.label("明るさ:");
+            let response = ui.add(egui::Slider::new(brightness, -100..=100));
+            focus_on_first_frame(&response, first_frame);
+            if response.changed() {
+                changed = true;
+            }
         });
+        ui.horizontal(|ui| {
+            ui.label("コントラスト:");
+            if ui.add(egui::Slider::new(contrast, -100..=100)).changed() {
+                changed = true;
+            }
+        });
+        ui.separator();
+        confirm_buttons(ui, &mut outcome);
+    });
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     (outcome, changed)
 }
 
@@ -206,7 +250,9 @@ pub fn show_mosaic(
 ) -> (DialogOutcome, bool) {
     let mut outcome = DialogOutcome::Pending;
     let mut changed = false;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_mosaic")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_mosaic");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("モザイク");
         if ui.checkbox(auto, "自動").changed() {
             changed = true;
@@ -217,6 +263,7 @@ pub fn show_mosaic(
             // 自動のときはスライダーを無効化し、実際に使われる値を出す。
             let response =
                 ui.add_enabled(!*auto, egui::Slider::new(&mut value, 2..=100).suffix("px"));
+            focus_on_first_frame(&response, first_frame && !*auto);
             if response.changed() {
                 let clamped = value.clamp(2, 100) as u32;
                 if *block != clamped {
@@ -234,6 +281,7 @@ pub fn show_mosaic(
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     (outcome, changed)
 }
 
@@ -247,11 +295,15 @@ pub fn show_hue_saturation(
 ) -> (DialogOutcome, bool) {
     let mut outcome = DialogOutcome::Pending;
     let mut changed = false;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_hue_saturation")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_hue_saturation");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("色相・彩度・明度");
         ui.horizontal(|ui| {
             ui.label("色相:");
-            if ui.add(egui::Slider::new(hue, -180..=180)).changed() {
+            let response = ui.add(egui::Slider::new(hue, -180..=180));
+            focus_on_first_frame(&response, first_frame);
+            if response.changed() {
                 changed = true;
             }
         });
@@ -273,6 +325,7 @@ pub fn show_hue_saturation(
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     (outcome, changed)
 }
 
@@ -280,12 +333,16 @@ pub fn show_hue_saturation(
 /// `doc_label` はタイトルバーと同じ「ファイル名」表記(無題なら「無題」)。
 pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutcome {
     let mut outcome = ConfirmOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_confirm_unsaved")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_confirm_unsaved");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("保存しますか?");
         ui.label(format!("「{doc_label}」への変更を保存しますか?"));
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("保存").clicked() {
+            let save = ui.button("保存");
+            focus_on_first_frame(&save, first_frame);
+            if save.clicked() {
                 outcome = ConfirmOutcome::Save;
             }
             if ui.button("破棄").clicked() {
@@ -298,6 +355,13 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
     });
     if modal.should_close() && outcome == ConfirmOutcome::Pending {
         outcome = ConfirmOutcome::Cancel;
+    }
+    if outcome == ConfirmOutcome::Pending {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            outcome = ConfirmOutcome::Cancel;
+        } else if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+            outcome = ConfirmOutcome::Save;
+        }
     }
     outcome
 }
@@ -314,11 +378,14 @@ pub fn show_preferences(
     diffusion_port: &mut u16,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    let modal = egui::Modal::new(egui::Id::new("darask_dialog_preferences")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_preferences");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    let modal = egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("設定");
         ui.horizontal(|ui| {
             ui.label("IOpaint ポート:");
-            ui.add(egui::DragValue::new(iopaint_port).range(1..=u16::MAX));
+            let response = ui.add(egui::DragValue::new(iopaint_port).range(1..=u16::MAX));
+            focus_on_first_frame(&response, first_frame);
         });
         ui.horizontal(|ui| {
             ui.label("AI Diffusion ポート:");
@@ -341,6 +408,7 @@ pub fn show_preferences(
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Cancelled;
     }
+    apply_dialog_keys(ctx, &mut outcome, true);
     outcome
 }
 
@@ -363,6 +431,13 @@ pub fn show_about(ctx: &egui::Context, version: &str, repository: &str) -> Dialo
     if modal.should_close() && outcome == DialogOutcome::Pending {
         outcome = DialogOutcome::Confirmed;
     }
+    if outcome == DialogOutcome::Pending
+        && ctx.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
+        })
+    {
+        outcome = DialogOutcome::Confirmed;
+    }
     outcome
 }
 
@@ -373,10 +448,13 @@ pub fn show_diffusion_generate(
     seed: &mut String,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    egui::Modal::new(egui::Id::new("darask_dialog_diffusion_generate")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_diffusion_generate");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("AI 生成(Diffusion)");
         ui.label("プロンプト:");
-        ui.text_edit_multiline(prompt);
+        let response = ui.text_edit_multiline(prompt);
+        focus_on_first_frame(&response, first_frame);
         ui.label("ネガティブプロンプト(任意):");
         ui.text_edit_multiline(negative);
         ui.horizontal(|ui| {
@@ -385,6 +463,7 @@ pub fn show_diffusion_generate(
         });
         confirm_buttons(ui, &mut outcome);
     });
+    apply_dialog_keys(ctx, &mut outcome, false);
     outcome
 }
 
@@ -394,27 +473,30 @@ pub fn show_diffusion_inpaint(
     strength: &mut f32,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
-    egui::Modal::new(egui::Id::new("darask_dialog_diffusion_inpaint")).show(ctx, |ui| {
+    let dialog_id = egui::Id::new("darask_dialog_diffusion_inpaint");
+    let first_frame = dialog_first_frame(ctx, dialog_id);
+    egui::Modal::new(dialog_id).show(ctx, |ui| {
         ui.heading("AI 置換(Diffusion)");
         ui.label("プロンプト:");
-        ui.text_edit_multiline(prompt);
+        let response = ui.text_edit_multiline(prompt);
+        focus_on_first_frame(&response, first_frame);
         ui.horizontal(|ui| {
             ui.label("強さ:");
             ui.add(egui::DragValue::new(strength).range(0.01..=1.0).speed(0.01));
         });
         confirm_buttons(ui, &mut outcome);
     });
+    apply_dialog_keys(ctx, &mut outcome, false);
     outcome
 }
 
-fn size_fields(ui: &mut egui::Ui, width: &mut u32, height: &mut u32) {
+fn size_fields(ui: &mut egui::Ui, width: &mut u32, height: &mut u32, first_frame: bool) {
     ui.horizontal(|ui| {
         ui.label("幅:");
         let mut w = *width;
-        if ui
-            .add(egui::DragValue::new(&mut w).range(1..=8192))
-            .changed()
-        {
+        let response = ui.add(egui::DragValue::new(&mut w).range(1..=8192));
+        focus_on_first_frame(&response, first_frame);
+        if response.changed() {
             *width = w.clamp(1, 8192);
         }
     });
@@ -444,6 +526,70 @@ fn confirm_buttons(ui: &mut egui::Ui, outcome: &mut DialogOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_key(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn standard_dialog_enter_confirms_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        let mut width = 320;
+        let mut height = 240;
+        let mut background = Background::White;
+        let mut outcome = DialogOutcome::Pending;
+        let _ = ctx.run_ui(raw_key(egui::Key::Enter), |_ui| {
+            outcome = show_new(&ctx, &mut width, &mut height, &mut background);
+        });
+        assert_eq!(outcome, DialogOutcome::Confirmed);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_key(egui::Key::Escape), |_ui| {
+            outcome = show_new(&ctx, &mut width, &mut height, &mut background);
+        });
+        assert_eq!(outcome, DialogOutcome::Cancelled);
+    }
+
+    #[test]
+    fn standard_dialog_focuses_primary_input_on_first_frame() {
+        let ctx = egui::Context::default();
+        let mut width = 320;
+        let mut height = 240;
+        let mut background = Background::White;
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            show_new(&ctx, &mut width, &mut height, &mut background);
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_some()));
+    }
+
+    #[test]
+    fn diffusion_multiline_enter_inserts_newline_without_confirming() {
+        let ctx = egui::Context::default();
+        let mut prompt = "first line".to_owned();
+        let mut negative = String::new();
+        let mut seed = String::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            assert_eq!(
+                show_diffusion_generate(&ctx, &mut prompt, &mut negative, &mut seed),
+                DialogOutcome::Pending
+            );
+        });
+        let mut outcome = DialogOutcome::Confirmed;
+        let _ = ctx.run_ui(raw_key(egui::Key::Enter), |_ui| {
+            outcome = show_diffusion_generate(&ctx, &mut prompt, &mut negative, &mut seed);
+        });
+        assert_eq!(outcome, DialogOutcome::Pending);
+        assert_eq!(prompt, "first line\n");
+    }
 
     /// v12 §51.1: モザイクダイアログが 1 フレーム描画でき、無操作なら
     /// `Pending`(= まだ閉じない)を返すこと。「自動」ONのときはスライダーが

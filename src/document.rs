@@ -156,20 +156,30 @@ impl IRect {
 /// でもメモリ・ループ回数が無制限には増えないことだけを保証する設計)。
 #[derive(Default, Clone)]
 pub struct DirtyRegion {
-    rects: Vec<IRect>,
+    segments: Vec<DirtySegment>,
+}
+
+#[derive(Clone, Copy)]
+struct DirtySegment {
+    rect: IRect,
+    source_area: i64,
 }
 
 /// セグメントの上限(ARCHITECTURE.md §16.1: 「小さな `Vec<IRect>`、上限 32
 /// 個で溢れたら合併」)。
 const MAX_DIRTY_SEGMENTS: usize = 32;
+const DIRTY_MERGE_AREA_NUMERATOR: i64 = 3;
+const DIRTY_MERGE_AREA_DENOMINATOR: i64 = 2;
 
 impl DirtyRegion {
     pub fn new() -> Self {
-        Self { rects: Vec::new() }
+        Self {
+            segments: Vec::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rects.is_empty()
+        self.segments.is_empty()
     }
 
     /// `rect` を新しいセグメントとして積む。空矩形は無視する
@@ -180,31 +190,60 @@ impl DirtyRegion {
         if rect.is_empty() {
             return;
         }
-        if self.rects.len() >= MAX_DIRTY_SEGMENTS {
-            if let Some(last) = self.rects.last_mut() {
-                *last = last.union(&rect);
+        let mut merged = DirtySegment {
+            rect,
+            source_area: rect_area(rect),
+        };
+        let mut index = 0;
+        while index < self.segments.len() {
+            let existing = self.segments[index];
+            let union = existing.rect.union(&merged.rect);
+            let combined_area = existing.source_area.saturating_add(merged.source_area);
+            if rect_area(union).saturating_mul(DIRTY_MERGE_AREA_DENOMINATOR)
+                <= combined_area.saturating_mul(DIRTY_MERGE_AREA_NUMERATOR)
+            {
+                merged = DirtySegment {
+                    rect: union,
+                    source_area: combined_area,
+                };
+                self.segments.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        if self.segments.len() >= MAX_DIRTY_SEGMENTS {
+            if let Some(last) = self.segments.last_mut() {
+                last.rect = last.rect.union(&merged.rect);
+                last.source_area = last.source_area.saturating_add(merged.source_area);
             }
             return;
         }
-        self.rects.push(rect);
+        self.segments.push(merged);
     }
 
     /// 現在のセグメント一覧(テスト・`recompose_if_dirty` 用)。
-    pub fn rects(&self) -> &[IRect] {
-        &self.rects
+    pub fn rects(&self) -> Vec<IRect> {
+        self.segments.iter().map(|segment| segment.rect).collect()
     }
 
     /// 蓄積したセグメントを取り出して空にする(`canvas_view` が毎フレーム、
     /// テクスチャ部分更新のために消費する)。
     pub fn take(&mut self) -> Vec<IRect> {
-        std::mem::take(&mut self.rects)
+        std::mem::take(&mut self.segments)
+            .into_iter()
+            .map(|segment| segment.rect)
+            .collect()
     }
 
     /// 中身を空にするだけ(取り出した内容が不要なとき、ARCHITECTURE.md
     /// §16.1)。
     pub fn clear(&mut self) {
-        self.rects.clear();
+        self.segments.clear();
     }
+}
+
+fn rect_area(rect: IRect) -> i64 {
+    i64::from(rect.width()) * i64::from(rect.height())
 }
 
 /// v4 §16.3/§21(ARCHITECTURE.md): 矩形限定だった選択を一般化した
@@ -1461,16 +1500,56 @@ fn crop_buffer(width: u32, height: u32, pixels: &[u8], rect: IRect) -> Vec<u8> {
 }
 
 /// 双線形補間で 4 近傍から 1 画素を求める(`resize_buffer` の
-/// `Interpolation::Bilinear` が使う)。straight alpha のままチャンネルごとに
-/// 線形補間する簡易実装(SPEC は premultiplied 前提の高精度リサイズまでは
-/// 要求していない)。
+/// `Interpolation::Bilinear` が使う)。透明画素に残った RGB が半透明境界へ
+/// 混入しないよう premultiplied alpha で補間し、最後に straight alpha へ戻す。
 fn bilerp(p00: [u8; 4], p10: [u8; 4], p01: [u8; 4], p11: [u8; 4], fx: f32, fy: f32) -> [u8; 4] {
+    if [p00, p10, p01, p11].iter().all(|pixel| pixel[3] == 255) {
+        return bilerp_straight(p00, p10, p01, p11, fx, fy);
+    }
+
+    let weights = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
+    let pixels = [p00, p10, p01, p11];
+    let alpha = pixels
+        .iter()
+        .zip(weights)
+        .map(|(pixel, weight)| pixel[3] as f32 * weight)
+        .sum::<f32>();
+    if alpha <= f32::EPSILON {
+        return [0, 0, 0, 0];
+    }
+
     let mut out = [0u8; 4];
-    for c in 0..4 {
-        let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
-        let bottom = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
-        let v = top * (1.0 - fy) + bottom * fy;
-        out[c] = v.round().clamp(0.0, 255.0) as u8;
+    for channel in 0..3 {
+        let premultiplied = pixels
+            .iter()
+            .zip(weights)
+            .map(|(pixel, weight)| pixel[channel] as f32 * pixel[3] as f32 / 255.0 * weight)
+            .sum::<f32>();
+        out[channel] = (premultiplied * 255.0 / alpha).round().clamp(0.0, 255.0) as u8;
+    }
+    out[3] = alpha.round().clamp(0.0, 255.0) as u8;
+    out
+}
+
+fn bilerp_straight(
+    p00: [u8; 4],
+    p10: [u8; 4],
+    p01: [u8; 4],
+    p11: [u8; 4],
+    fx: f32,
+    fy: f32,
+) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
+        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
+        let value = top * (1.0 - fy) + bottom * fy;
+        out[channel] = value.round().clamp(0.0, 255.0) as u8;
     }
     out
 }
@@ -1478,6 +1557,63 @@ fn bilerp(p00: [u8; 4], p10: [u8; 4], p01: [u8; 4], p11: [u8; 4], fx: f32, fy: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_dirty_segments_within_merge_ratio(region: &DirtyRegion) {
+        for segment in &region.segments {
+            assert!(
+                rect_area(segment.rect).saturating_mul(DIRTY_MERGE_AREA_DENOMINATOR)
+                    <= segment
+                        .source_area
+                        .saturating_mul(DIRTY_MERGE_AREA_NUMERATOR),
+                "dirty segment {:?} has union area {} over source area {}",
+                segment.rect,
+                rect_area(segment.rect),
+                segment.source_area
+            );
+        }
+    }
+
+    fn legacy_resize_bilinear(
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        new_width: u32,
+        new_height: u32,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; new_width as usize * new_height as usize * 4];
+        let scale_x = width as f32 / new_width as f32;
+        let scale_y = height as f32 / new_height as f32;
+        for ny in 0..new_height {
+            let sy = ((ny as f32 + 0.5) * scale_y - 0.5).clamp(0.0, height as f32 - 1.0);
+            let y0 = sy.floor() as i32;
+            let y1 = (y0 + 1).min(height as i32 - 1);
+            let fy = sy - y0 as f32;
+            for nx in 0..new_width {
+                let sx = ((nx as f32 + 0.5) * scale_x - 0.5).clamp(0.0, width as f32 - 1.0);
+                let x0 = sx.floor() as i32;
+                let x1 = (x0 + 1).min(width as i32 - 1);
+                let fx = sx - x0 as f32;
+                let samples = [
+                    read_pixel(pixels, width, height, x0, y0).unwrap_or([0; 4]),
+                    read_pixel(pixels, width, height, x1, y0).unwrap_or([0; 4]),
+                    read_pixel(pixels, width, height, x0, y1).unwrap_or([0; 4]),
+                    read_pixel(pixels, width, height, x1, y1).unwrap_or([0; 4]),
+                ];
+                let mut pixel = [0u8; 4];
+                for channel in 0..4 {
+                    let top =
+                        samples[0][channel] as f32 * (1.0 - fx) + samples[1][channel] as f32 * fx;
+                    let bottom =
+                        samples[2][channel] as f32 * (1.0 - fx) + samples[3][channel] as f32 * fx;
+                    pixel[channel] =
+                        (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+                }
+                let index = (ny as usize * new_width as usize + nx as usize) * 4;
+                out[index..index + 4].copy_from_slice(&pixel);
+            }
+        }
+        out
+    }
 
     #[test]
     fn new_white_fills_opaque_white() {
@@ -1739,6 +1875,117 @@ mod tests {
             x1: 7,
             y1: 7
         }));
+    }
+
+    #[test]
+    fn mark_dirty_merges_adjacent_segments_when_area_growth_is_small() {
+        let mut doc = Document::new(10, 10, Background::White);
+        doc.mark_dirty(IRect {
+            x0: 1,
+            y0: 1,
+            x1: 3,
+            y1: 3,
+        });
+        doc.mark_dirty(IRect {
+            x0: 3,
+            y0: 1,
+            x1: 5,
+            y1: 3,
+        });
+        assert_eq!(
+            doc.dirty.rects(),
+            &[IRect {
+                x0: 1,
+                y0: 1,
+                x1: 5,
+                y1: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn dirty_chain_merge_never_exceeds_source_area_ratio() {
+        let mut region = DirtyRegion::new();
+        for x in [0, 2, 5, 9, 15, 23, 33] {
+            region.push(IRect {
+                x0: x,
+                y0: 0,
+                x1: x + 1,
+                y1: 1,
+            });
+        }
+        assert_dirty_segments_within_merge_ratio(&region);
+    }
+
+    #[test]
+    fn dirty_diagonal_segments_never_exceed_source_area_ratio() {
+        let mut region = DirtyRegion::new();
+        for coordinate in 0..8 {
+            region.push(IRect {
+                x0: coordinate,
+                y0: coordinate,
+                x1: coordinate + 1,
+                y1: coordinate + 1,
+            });
+        }
+        assert_dirty_segments_within_merge_ratio(&region);
+    }
+
+    #[test]
+    fn dirty_containment_preserves_source_area_accounting() {
+        let mut region = DirtyRegion::new();
+        region.push(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        });
+        region.push(IRect {
+            x0: 1,
+            y0: 1,
+            x1: 2,
+            y1: 2,
+        });
+        assert_eq!(region.segments.len(), 1);
+        assert_eq!(region.segments[0].source_area, 17);
+        assert_dirty_segments_within_merge_ratio(&region);
+    }
+
+    #[test]
+    fn dirty_complete_overlap_preserves_source_area_accounting() {
+        let mut region = DirtyRegion::new();
+        let rect = IRect {
+            x0: 2,
+            y0: 3,
+            x1: 5,
+            y1: 7,
+        };
+        region.push(rect);
+        region.push(rect);
+        assert_eq!(region.segments.len(), 1);
+        assert_eq!(region.segments[0].source_area, 24);
+        assert_dirty_segments_within_merge_ratio(&region);
+    }
+
+    #[test]
+    fn dirty_merge_accepts_exactly_one_and_a_half_area_boundary() {
+        let mut region = DirtyRegion::new();
+        region.push(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        });
+        region.push(IRect {
+            x0: 2,
+            y0: 0,
+            x1: 3,
+            y1: 1,
+        });
+        assert_eq!(region.segments.len(), 1);
+        assert_eq!(rect_area(region.segments[0].rect), 3);
+        assert_eq!(region.segments[0].source_area, 2);
+        assert_dirty_segments_within_merge_ratio(&region);
     }
 
     #[test]
@@ -2026,6 +2273,70 @@ mod tests {
             .active_pixels()
             .chunks_exact(4)
             .all(|p| p == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn opaque_bilinear_resize_matches_legacy_results_exactly() {
+        for (width, height, new_width, new_height) in [
+            (2u32, 2u32, 7u32, 5u32),
+            (3, 5, 8, 2),
+            (7, 4, 3, 9),
+            (5, 6, 5, 6),
+        ] {
+            let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+            for index in 0..width * height {
+                pixels.extend_from_slice(&[
+                    (index * 37 + 11) as u8,
+                    (index * 73 + 29) as u8,
+                    (index * 151 + 7) as u8,
+                    255,
+                ]);
+            }
+            let expected = legacy_resize_bilinear(width, height, &pixels, new_width, new_height);
+            let actual = resize_buffer(
+                width,
+                height,
+                &pixels,
+                new_width,
+                new_height,
+                Interpolation::Bilinear,
+            );
+            assert_eq!(
+                actual, expected,
+                "{width}x{height} -> {new_width}x{new_height}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_bilinear_does_not_bleed_rgb_from_transparent_pixels() {
+        let mut doc = Document::new(2, 1, Background::Transparent);
+        doc.set_pixel(0, 0, [255, 0, 0, 255]);
+        doc.set_pixel(1, 0, [0, 255, 0, 0]);
+        doc.resize(3, 1, Interpolation::Bilinear);
+        let middle = doc.get_pixel(1, 0).expect("middle pixel");
+        assert_eq!(middle[0], 255);
+        assert_eq!(
+            middle[1], 0,
+            "transparent green RGB must not create a fringe"
+        );
+        assert_eq!(middle[2], 0);
+        assert!(middle[3] > 0 && middle[3] < 255);
+    }
+
+    #[test]
+    fn bilerp_clears_rgb_when_output_is_fully_transparent() {
+        assert_eq!(
+            bilerp(
+                [255, 0, 0, 0],
+                [0, 255, 0, 0],
+                [0, 0, 255, 0],
+                [255, 255, 255, 0],
+                0.5,
+                0.5
+            ),
+            [0, 0, 0, 0]
+        );
     }
 
     #[test]

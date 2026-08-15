@@ -111,10 +111,10 @@ pub fn load_image(path: &Path) -> Result<Document, String> {
 }
 
 /// `doc` を `path` に `format` で保存する(SPEC §8)。SPEC §13: 保存は常に
-/// 可視レイヤーの合成(統合)結果を書き出すため、保存前に `composite` を
-/// 全再計算する。
+/// 可視レイヤーの合成(統合)結果を書き出す。未反映の dirty 領域だけを
+/// 合成し、既に最新の `composite` は再計算しない。
 pub fn save_image(doc: &mut Document, path: &Path, format: SaveFormat) -> Result<(), String> {
-    doc.recomposite_full();
+    doc.recompose_if_dirty();
     match format {
         SaveFormat::Project => {
             Err("プロジェクト形式は履歴を含む保存APIを使用してください".to_owned())
@@ -373,6 +373,14 @@ mod tests {
         let mut doc = Document::new(4, 3, Background::Transparent);
         doc.set_pixel(1, 1, [10, 20, 30, 200]);
         doc.set_pixel(3, 2, [255, 0, 0, 255]);
+        // `save_image` は dirty 領域だけを合成するため、実編集経路と同じく
+        // 低レベルのテスト書き込み後に変更範囲を通知する。
+        doc.mark_dirty(crate::document::IRect {
+            x0: 1,
+            y0: 1,
+            x1: 4,
+            y1: 3,
+        });
 
         save_image(&mut doc, &path, SaveFormat::Png).expect("save should succeed");
         let loaded = load_image(&path).expect("load should succeed");
@@ -382,6 +390,30 @@ mod tests {
         assert_eq!(loaded.active_pixels(), doc.composite.as_slice());
         assert_eq!(loaded.path, Some(path.clone()));
         assert!(!loaded.modified);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_image_does_not_recompose_when_document_is_not_dirty() {
+        let dir = std::env::temp_dir().join(format!(
+            "darask_paint_test_save_clean_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("clean.png");
+        let mut doc = Document::new(1, 1, Background::White);
+        doc.dirty.clear();
+        doc.layers[0].pixels.copy_from_slice(&[255, 0, 0, 255]);
+        doc.composite.copy_from_slice(&[0, 0, 255, 255]);
+
+        save_image(&mut doc, &path, SaveFormat::Png).expect("save should succeed");
+        let loaded = load_image(&path).expect("load should succeed");
+        assert_eq!(loaded.get_pixel(0, 0), Some([0, 0, 255, 255]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -403,6 +435,12 @@ mod tests {
 
         let mut doc = Document::new(3, 3, Background::White);
         doc.set_pixel(0, 0, [10, 20, 30, 255]);
+        doc.mark_dirty(crate::document::IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        });
 
         save_image(&mut doc, &path, SaveFormat::Bmp).expect("save should succeed");
         let loaded = load_image(&path).expect("load should succeed");
@@ -531,6 +569,12 @@ mod tests {
         save_image(&mut first, &path, SaveFormat::Png).expect("first save");
         let mut second = Document::new(2, 2, Background::Transparent);
         second.set_pixel(0, 0, [1, 2, 3, 255]);
+        second.mark_dirty(crate::document::IRect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        });
         save_image(&mut second, &path, SaveFormat::Png).expect("overwrite save");
 
         let loaded = load_image(&path).expect("load overwritten file");

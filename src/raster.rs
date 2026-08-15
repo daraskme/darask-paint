@@ -681,19 +681,24 @@ pub fn flood_fill(
 /// 「塗りつぶしの連結探索は clip 外を壁として扱う」と同様)クリップ外へは
 /// 広がらない。
 pub fn flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
+    flood_mask_impl(surface, x, y, tolerance).0
+}
+
+fn flood_mask_impl(surface: &Surface, x: i32, y: i32, tolerance: u8) -> (SelMask, usize) {
     let Some(target) = surface.get_pixel(x, y) else {
-        return SelMask::empty();
+        return (SelMask::empty(), 0);
     };
     let w = surface.width as i32;
     let h = surface.height as i32;
     if w <= 0 || h <= 0 {
-        return SelMask::empty();
+        return (SelMask::empty(), 0);
     }
 
-    let mut visited = vec![false; w as usize * h as usize];
-    let idx = |x: i32, y: i32| y as usize * w as usize + x as usize;
-    let is_open = |visited: &[bool], x: i32, y: i32| {
-        !visited[idx(x, y)]
+    let Some(mut visited) = SparseVisited::new(surface.width, surface.height) else {
+        return (SelMask::empty(), 0);
+    };
+    let is_open = |visited: &SparseVisited, x: i32, y: i32| {
+        !visited.contains(x, y)
             && surface.clip.is_none_or(|clip| clip.contains(x, y))
             && surface
                 .get_pixel(x, y)
@@ -721,10 +726,8 @@ pub fn flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
             x1: xr + 1,
             y1: sy + 1,
         };
-        let span_start = sy as usize * w as usize + xl as usize;
-        let span_len = (xr - xl + 1) as usize;
-        if let Some(v) = visited.get_mut(span_start..span_start + span_len) {
-            v.fill(true);
+        for xx in xl..=xr {
+            visited.insert(xx, sy);
         }
         bounds = Some(match bounds {
             Some(b) => b.union(&span_rect),
@@ -750,19 +753,82 @@ pub fn flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
     }
 
     let Some(bbox) = bounds else {
-        return SelMask::empty();
+        return (SelMask::empty(), visited.allocated_tile_count());
     };
     let bw = bbox.width() as usize;
     let bh = bbox.height() as usize;
-    let mut mask = vec![0u8; bw * bh];
+    let Some(mask_len) = bw.checked_mul(bh) else {
+        return (SelMask::empty(), visited.allocated_tile_count());
+    };
+    let mut mask = Vec::new();
+    if mask.try_reserve_exact(mask_len).is_err() {
+        return (SelMask::empty(), visited.allocated_tile_count());
+    }
+    mask.resize(mask_len, 0u8);
     for yy in 0..bh {
-        let src_row = (bbox.y0 as usize + yy) * w as usize + bbox.x0 as usize;
         let dst_row = yy * bw;
         for xx in 0..bw {
-            mask[dst_row + xx] = if visited[src_row + xx] { 255 } else { 0 };
+            mask[dst_row + xx] = if visited.contains(bbox.x0 + xx as i32, bbox.y0 + yy as i32) {
+                255
+            } else {
+                0
+            };
         }
     }
-    SelMask { bbox, mask }
+    (SelMask { bbox, mask }, visited.allocated_tile_count())
+}
+
+const VISITED_TILE_SIZE: usize = 64;
+
+struct SparseVisited {
+    tiles_x: usize,
+    tiles: Vec<Option<Box<[u64; VISITED_TILE_SIZE]>>>,
+    allocated_tiles: usize,
+}
+
+impl SparseVisited {
+    fn new(width: u32, height: u32) -> Option<Self> {
+        let tiles_x = width.div_ceil(VISITED_TILE_SIZE as u32) as usize;
+        let tiles_y = height.div_ceil(VISITED_TILE_SIZE as u32) as usize;
+        let tile_count = tiles_x.checked_mul(tiles_y)?;
+        let mut tiles = Vec::new();
+        tiles.try_reserve_exact(tile_count).ok()?;
+        tiles.resize_with(tile_count, || None);
+        Some(Self {
+            tiles_x,
+            tiles,
+            allocated_tiles: 0,
+        })
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let x = x as usize;
+        let y = y as usize;
+        let tile_index = (y / VISITED_TILE_SIZE) * self.tiles_x + x / VISITED_TILE_SIZE;
+        let local_y = y % VISITED_TILE_SIZE;
+        let bit = 1u64 << (x % VISITED_TILE_SIZE);
+        self.tiles[tile_index]
+            .as_ref()
+            .is_some_and(|rows| rows[local_y] & bit != 0)
+    }
+
+    fn insert(&mut self, x: i32, y: i32) {
+        let x = x as usize;
+        let y = y as usize;
+        let tile_index = (y / VISITED_TILE_SIZE) * self.tiles_x + x / VISITED_TILE_SIZE;
+        let local_y = y % VISITED_TILE_SIZE;
+        let bit = 1u64 << (x % VISITED_TILE_SIZE);
+        let tile = &mut self.tiles[tile_index];
+        if tile.is_none() {
+            self.allocated_tiles += 1;
+        }
+        let rows = tile.get_or_insert_with(|| Box::new([0; VISITED_TILE_SIZE]));
+        rows[local_y] |= bit;
+    }
+
+    fn allocated_tile_count(&self) -> usize {
+        self.allocated_tiles
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1252,88 @@ pub fn thumbnail_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
+        let Some(target) = surface.get_pixel(x, y) else {
+            return SelMask::empty();
+        };
+        let width = surface.width as i32;
+        let height = surface.height as i32;
+        if width <= 0 || height <= 0 {
+            return SelMask::empty();
+        }
+        let mut visited = vec![false; width as usize * height as usize];
+        let index = |x: i32, y: i32| y as usize * width as usize + x as usize;
+        let is_open = |visited: &[bool], x: i32, y: i32| {
+            !visited[index(x, y)]
+                && surface.clip.is_none_or(|clip| clip.contains(x, y))
+                && surface
+                    .get_pixel(x, y)
+                    .is_some_and(|pixel| color_within_tolerance(pixel, target, tolerance))
+        };
+        let mut stack = vec![(x, y)];
+        let mut bounds: Option<IRect> = None;
+        while let Some((seed_x, seed_y)) = stack.pop() {
+            if !is_open(&visited, seed_x, seed_y) {
+                continue;
+            }
+            let mut left = seed_x;
+            while left > 0 && is_open(&visited, left - 1, seed_y) {
+                left -= 1;
+            }
+            let mut right = seed_x;
+            while right + 1 < width && is_open(&visited, right + 1, seed_y) {
+                right += 1;
+            }
+            let span_rect = IRect {
+                x0: left,
+                y0: seed_y,
+                x1: right + 1,
+                y1: seed_y + 1,
+            };
+            let span_start = seed_y as usize * width as usize + left as usize;
+            let span_len = (right - left + 1) as usize;
+            visited[span_start..span_start + span_len].fill(true);
+            bounds = Some(bounds.map_or(span_rect, |bounds| bounds.union(&span_rect)));
+            for next_y in [seed_y - 1, seed_y + 1] {
+                if next_y < 0 || next_y >= height {
+                    continue;
+                }
+                let mut in_run = false;
+                for next_x in left..=right {
+                    if is_open(&visited, next_x, next_y) {
+                        if !in_run {
+                            stack.push((next_x, next_y));
+                            in_run = true;
+                        }
+                    } else {
+                        in_run = false;
+                    }
+                }
+            }
+        }
+        let Some(bbox) = bounds else {
+            return SelMask::empty();
+        };
+        let bbox_width = bbox.width() as usize;
+        let bbox_height = bbox.height() as usize;
+        let mut mask = vec![0; bbox_width * bbox_height];
+        for mask_y in 0..bbox_height {
+            for mask_x in 0..bbox_width {
+                let source_x = bbox.x0 + mask_x as i32;
+                let source_y = bbox.y0 + mask_y as i32;
+                if visited[index(source_x, source_y)] {
+                    mask[mask_y * bbox_width + mask_x] = 255;
+                }
+            }
+        }
+        SelMask { bbox, mask }
+    }
+
+    fn assert_masks_equal(actual: &SelMask, expected: &SelMask) {
+        assert_eq!(actual.bbox, expected.bbox);
+        assert_eq!(actual.mask, expected.mask);
+    }
 
     /// 塗りつぶされたバッファを持つテスト用 `Surface` を作る。
     fn make_buffer(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
@@ -2112,6 +2260,174 @@ mod tests {
     }
 
     #[test]
+    fn sparse_visited_allocates_only_touched_tiles() {
+        let Some(mut visited) = SparseVisited::new(128, 64) else {
+            panic!("visited tile grid allocation failed");
+        };
+        visited.insert(0, 0);
+        visited.insert(63, 63);
+        assert_eq!(visited.allocated_tile_count(), 1);
+        visited.insert(64, 0);
+        assert_eq!(visited.allocated_tile_count(), 2);
+        assert!(visited.contains(63, 63));
+        assert!(!visited.contains(62, 63));
+    }
+
+    #[test]
+    fn flood_mask_matches_dense_reference_on_random_images() {
+        let mut state = 0x9e37_79b9u32;
+        for case in 0..40 {
+            let width = 5 + case % 12;
+            let height = 4 + case % 9;
+            let mut buffer = vec![0u8; width as usize * height as usize * 4];
+            for pixel in buffer.chunks_exact_mut(4) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                pixel.copy_from_slice(&[
+                    (state >> 24) as u8,
+                    (state >> 16) as u8,
+                    (state >> 8) as u8,
+                    255,
+                ]);
+            }
+            let start_x = (state % width) as i32;
+            let start_y = (state.rotate_left(7) % height) as i32;
+            let tolerance = (state >> 27) as u8 * 8;
+            let surface = Surface {
+                width,
+                height,
+                pixels: &mut buffer,
+                clip: None,
+                alpha_lock: false,
+            };
+            let actual = flood_mask(&surface, start_x, start_y, tolerance);
+            let expected = reference_flood_mask(&surface, start_x, start_y, tolerance);
+            assert_masks_equal(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn flood_mask_includes_exact_tolerance_boundary() {
+        let mut buffer = vec![10, 20, 30, 255, 20, 10, 40, 245, 21, 20, 30, 255];
+        let surface = Surface {
+            width: 3,
+            height: 1,
+            pixels: &mut buffer,
+            clip: None,
+            alpha_lock: false,
+        };
+        let mask = flood_mask(&surface, 0, 0, 10);
+        assert_eq!(mask.bbox.x1, 2);
+        assert!(mask.contains(1, 0));
+        assert!(!mask.contains(2, 0));
+    }
+
+    #[test]
+    fn flood_mask_thin_large_bbox_matches_reference_and_tile_count() {
+        let width = 4097u32;
+        let mut buffer = make_buffer(width, 1, [3, 4, 5, 255]);
+        let surface = Surface {
+            width,
+            height: 1,
+            pixels: &mut buffer,
+            clip: None,
+            alpha_lock: false,
+        };
+        let (actual, tile_count) = flood_mask_impl(&surface, 0, 0, 0);
+        let expected = reference_flood_mask(&surface, 0, 0, 0);
+        assert_masks_equal(&actual, &expected);
+        assert_eq!(tile_count, 65);
+    }
+
+    #[test]
+    fn flood_mask_respects_clip_hole() {
+        let mut buffer = make_buffer(130, 2, [8, 9, 10, 255]);
+        let mut clip_mask = vec![255u8; 130 * 2];
+        clip_mask[64] = 0;
+        clip_mask[130 + 64] = 0;
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 130,
+                y1: 2,
+            },
+            mask: clip_mask,
+        };
+        let surface = Surface {
+            width: 130,
+            height: 2,
+            pixels: &mut buffer,
+            clip: Some(&clip),
+            alpha_lock: false,
+        };
+        let actual = flood_mask(&surface, 0, 0, 0);
+        let expected = reference_flood_mask(&surface, 0, 0, 0);
+        assert_masks_equal(&actual, &expected);
+        assert_eq!(actual.bbox.x1, 64);
+    }
+
+    #[test]
+    fn flood_mask_tile_boundary_and_small_region_allocate_only_touched_tiles() {
+        let mut boundary_buffer = make_buffer(66, 1, [0, 0, 0, 255]);
+        for x in 63..=64 {
+            let index = x * 4;
+            boundary_buffer[index..index + 4].copy_from_slice(&[7, 7, 7, 255]);
+        }
+        let boundary_surface = Surface {
+            width: 66,
+            height: 1,
+            pixels: &mut boundary_buffer,
+            clip: None,
+            alpha_lock: false,
+        };
+        let (boundary_mask, boundary_tiles) = flood_mask_impl(&boundary_surface, 63, 0, 0);
+        assert_eq!(boundary_mask.mask, vec![255, 255]);
+        assert_eq!(boundary_tiles, 2);
+
+        let mut large_buffer = make_buffer(512, 512, [0, 0, 0, 255]);
+        for y in 10..12 {
+            for x in 10..12 {
+                let index = (y * 512 + x) * 4;
+                large_buffer[index..index + 4].copy_from_slice(&[1, 2, 3, 255]);
+            }
+        }
+        let large_surface = Surface {
+            width: 512,
+            height: 512,
+            pixels: &mut large_buffer,
+            clip: None,
+            alpha_lock: false,
+        };
+        let (mask, tile_count) = flood_mask_impl(&large_surface, 10, 10, 0);
+        assert_eq!(mask.mask, vec![255; 4]);
+        assert_eq!(tile_count, 1);
+    }
+
+    #[test]
+    fn flood_mask_sparse_and_dense_performance_observation() {
+        let width = 1024u32;
+        let height = 1024u32;
+        let mut buffer = make_buffer(width, height, [21, 22, 23, 255]);
+        let surface = Surface {
+            width,
+            height,
+            pixels: &mut buffer,
+            clip: None,
+            alpha_lock: false,
+        };
+        let sparse_start = std::time::Instant::now();
+        let sparse = flood_mask(&surface, 0, 0, 0);
+        let sparse_elapsed = sparse_start.elapsed();
+        let dense_start = std::time::Instant::now();
+        let dense = reference_flood_mask(&surface, 0, 0, 0);
+        let dense_elapsed = dense_start.elapsed();
+        assert_masks_equal(&sparse, &dense);
+        eprintln!(
+            "flood_mask 1024x1024 full region: sparse={sparse_elapsed:?}, dense={dense_elapsed:?}"
+        );
+    }
+
+    #[test]
     fn flood_mask_4000x4000_is_correct_and_terminates() {
         // flood_fill_4000x4000_is_correct_and_terminates と同じ回帰検知
         // (デバッグビルドでの緩い上限)。
@@ -2144,6 +2460,7 @@ mod tests {
             elapsed.as_secs() < 10,
             "flood_mask took suspiciously long (possible regression): {elapsed:?}"
         );
+        eprintln!("flood_mask 4000x4000 full region: sparse={elapsed:?}");
     }
 
     // -- v4 §16.4/§23: グラデーション -----------------------------------------

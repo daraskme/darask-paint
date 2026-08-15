@@ -202,12 +202,18 @@ fn alpha_slider(ui: &mut egui::Ui, primary: &mut Color32) {
 
 /// SPEC §14 項目3: 「HEX 入力欄(#RRGGBB / #RRGGBBAA、確定で反映)」。
 fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) {
+    let id = egui::Id::new("darask_color_hex");
     let response = ui.add(
         egui::TextEdit::singleline(hex_buffer)
-            .id(egui::Id::new("darask_color_hex"))
+            .id(id)
             .desired_width(84.0)
             .hint_text("#RRGGBB"),
     );
+    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        *hex_buffer = format_hex(*primary);
+        ui.memory_mut(|memory| memory.surrender_focus(id));
+        return;
+    }
     // レイヤー名編集(`layers_panel.rs`)と同じパターン: `lost_focus` を
     // 「確定」の合図として使う(Enter・クリックで外れる、いずれも対応)。
     if response.lost_focus() {
@@ -215,8 +221,20 @@ fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) 
             *primary = color;
         }
     }
-    // フォーカスが無い間だけ現在の primary を表示する(編集中は上書きしない)。
-    if !response.has_focus() {
+    let invalid = parse_hex_color(hex_buffer).is_none();
+    if invalid {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.0),
+            2.0,
+            Stroke::new(1.5, Color32::from_rgb(220, 60, 60)),
+            StrokeKind::Outside,
+        );
+        ui.colored_label(
+            Color32::from_rgb(220, 60, 60),
+            "6桁または8桁の16進数を入力してください",
+        );
+    } else if !response.has_focus() {
+        // 正常な入力だけ現在値へ正規化する。無効な文字列は修正できるよう保持する。
         *hex_buffer = format_hex(*primary);
     }
 }
@@ -512,6 +530,18 @@ mod tests {
         assert_eq!(parse_hex_color("#1234567"), None);
         assert_eq!(parse_hex_color("#GGGGGG"), None);
         assert_eq!(parse_hex_color("#123456789"), None);
+    }
+
+    #[test]
+    fn invalid_hex_input_is_preserved_for_correction() {
+        let ctx = egui::Context::default();
+        let mut primary = Color32::BLACK;
+        let mut buffer = "#12GG34".to_owned();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            hex_input(ui, &mut primary, &mut buffer);
+        });
+        assert_eq!(buffer, "#12GG34");
+        assert_eq!(primary, Color32::BLACK);
     }
 
     #[test]

@@ -109,6 +109,7 @@ const MAX_BRUSH_OPACITY: u8 = 100;
 
 /// SPEC §8: トーストは約 4 秒表示する。
 const TOAST_DURATION: Duration = Duration::from_secs(4);
+const SETTINGS_SAVE_WARNING: &str = "設定を保存できませんでした";
 
 /// v4 §22: 多角形なげなわの「始点クリックで閉じる」判定距離(スクリーン
 /// 論理ポイント。SPEC §16 のハンドルサイズ(7pt)と同程度の当たり判定)。
@@ -1130,6 +1131,7 @@ pub struct DaraskApp {
     last_title: String,
     /// ステータスバーのトースト(SPEC §8: 約 4 秒表示)。
     toast: Option<(String, Instant)>,
+    toast_queue: VecDeque<String>,
 
     // -- v4 §26: 設定の永続化・最近使ったファイル(ARCHITECTURE.md §16.7) --
     /// 最近使ったファイル(SPEC §26: 最大 8、先頭が最新)。「ファイル >
@@ -1159,11 +1161,31 @@ pub struct DaraskApp {
     /// ため `save_settings` を無効化する(`save_settings` のドキュメント
     /// コメント参照)。実アプリ(`DaraskApp::new`)は常に `true`。
     persist_settings: bool,
+    /// 設定保存エラーのトーストは同じ実行中に一度だけ表示する。
+    settings_save_warning_shown: bool,
 
     bench: Option<BenchState>,
 }
 
 impl DaraskApp {
+    /// 防御的に「常に1タブ以上」の不変条件をフレーム入口で復旧する。
+    fn ensure_tab_invariant(&mut self) {
+        if !self.tabs.is_empty() {
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+            return;
+        }
+        let number = self.take_recovery_untitled_number();
+        self.tabs.push(Tab::new(
+            Document::new(DEFAULT_NEW_WIDTH, DEFAULT_NEW_HEIGHT, Background::White),
+            Some(number),
+            self.max_undo_steps,
+        ));
+        self.active_tab = 0;
+        self.reset_tool_state_for_new_document();
+    }
+
     /// v5 §30(ARCHITECTURE.md §17.1): アクティブタブへの参照。`active_tab`
     /// (index フィールド)は `DaraskApp::new`/`new_for_test` が常に
     /// `tabs` の有効な範囲で初期化し、タブを閉じる操作(v5 §17.4、
@@ -1382,6 +1404,7 @@ impl DaraskApp {
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
             last_title: String::new(),
             toast: None,
+            toast_queue: VecDeque::new(),
             recent_files: settings.recent_files,
             // ベンチモードは 2 フレームで自動終了する決定的なスモーク
             // テストなので、リサイズを送らない(SPEC §11)。
@@ -1396,6 +1419,7 @@ impl DaraskApp {
             window_size,
             window_maximized: settings.window_maximized,
             persist_settings: true,
+            settings_save_warning_shown: false,
             bench,
         };
         if let Some(message) = startup_error {
@@ -2570,7 +2594,15 @@ impl DaraskApp {
         );
         let new_w_px = (new_w.round() as u32).max(1);
         let new_h_px = (new_h.round() as u32).max(1);
-        let new_id = (new_w_px != cur_w || new_h_px != cur_h).then(|| self.alloc_floating_id());
+        let size_changed = new_w_px != cur_w || new_h_px != cur_h;
+        let new_id = if size_changed {
+            self.alloc_floating_id()
+        } else {
+            None
+        };
+        if size_changed && new_id.is_none() {
+            return;
+        }
         let Some(floating) = self.active_tab_mut().floating.as_mut() else {
             return;
         };
@@ -2805,6 +2837,9 @@ impl DaraskApp {
             self.active_tab_mut().selection = None;
             return;
         }
+        let Some(id) = self.alloc_floating_id() else {
+            return;
+        };
         // `history`/`doc` を同時に触るため、`self.tabs[..]` を直接経由する
         // (`active_tab_mut()` を複数回呼ぶと `*self` の二重可変借用になる、
         // `end_active_gesture` のコメント参照)。
@@ -2819,7 +2854,6 @@ impl DaraskApp {
         tab.doc.modified = true;
 
         let pos = pos2(rect.x0 as f32, rect.y0 as f32);
-        let id = self.alloc_floating_id();
         let mask_bits = mask.mask.clone();
         let mut floating = Floating::new(
             pixels,
@@ -2837,9 +2871,13 @@ impl DaraskApp {
         self.select_drag = Some(SelectDrag::MoveFloating { offset });
     }
 
-    fn alloc_floating_id(&mut self) -> u64 {
-        self.next_floating_id += 1;
-        self.next_floating_id
+    fn alloc_floating_id(&mut self) -> Option<u64> {
+        let Some(next) = self.next_floating_id.checked_add(1) else {
+            self.show_toast("浮動片IDを採番できないため、操作を中止しました".to_owned());
+            return None;
+        };
+        self.next_floating_id = next;
+        Some(next)
     }
 
     /// 浮動片を現在位置に合成して 1 つの undo 単位にし、選択を解除する
@@ -3371,7 +3409,9 @@ impl DaraskApp {
         pixels: Vec<u8>,
         label: &'static str,
     ) {
-        let id = self.alloc_floating_id();
+        let Some(id) = self.alloc_floating_id() else {
+            return;
+        };
         self.tool = ToolKind::Select;
         // 切り出し元が無いので `begin_stroke` するだけで `ensure_tiles_saved`
         // は呼ばない(confirm 時に合成先だけ保存すれば十分、
@@ -3942,6 +3982,26 @@ impl DaraskApp {
     // -----------------------------------------------------------------
 
     fn show_toast(&mut self, message: String) {
+        if self.toast.is_none() {
+            self.start_toast(message);
+        } else {
+            self.toast_queue.push_back(message);
+        }
+    }
+
+    fn show_settings_save_warning(&mut self) {
+        if self.toast.is_none() {
+            self.start_toast(SETTINGS_SAVE_WARNING.to_owned());
+        } else {
+            self.toast_queue
+                .push_front(SETTINGS_SAVE_WARNING.to_owned());
+        }
+    }
+
+    fn start_toast(&mut self, message: String) {
+        if message == SETTINGS_SAVE_WARNING {
+            self.settings_save_warning_shown = true;
+        }
         self.toast = Some((message, Instant::now()));
     }
 
@@ -3949,15 +4009,22 @@ impl DaraskApp {
     /// (ARCHITECTURE.md §3 の再描画ポリシーの唯一の例外)。表示すべき文言を
     /// 返す。
     fn tick_toast(&mut self, ctx: &egui::Context) -> Option<String> {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, started)| started.elapsed() >= TOAST_DURATION)
+        {
+            self.toast = None;
+        }
+        if self.toast.is_none() {
+            if let Some(message) = self.toast_queue.pop_front() {
+                self.start_toast(message);
+            }
+        }
         let (message, started) = self.toast.as_ref()?;
         let elapsed = started.elapsed();
-        if elapsed >= TOAST_DURATION {
-            self.toast = None;
-            None
-        } else {
-            ctx.request_repaint_after(TOAST_DURATION - elapsed);
-            Some(message.clone())
-        }
+        ctx.request_repaint_after(TOAST_DURATION - elapsed);
+        Some(message.clone())
     }
 
     /// D&D でファイルが落とされたら新規タブとして開く(SPEC §30: 「ドラッグ
@@ -3965,13 +4032,15 @@ impl DaraskApp {
     /// した場合は複数タブを開く」)。新規タブの追加は既存タブを破壊しない
     /// ため、v1〜v4 と異なり未保存ガードは不要(`open_path_in_new_tab` 参照)。
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if self.modal.is_some() {
-            // 他のモーダル(新規/サイズ変更ダイアログ等)が表示中に新規タブを
-            // 追加するとモーダルの状態と食い違うため、何もしない(モーダルを
-            // 閉じてから再度ドロップしてもらう)。
+            if dropped.iter().any(|file| file.path.is_some()) {
+                self.show_toast(
+                    "ダイアログを閉じてから、ファイルをもう一度ドロップしてください".to_owned(),
+                );
+            }
             return;
         }
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for path in dropped.into_iter().filter_map(|f| f.path) {
             if path.is_dir() {
                 self.open_folder_as_pages(path);
@@ -4161,7 +4230,7 @@ impl DaraskApp {
     /// `tabs` から取り除いて `active_tab` を整合させる処理(ARCHITECTURE.md
     /// §17.8-3: 「境界チェックを怠らない」)。
     fn remove_tab_and_adjust_active(&mut self, index: usize) {
-        if index >= self.tabs.len() {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
         }
         self.tabs.remove(index);
@@ -4507,12 +4576,18 @@ impl DaraskApp {
 
     /// SPEC §30: 「Ctrl+Tab: 次のタブへ切り替え(端では反対側へ循環)」。
     fn next_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let next = (self.active_tab + 1) % self.tabs.len();
         self.switch_tab(next);
     }
 
     /// SPEC §30: 「Ctrl+Shift+Tab: 前のタブへ切り替え(端では反対側へ循環)」。
     fn prev_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
         let prev = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
         self.switch_tab(prev);
     }
@@ -4533,7 +4608,14 @@ impl DaraskApp {
 
     fn open_new_tab_internal(&mut self, doc: Document, history: Option<History>) -> usize {
         self.commit_open_gesture();
-        let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
+        let untitled_number = if doc.path.is_none() {
+            let Some(number) = self.take_untitled_number() else {
+                return self.active_tab;
+            };
+            Some(number)
+        } else {
+            None
+        };
         // バグ修正: 以前はここで `self.layer_rename = None` を無条件に
         // 実行していたが、これは共有フィールドだった頃の名残。新規タブは
         // 追加されるだけで既存タブ(そのタブ自身の `layer_rename`)を一切
@@ -4552,10 +4634,20 @@ impl DaraskApp {
     }
 
     /// SPEC §30: 「無題」「無題2」…の採番(`Tab::untitled_number` 参照)。
-    fn take_untitled_number(&mut self) -> u32 {
+    fn take_untitled_number(&mut self) -> Option<u32> {
         let n = self.next_untitled_number;
-        self.next_untitled_number += 1;
-        n
+        let Some(next) = n.checked_add(1) else {
+            self.show_toast("無題番号を採番できないため、操作を中止しました".to_owned());
+            return None;
+        };
+        self.next_untitled_number = next;
+        Some(n)
+    }
+
+    fn take_recovery_untitled_number(&mut self) -> u32 {
+        let number = self.next_untitled_number;
+        self.next_untitled_number = self.next_untitled_number.saturating_add(1);
+        number
     }
 
     /// SPEC §30: Ctrl+N / メニュー「新規」。新規タブを追加する方式に変わった
@@ -4628,7 +4720,13 @@ impl DaraskApp {
     fn begin_save(&mut self) {
         self.commit_open_gesture();
         match self.active_tab().doc.path.clone() {
-            Some(path) => self.begin_save_to_path(path),
+            Some(path) if io::format_for_path(&path).is_some() => self.begin_save_to_path(path),
+            Some(_) => {
+                self.show_toast(
+                    "この形式には上書き保存できません。名前を付けて保存してください".to_owned(),
+                );
+                self.pending_dialog = Some(DialogRequest::SaveAs);
+            }
             None => self.pending_dialog = Some(DialogRequest::SaveAs),
         }
     }
@@ -4651,18 +4749,10 @@ impl DaraskApp {
             }
             Some(format) => self.finish_save(path, format),
             None => {
-                // M4 で発見・修正したバグ: 「名前を付けて保存」経路
-                // (`process_pending_dialog`)は `io::ensure_extension` を通す
-                // ため、対応外拡張子(.gif/.webp 等)には確実に `.png` が
-                // 付く。しかし「上書き保存」(Ctrl+S)は `doc.path` が既に
-                // 決まっていればここへ直行し `ensure_extension` を通らない
-                // ため、GIF/WebP を開いて Ctrl+S すると拡張子は `.gif`/
-                // `.webp` のまま中身だけ PNG バイト列で上書きされてしまって
-                // いた(SPEC §8: 「拡張子で判定、不明な拡張子なら .png を
-                // 付ける」に違反、かつ拡張子と実体が食い違うファイルが
-                // サイレントに生成される)。ここでも同じく拡張子を補正する。
-                let path = io::ensure_extension(path);
-                self.finish_save(path, SaveFormat::Png);
+                self.show_toast(
+                    "この形式には保存できません。名前を付けて保存してください".to_owned(),
+                );
+                self.pending_dialog = Some(DialogRequest::SaveAs);
             }
         }
     }
@@ -4775,7 +4865,9 @@ impl DaraskApp {
             .map(|(i, _)| i)
             .collect();
         for index in detach {
-            let number = self.take_untitled_number();
+            let Some(number) = self.take_untitled_number() else {
+                return;
+            };
             let tab = &mut self.tabs[index];
             let current_page_matches = tab
                 .pages
@@ -4869,7 +4961,14 @@ impl DaraskApp {
         // いても「無題4」に更新されない)残っていた。通常の Ctrl+N
         // (`open_new_tab`)と同じく、パスの無い新規ドキュメントには
         // 必ず新しい番号を払い出す。
-        let untitled_number = doc.path.is_none().then(|| self.take_untitled_number());
+        let untitled_number = if doc.path.is_none() {
+            let Some(number) = self.take_untitled_number() else {
+                return;
+            };
+            Some(number)
+        } else {
+            None
+        };
         self.active_tab_mut().doc = doc;
         // v12 §50.1: 文書ごと差し替えたのでレイヤーサムネイルは全消去する
         // (`content_gen` は新しい文書の 0 から始まるため、消さないと前の
@@ -4945,14 +5044,18 @@ impl DaraskApp {
     fn reset_panel_layout(&mut self) {
         self.panels.reset();
         self.panels_need_clamp = false;
+        let warning_was_shown = self.settings_save_warning_shown;
         self.save_settings();
+        if !warning_was_shown && self.settings_save_warning_shown {
+            return;
+        }
         self.show_toast("パネル配置を既定に戻しました".to_string());
     }
 
     /// ARCHITECTURE.md §16.7: 「書き込みは終了時と最近使ったファイル更新時
     /// のみ」。この 2 箇所(`remember_recent_file`/`on_exit`/`exit_process`)
-    /// だけがこれを呼ぶ。書き込み失敗は無視する(`settings::save` 自体が
-    /// パニックしない、SPEC §26)。
+    /// だけがこれを呼ぶ。書き込み失敗は終了を妨げず、実行中に一度だけ
+    /// 非モーダルの警告トーストを表示する。
     ///
     /// `self.persist_settings` が `false`(`new_for_test` 経由のユニット
     /// テストは常にこう)なら何もしない — `open_path`/`finish_save` 等の
@@ -4963,9 +5066,28 @@ impl DaraskApp {
     /// (`settings.rs` 自体の I/O テストは temp dir 経由の
     /// `save_to_path`/`load_from_path` で既に検証済み、ここでの実書き込みは
     /// 不要)。
-    fn save_settings(&self) {
+    fn save_settings(&mut self) {
         if self.persist_settings {
-            settings::save(&self.current_settings());
+            let result = settings::save(&self.current_settings());
+            self.handle_settings_save_result(result);
+        }
+    }
+
+    fn handle_settings_save_result(&mut self, result: std::io::Result<()>) {
+        let warning_is_active = self
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message == SETTINGS_SAVE_WARNING);
+        let warning_is_queued = self
+            .toast_queue
+            .iter()
+            .any(|message| message == SETTINGS_SAVE_WARNING);
+        if result.is_err()
+            && !self.settings_save_warning_shown
+            && !warning_is_active
+            && !warning_is_queued
+        {
+            self.show_settings_save_warning();
         }
     }
 
@@ -4979,7 +5101,7 @@ impl DaraskApp {
     /// これを経由させない: ベンチはユーザー操作を伴わない決定的なスモーク
     /// テストであり、実行するたびに実 `%APPDATA%` の設定ファイルを上書きする
     /// のは望ましくない副作用になる。
-    fn exit_process(&self) -> ! {
+    fn exit_process(&mut self) -> ! {
         // v12 §53 の終了契約: 実行中ジョブへ非ブロッキングにキャンセルを
         // 通知してから落ちる(`process::exit` はデストラクタを走らせないので
         // ここで明示的に伝える必要がある)。
@@ -5097,7 +5219,9 @@ impl DaraskApp {
             // 自由変形と同じ入口 — commit-first ガードも同関数が持つ)。
             self.free_transform();
         }
-        let id = self.alloc_floating_id();
+        let Some(id) = self.alloc_floating_id() else {
+            return false;
+        };
         let Some(floating) = self.active_tab_mut().floating.as_mut() else {
             return false;
         };
@@ -5376,7 +5500,10 @@ impl DaraskApp {
     /// 呼び出し元が確認済み)。
     fn insert_duplicated_tab(&mut self, doc: Document) -> usize {
         // SPEC §31: 「パスは無し(「無題」系の命名)」なので常に採番する。
-        let untitled_number = Some(self.take_untitled_number());
+        let Some(number) = self.take_untitled_number() else {
+            return self.active_tab;
+        };
+        let untitled_number = Some(number);
         let insert_at = self.active_tab + 1;
         // バグ修正: 以前はここで `self.layer_rename = None` を無条件に
         // 実行していたが、新規タブは挿入されるだけで元タブ(そのタブ自身の
@@ -7041,6 +7168,8 @@ impl DaraskApp {
 
 impl eframe::App for DaraskApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ensure_tab_invariant();
+
         // 起動時白画面(DWM 合成の競合)ワークアラウンド。`StartupNudge` の
         // ドキュメントコメント参照。
         self.tick_startup_nudge(ui.ctx());
@@ -7678,6 +7807,7 @@ mod tests {
             last_jpeg_quality: DEFAULT_JPEG_QUALITY,
             last_title: String::new(),
             toast: None,
+            toast_queue: VecDeque::new(),
             recent_files: VecDeque::new(),
             // テストにはウィンドウが無いため、ワークアラウンドは常に完了
             // 状態にしておく。
@@ -7690,6 +7820,7 @@ mod tests {
             window_maximized: false,
             // テストは実 `%APPDATA%` を書き換えない(`save_settings` 参照)。
             persist_settings: false,
+            settings_save_warning_shown: false,
             bench: None,
         }
     }
@@ -9674,10 +9805,10 @@ mod tests {
         );
     }
 
-    // -- GIF/WebP への上書き保存が拡張子を補正しないバグ(修正済み) ---------
+    // -- GIF/WebP への上書き保存を名前を付けて保存へ誘導する ----------------
 
     #[test]
-    fn begin_save_to_path_corrects_unsupported_extension_to_png() {
+    fn begin_save_to_path_rejects_unsupported_extension_and_opens_save_as() {
         let dir = std::env::temp_dir().join(format!(
             "darask_paint_test_savepath_{}_{}",
             std::process::id(),
@@ -9690,18 +9821,40 @@ mod tests {
         let gif_path = dir.join("photo.gif");
 
         let mut app = new_for_test(Document::new(2, 2, Background::White));
+        app.active_tab_mut().doc.path = Some(gif_path.clone());
         app.begin_save_to_path(gif_path.clone());
 
         let png_path = dir.join("photo.png");
-        assert_eq!(
-            app.active_tab().doc.path,
-            Some(png_path.clone()),
-            "saving to an unsupported extension must redirect to .png instead of writing PNG bytes under .gif"
-        );
-        assert!(png_path.exists());
+        // v12 Phase 7-2: 黙ってパスを書き換える仕様を廃止し、ユーザーに
+        // 保存先を選び直してもらう。元の関連付けとファイルは変更しない。
+        assert_eq!(app.active_tab().doc.path, Some(gif_path.clone()));
+        assert!(matches!(app.pending_dialog, Some(DialogRequest::SaveAs)));
+        assert!(app.toast.is_some());
+        assert!(!png_path.exists());
         assert!(!gif_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropped_file_during_modal_shows_retry_toast() {
+        let mut app = new_for_test(Document::new(2, 2, Background::White));
+        app.modal = Some(ModalState::About);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(PathBuf::from("dropped.png")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.handle_dropped_files(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| { message.contains("ダイアログを閉じてから") }));
     }
 
     // -- モーダル表示中の閉じる要求が握りつぶされるバグ(修正済み) -----------
@@ -11627,6 +11780,92 @@ mod tests {
         assert_eq!(app.active_tab, 0);
         app.prev_tab();
         assert_eq!(app.active_tab, 2, "SPEC §30: 前のタブも端で循環する");
+    }
+
+    #[test]
+    fn empty_tab_list_is_restored_and_tab_navigation_is_safe() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs.clear();
+        app.active_tab = 0;
+        app.next_tab();
+        app.prev_tab();
+        app.ensure_tab_invariant();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(
+            app.active_tab().doc.get_pixel(0, 0),
+            Some([255, 255, 255, 255])
+        );
+    }
+
+    #[test]
+    fn overflowing_internal_counters_refuse_operations_with_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.next_floating_id = u64::MAX;
+        app.place_new_floating(pos2(0.0, 0.0), 1, 1, vec![0; 4], "貼り付け");
+        assert!(app.active_tab().floating.is_none());
+        assert!(app.toast.is_some());
+
+        app.toast = None;
+        app.next_untitled_number = u32::MAX;
+        let tab_count = app.tabs.len();
+        app.open_new_tab(Document::new(2, 2, Background::White));
+        assert_eq!(app.tabs.len(), tab_count);
+        assert!(app.toast.is_some());
+    }
+
+    #[test]
+    fn settings_save_failure_shows_only_one_warning_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let error = || std::io::Error::other("disk full");
+        app.handle_settings_save_result(Err(error()));
+        let first = app.toast.clone();
+        app.handle_settings_save_result(Err(error()));
+        assert_eq!(app.toast, first);
+        assert!(app.settings_save_warning_shown);
+    }
+
+    #[test]
+    fn queued_settings_warning_is_marked_shown_only_when_displayed() {
+        let ctx = egui::Context::default();
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.show_toast("画像を書き出しました".to_owned());
+        app.handle_settings_save_result(Err(std::io::Error::other("disk full")));
+        assert!(!app.settings_save_warning_shown);
+        assert_eq!(
+            app.toast_queue.front().map(String::as_str),
+            Some(SETTINGS_SAVE_WARNING)
+        );
+
+        app.toast.as_mut().unwrap().1 = Instant::now() - TOAST_DURATION;
+        assert_eq!(app.tick_toast(&ctx).as_deref(), Some(SETTINGS_SAVE_WARNING));
+        assert!(app.settings_save_warning_shown);
+
+        app.handle_settings_save_result(Err(std::io::Error::other("still full")));
+        assert!(
+            app.toast_queue.is_empty(),
+            "warning must be shown only once"
+        );
+    }
+
+    #[test]
+    fn remove_tab_helper_refuses_to_remove_the_last_tab() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.remove_tab_and_adjust_active(0);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn tab_invariant_recovery_at_number_exhaustion_has_no_failure_toast() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.tabs.clear();
+        app.next_untitled_number = u32::MAX;
+        app.toast = None;
+        app.ensure_tab_invariant();
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].untitled_number, Some(u32::MAX));
+        assert!(app.toast.is_none());
     }
 
     #[test]
