@@ -1329,6 +1329,158 @@ pub fn paint_about_icon(painter: &Painter, rect: Rect, color: Color32) {
 }
 
 // ---------------------------------------------------------------------------
+// v12 §59: メニューバーのグループタイル
+// ---------------------------------------------------------------------------
+
+/// ファイル操作グループ: タブ付きフォルダー。
+pub fn paint_menu_file_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    painter.line_segment([p(rect, 0.12, 0.3), p(rect, 0.4, 0.3)], st);
+    painter.line_segment([p(rect, 0.4, 0.3), p(rect, 0.5, 0.42)], st);
+    painter.line_segment([p(rect, 0.5, 0.42), p(rect, 0.88, 0.42)], st);
+    painter.rect_stroke(
+        Rect::from_min_max(p(rect, 0.12, 0.3), p(rect, 0.88, 0.78)),
+        rect.width() * 0.06,
+        st,
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// 選択操作グループ: 破線の選択矩形。
+pub fn paint_menu_selection_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let segments = [
+        (0.16, 0.18, 0.4, 0.18),
+        (0.6, 0.18, 0.84, 0.18),
+        (0.16, 0.82, 0.4, 0.82),
+        (0.6, 0.82, 0.84, 0.82),
+        (0.16, 0.18, 0.16, 0.42),
+        (0.16, 0.58, 0.16, 0.82),
+        (0.84, 0.18, 0.84, 0.42),
+        (0.84, 0.58, 0.84, 0.82),
+    ];
+    for (x1, y1, x2, y2) in segments {
+        painter.line_segment([p(rect, x1, y1), p(rect, x2, y2)], st);
+    }
+}
+
+/// サイズ操作グループ: 枠と対角方向の寸法矢印。
+pub fn paint_menu_size_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    painter.rect_stroke(
+        Rect::from_min_max(p(rect, 0.16, 0.16), p(rect, 0.84, 0.84)),
+        0.0,
+        st,
+        egui::StrokeKind::Middle,
+    );
+    painter.line_segment([p(rect, 0.3, 0.7), p(rect, 0.7, 0.3)], st);
+    arrow_head(
+        painter,
+        p(rect, 0.7, 0.3),
+        vec2(0.7, -0.7),
+        rect.width() * 0.13,
+        color,
+    );
+    arrow_head(
+        painter,
+        p(rect, 0.3, 0.7),
+        vec2(-0.7, 0.7),
+        rect.width() * 0.13,
+        color,
+    );
+}
+
+/// 変形操作グループ: 四隅ハンドルと回転矢印。
+pub fn paint_menu_transform_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    painter.rect_stroke(
+        Rect::from_min_max(p(rect, 0.24, 0.24), p(rect, 0.76, 0.76)),
+        0.0,
+        st,
+        egui::StrokeKind::Middle,
+    );
+    for (x, y) in [(0.24, 0.24), (0.76, 0.24), (0.24, 0.76), (0.76, 0.76)] {
+        painter.circle_filled(p(rect, x, y), rect.width() * 0.055, color);
+    }
+    painter.add(Shape::line(
+        arc_points(
+            p(rect, 0.22, 0.62),
+            p(rect, 0.5, 0.02),
+            p(rect, 0.82, 0.38),
+            10,
+        ),
+        st,
+    ));
+    arrow_head(
+        painter,
+        p(rect, 0.82, 0.38),
+        vec2(0.35, 0.94),
+        rect.width() * 0.12,
+        color,
+    );
+}
+
+/// 色調補正グループ: 3 本のスライダー。
+pub fn paint_menu_color_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    for (y, knob_x) in [(0.28, 0.36), (0.5, 0.66), (0.72, 0.48)] {
+        painter.line_segment([p(rect, 0.16, y), p(rect, 0.84, y)], st);
+        painter.circle_filled(p(rect, knob_x, y), rect.width() * 0.075, color);
+    }
+}
+
+/// AI・修復グループ: 修復を表す大小のきらめき。
+pub fn paint_menu_ai_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    for (cx, cy, radius) in [(0.42, 0.46, 0.28), (0.73, 0.27, 0.13)] {
+        painter.line_segment([p(rect, cx - radius, cy), p(rect, cx + radius, cy)], st);
+        painter.line_segment([p(rect, cx, cy - radius), p(rect, cx, cy + radius)], st);
+        painter.line_segment(
+            [
+                p(rect, cx - radius * 0.65, cy - radius * 0.65),
+                p(rect, cx + radius * 0.65, cy + radius * 0.65),
+            ],
+            st,
+        );
+        painter.line_segment(
+            [
+                p(rect, cx + radius * 0.65, cy - radius * 0.65),
+                p(rect, cx - radius * 0.65, cy + radius * 0.65),
+            ],
+            st,
+        );
+    }
+}
+
+/// レイヤー操作グループ: 3 枚の積層面。
+pub fn paint_menu_layer_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    for offset in [0.0, 0.12, 0.24] {
+        painter.add(Shape::closed_line(
+            vec![
+                p(rect, 0.16, 0.3 + offset),
+                p(rect, 0.5, 0.14 + offset),
+                p(rect, 0.84, 0.3 + offset),
+                p(rect, 0.5, 0.46 + offset),
+            ],
+            st,
+        ));
+    }
+}
+
+/// 表示操作グループ: 目。
+pub fn paint_menu_view_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    paint_eye_icon(painter, rect, color, true);
+}
+
+/// その他グループ: 横三点。
+pub fn paint_menu_other_group_icon(painter: &Painter, rect: Rect, color: Color32) {
+    for x in [0.25, 0.5, 0.75] {
+        painter.circle_filled(p(rect, x, 0.5), rect.width() * 0.075, color);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // v12 §50.1/§50.3: レイヤーパネルのアイコン(目 / 透明保護)
 // ---------------------------------------------------------------------------
 

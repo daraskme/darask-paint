@@ -1,40 +1,8 @@
-//! メニューバー(SPEC §7、v6 §33)。
+//! メニューバー(SPEC §7、v6 §33、v12 §59)。
 //!
-//! v1〜v5 はドロップダウン式(`egui::menu::bar` + `ui.menu_button`)だった。
-//! v6 M4(ARCHITECTURE.md §18.1)で「クリックでの開閉が無い、常時表示の
-//! アイコンボタン行」に置き換えた。各項目の**実際の意味・確認ダイアログ・
-//! ショートカットは一切変えていない**(見た目とレイアウトのみの変更、
-//! ARCHITECTURE.md §18.6 落とし穴4)。各項目は `MenuAction` を返し、
-//! `app.rs` が実行する(rfd のネイティブダイアログ呼び出しはフレーム処理の
-//! 外側で行う必要があるため、ここではまだ実行せず「何を要求されたか」だけを
-//! 返す、ARCHITECTURE.md §12-9)。有効/無効(元に戻す・やり直し・選択系・
-//! トリミング)は `MenuState` で受け取る。
-//!
-//! 「最近使ったファイル」だけは可変長リストのため、SPEC §33 が認める唯一の
-//! 例外としてクリックで軽量ポップアップ(`egui::Popup::menu` — `ui.menu_button`
-//! を内部で支えているのと同じ機構、`egui::containers::menu::MenuButton::ui`
-//! 参照)を開く。他は全てワンクリックで即座に `MenuAction` を返す。
-//!
-//! ## 折り返しの実装について(`ui.horizontal_wrapped` を使わない理由)
-//!
-//! `show` はまず `ui.available_width()` から「何個のボタン/区切りが 1 行に
-//! 収まるか」を貪欲法(グリーディ)で `pack_rows` により事前に計算し、
-//! その行数から `egui::Panel::top` の高さを `exact_size` で厳密に確定して
-//! から、行ごとに独立した(折り返しを伴わない)`ui.horizontal` を並べる。
-//!
-//! `ui.horizontal_wrapped` + `Panel` の既定の自動高さ計算(前フレームの
-//! パネル高さを引き継ぎ、実際のコンテンツ高さへ数フレームかけて収束する
-//! 挙動)を使わない理由: ウィンドウ幅が変わった直後の 1 フレーム目は
-//! 「まだ前の幅のときの行数」でパネル高さが決まってしまい、次の再描画
-//! (マウス移動等の入力)が来るまで正しい行数で表示されない可能性がある。
-//! このアプリは「入力がない限り再描画しない」(CLAUDE.md 鉄則、無条件の
-//! `request_repaint()` 禁止)ため、リサイズ直後にちょうど再描画が起きない
-//! フレームで実機確認・スクリーンショットを取ると、実際には数フレーム後に
-//! 解消する一時的な行不足が「項目が消えている」ように見えることがある
-//! (このモジュールの実装を固める過程で複数回遭遇した)。`pack_rows` は
-//! 現在のフレームの `ui.available_width()` だけから行数を導出できるので、
-//! `exact_size` と組み合わせれば**リサイズ直後の 1 フレーム目から**正しい
-//! 高さで確定させられ、この手のフレーム依存の見え方の揺れを避けられる。
+//! 頻繁に使う 9 操作だけを常時表示し、関連操作を 9 個のグループタイルへ
+//! まとめる。各項目が返す `MenuAction`、有効条件、ショートカット、確認
+//! ダイアログや履歴の扱いは従来から変更しない。
 
 use eframe::egui;
 
@@ -42,73 +10,48 @@ use crate::keymap::{self, Action};
 use crate::ui::icons;
 
 /// クリックされたメニュー項目(まだ副作用は起こさない。`app.rs` が実行する)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MenuAction {
     New,
     Open,
-    /// v4 §26: 「最近使ったファイル」サブメニューの `index` 番目
-    /// (`MenuState::recent_files` と同じ添字)。`PathBuf` を持たせると
-    /// `Copy` にできなくなるため、添字だけを運ぶ(`app.rs::open_recent_file`
-    /// が実際のパスを引く)。
     OpenRecent(usize),
     Save,
     SaveAs,
-    /// v5 §30/§32(V5-M3、ARCHITECTURE.md §17.6): 「タブを閉じる (Ctrl+W)」。
     CloseTab,
     Exit,
     Undo,
     Redo,
     Cut,
     Copy,
-    /// v8 §38: 「結合部分をコピー」(Ctrl+Shift+C)。通常のコピー(アクティブ
-    /// レイヤーのみ)と違い可視レイヤーの合成結果をコピーする
-    /// (`app.rs::copy_merged_selection_to_clipboard`)。
     CopyMerged,
     Paste,
-    /// v9 §43: 「ファイルから貼り付け」(MS ペイントの「貼り付け元」相当。
-    /// 画像を選び、クリップボード貼り付けと同じ規則で現在のタブへ)。
     PasteFromFile,
     Delete,
     SelectAll,
     Deselect,
-    /// v8 §37: 「選択範囲を反転」(Ctrl+Shift+I)。選択マスクの補集合を
-    /// 新しい選択にする(`app.rs::invert_selection`)。
     SelectInverse,
-    /// v12 §53: 「選択範囲を修復」(内蔵 Telea/FMM。ワーカー実行)。
     InpaintSelection,
-    /// v6 §33(ARCHITECTURE.md §18.1): 編集メニューに新規追加された
-    /// 「自由変形」(Ctrl+T と同じ、`app.rs::free_transform` を呼ぶだけ。
-    /// v3 §18 で実装済みの機能に、メニューからのアクセス経路を追加する)。
     FreeTransform,
     ImageResize,
     CanvasResize,
     Crop,
-    /// v5 §31(ARCHITECTURE.md §17.5): 「選択範囲を新規タブに複製」。
     DuplicateSelectionToTab,
-    /// v11 §48: 「選択範囲を切り取って新規タブへ」(複製の破壊的な対。
-    /// アクティブレイヤー基準で切り取り、元領域は透明になる)。
     CutSelectionToTab,
     FlipHorizontal,
     FlipVertical,
     RotateCw,
     RotateCcw,
-    // -- v4 §24: 色調補正(ARCHITECTURE.md §16.5) --------------------------
     BrightnessContrast,
     HueSaturation,
     Invert,
     Grayscale,
-    /// v12 §51.1: 「モザイク…」(色調補正グループ。ライブプレビュー付き)。
     Mosaic,
     ZoomIn,
     ZoomOut,
     Zoom100,
     FitWindow,
-    // -- v4 §25: ピクセルグリッド --------------------------------------------
     TogglePixelGrid,
-    /// v12 §58: 「パネル配置をリセット」(色/レイヤー/履歴を既定の右ドックへ
-    /// 戻し、設定にも反映する。`app.rs::reset_panel_layout`)。
     ResetPanelLayout,
-    // -- v2 §13: レイヤーメニュー(ARCHITECTURE.md §14.8 V2-M2) -----------
     LayerAdd,
     LayerDuplicate,
     LayerDelete,
@@ -116,18 +59,186 @@ pub enum MenuAction {
     LayerMoveDown,
     LayerMergeDown,
     LayerFlatten,
-    // -- v4 §26: ヘルプメニュー ------------------------------------------
     About,
-    /// v6 §33/§34(ARCHITECTURE.md §18.1/§18.2): 「その他」グループの設定
-    /// (歯車)ボタン。`ui/toolbar.rs::ToolbarAction::OpenPreferences` と
-    /// 同じ `app.rs::open_preferences_modal` を呼ぶだけ(ツールバー側の歯車
-    /// ボタンはそのまま残す — 2 箇所からアクセスできても害はない)。
     OpenPreferences,
 }
 
+/// メニュー項目の有効/無効判定に使う状態。
+pub struct MenuState<'a> {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub has_selection: bool,
+    pub background_job_running: bool,
+    pub can_duplicate_selection_to_tab: bool,
+    pub can_add_layer: bool,
+    pub can_delete_layer: bool,
+    pub can_move_layer_up: bool,
+    pub can_move_layer_down: bool,
+    pub can_merge_layer_down: bool,
+    pub can_flatten_layers: bool,
+    pub pixel_grid_visible: bool,
+    pub recent_files: &'a std::collections::VecDeque<std::path::PathBuf>,
+}
+
+const BUTTON_W: f32 = 44.0;
+const BUTTON_H: f32 = 40.0;
+const ICON_SIZE: f32 = 17.0;
+const LABEL_SIZE: f32 = 8.0;
+const SEP_W: f32 = 6.0;
+const ROW_ITEM_SPACING_X: f32 = 6.0;
+const PANEL_MARGIN_H: f32 = 8.0;
+const PANEL_MARGIN_V: f32 = 2.0;
+const POPUP_MIN_WIDTH: f32 = 286.0;
+const POPUP_ROW_H: f32 = 27.0;
+const POPUP_ICON_SIZE: f32 = 17.0;
+const FILE_RECENT_INSERT_INDEX: usize = 2;
+
+type PaintFn = fn(&egui::Painter, egui::Rect, egui::Color32);
+
+#[derive(Clone, Copy)]
+struct MenuGroup {
+    label: &'static str,
+    icon: PaintFn,
+    items: &'static [MenuAction],
+}
+
+#[derive(Clone, Copy)]
+enum MenuSlot {
+    Item(MenuAction),
+    Group(MenuGroup),
+    Separator,
+}
+
+const FILE_ITEMS: &[MenuAction] = &[
+    MenuAction::SaveAs,
+    MenuAction::PasteFromFile,
+    MenuAction::CloseTab,
+    MenuAction::Exit,
+];
+const SELECTION_ITEMS: &[MenuAction] = &[
+    MenuAction::SelectAll,
+    MenuAction::Deselect,
+    MenuAction::SelectInverse,
+    MenuAction::Delete,
+    MenuAction::CopyMerged,
+    MenuAction::DuplicateSelectionToTab,
+    MenuAction::CutSelectionToTab,
+];
+const SIZE_ITEMS: &[MenuAction] = &[
+    MenuAction::ImageResize,
+    MenuAction::CanvasResize,
+    MenuAction::Crop,
+];
+const TRANSFORM_ITEMS: &[MenuAction] = &[
+    MenuAction::FlipHorizontal,
+    MenuAction::FlipVertical,
+    MenuAction::RotateCw,
+    MenuAction::RotateCcw,
+];
+const COLOR_ITEMS: &[MenuAction] = &[
+    MenuAction::BrightnessContrast,
+    MenuAction::HueSaturation,
+    MenuAction::Invert,
+    MenuAction::Grayscale,
+    MenuAction::Mosaic,
+];
+// §55・§56 の外部 AI 操作はまだ MenuAction に存在しない。追加時はここへ並べる。
+const AI_ITEMS: &[MenuAction] = &[MenuAction::InpaintSelection];
+const LAYER_ITEMS: &[MenuAction] = &[
+    MenuAction::LayerAdd,
+    MenuAction::LayerDuplicate,
+    MenuAction::LayerDelete,
+    MenuAction::LayerMoveUp,
+    MenuAction::LayerMoveDown,
+    MenuAction::LayerMergeDown,
+    MenuAction::LayerFlatten,
+];
+const VIEW_ITEMS: &[MenuAction] = &[
+    MenuAction::ZoomIn,
+    MenuAction::ZoomOut,
+    MenuAction::Zoom100,
+    MenuAction::FitWindow,
+    MenuAction::TogglePixelGrid,
+];
+const OTHER_ITEMS: &[MenuAction] = &[
+    MenuAction::OpenPreferences,
+    MenuAction::ResetPanelLayout,
+    MenuAction::About,
+];
+
+const FILE_GROUP: MenuGroup = MenuGroup {
+    label: "ファイル…",
+    icon: icons::paint_menu_file_group_icon,
+    items: FILE_ITEMS,
+};
+const SELECTION_GROUP: MenuGroup = MenuGroup {
+    label: "選択…",
+    icon: icons::paint_menu_selection_group_icon,
+    items: SELECTION_ITEMS,
+};
+const SIZE_GROUP: MenuGroup = MenuGroup {
+    label: "サイズ…",
+    icon: icons::paint_menu_size_group_icon,
+    items: SIZE_ITEMS,
+};
+const TRANSFORM_GROUP: MenuGroup = MenuGroup {
+    label: "変形…",
+    icon: icons::paint_menu_transform_group_icon,
+    items: TRANSFORM_ITEMS,
+};
+const COLOR_GROUP: MenuGroup = MenuGroup {
+    label: "色調補正…",
+    icon: icons::paint_menu_color_group_icon,
+    items: COLOR_ITEMS,
+};
+const AI_GROUP: MenuGroup = MenuGroup {
+    label: "AI・修復…",
+    icon: icons::paint_menu_ai_group_icon,
+    items: AI_ITEMS,
+};
+const LAYER_GROUP: MenuGroup = MenuGroup {
+    label: "レイヤー…",
+    icon: icons::paint_menu_layer_group_icon,
+    items: LAYER_ITEMS,
+};
+const VIEW_GROUP: MenuGroup = MenuGroup {
+    label: "表示…",
+    icon: icons::paint_menu_view_group_icon,
+    items: VIEW_ITEMS,
+};
+const OTHER_GROUP: MenuGroup = MenuGroup {
+    label: "その他…",
+    icon: icons::paint_menu_other_group_icon,
+    items: OTHER_ITEMS,
+};
+
+/// SPEC §59 のトップレベル順序を保持する唯一のテーブル。
+const TOP_LEVEL_SLOTS: &[MenuSlot] = &[
+    MenuSlot::Item(MenuAction::New),
+    MenuSlot::Item(MenuAction::Open),
+    MenuSlot::Item(MenuAction::Save),
+    MenuSlot::Group(FILE_GROUP),
+    MenuSlot::Separator,
+    MenuSlot::Item(MenuAction::Undo),
+    MenuSlot::Item(MenuAction::Redo),
+    MenuSlot::Item(MenuAction::Cut),
+    MenuSlot::Item(MenuAction::Copy),
+    MenuSlot::Item(MenuAction::Paste),
+    MenuSlot::Item(MenuAction::FreeTransform),
+    MenuSlot::Group(SELECTION_GROUP),
+    MenuSlot::Separator,
+    MenuSlot::Group(SIZE_GROUP),
+    MenuSlot::Group(TRANSFORM_GROUP),
+    MenuSlot::Group(COLOR_GROUP),
+    MenuSlot::Group(AI_GROUP),
+    MenuSlot::Separator,
+    MenuSlot::Group(LAYER_GROUP),
+    MenuSlot::Separator,
+    MenuSlot::Group(VIEW_GROUP),
+    MenuSlot::Group(OTHER_GROUP),
+];
+
 impl MenuAction {
-    /// タイル下段へ常時表示する短い日本語ラベル。完全な操作名と
-    /// ショートカットは従来どおりツールチップへ残す。
     fn short_label(self) -> &'static str {
         match self {
             Self::New => "新規",
@@ -181,72 +292,217 @@ impl MenuAction {
             Self::OpenPreferences => "設定",
         }
     }
+
+    fn full_label(self) -> &'static str {
+        match self {
+            Self::New => "新規",
+            Self::Open => "開く",
+            Self::OpenRecent(_) => "最近使ったファイル",
+            Self::Save => "上書き保存",
+            Self::SaveAs => "名前を付けて保存",
+            Self::CloseTab => "タブを閉じる",
+            Self::Exit => "終了",
+            Self::Undo => "元に戻す",
+            Self::Redo => "やり直し",
+            Self::Cut => "切り取り",
+            Self::Copy => "コピー",
+            Self::CopyMerged => "結合部分をコピー",
+            Self::Paste => "貼り付け",
+            Self::PasteFromFile => "ファイルから貼り付け",
+            Self::Delete => "削除",
+            Self::SelectAll => "すべて選択",
+            Self::Deselect => "選択解除",
+            Self::SelectInverse => "選択範囲を反転",
+            Self::InpaintSelection => "選択範囲を修復",
+            Self::FreeTransform => "自由変形",
+            Self::ImageResize => "画像サイズ変更",
+            Self::CanvasResize => "キャンバスサイズ変更",
+            Self::Crop => "選択範囲でトリミング",
+            Self::DuplicateSelectionToTab => "選択範囲を新規タブに複製",
+            Self::CutSelectionToTab => "選択範囲を切り取って新規タブへ",
+            _ => self.full_label_image_and_later(),
+        }
+    }
+
+    fn full_label_image_and_later(self) -> &'static str {
+        match self {
+            Self::FlipHorizontal => "左右反転",
+            Self::FlipVertical => "上下反転",
+            Self::RotateCw => "右に 90°回転",
+            Self::RotateCcw => "左に 90°回転",
+            Self::BrightnessContrast => "明るさ・コントラスト",
+            Self::HueSaturation => "色相・彩度・明度",
+            Self::Invert => "階調の反転",
+            Self::Grayscale => "グレースケール化",
+            Self::Mosaic => "モザイク",
+            _ => self.full_label_view_and_later(),
+        }
+    }
+
+    fn full_label_view_and_later(self) -> &'static str {
+        match self {
+            Self::ZoomIn => "拡大",
+            Self::ZoomOut => "縮小",
+            Self::Zoom100 => "100%",
+            Self::FitWindow => "ウィンドウに合わせる",
+            Self::TogglePixelGrid => "ピクセルグリッド表示",
+            Self::ResetPanelLayout => "パネル配置をリセット",
+            Self::LayerAdd => "新規レイヤー",
+            Self::LayerDuplicate => "レイヤーを複製",
+            Self::LayerDelete => "レイヤーを削除",
+            Self::LayerMoveUp => "上へ",
+            Self::LayerMoveDown => "下へ",
+            Self::LayerMergeDown => "下と結合",
+            Self::LayerFlatten => "画像の統合",
+            Self::About => "バージョン情報",
+            Self::OpenPreferences => "設定",
+            _ => "",
+        }
+    }
+
+    fn shortcut(self) -> Option<Action> {
+        match self {
+            Self::New => Some(Action::New),
+            Self::Open => Some(Action::Open),
+            Self::Save => Some(Action::Save),
+            Self::SaveAs => Some(Action::SaveAs),
+            Self::CloseTab => Some(Action::CloseTab),
+            Self::Undo => Some(Action::Undo),
+            Self::Redo => Some(Action::Redo),
+            Self::Cut => Some(Action::Cut),
+            Self::Copy => Some(Action::Copy),
+            Self::CopyMerged => Some(Action::CopyMerged),
+            Self::Paste => Some(Action::Paste),
+            Self::Delete => Some(Action::Delete),
+            Self::SelectAll => Some(Action::SelectAll),
+            Self::Deselect => Some(Action::Deselect),
+            Self::SelectInverse => Some(Action::SelectInverse),
+            Self::FreeTransform => Some(Action::FreeTransform),
+            Self::HueSaturation => Some(Action::HueSaturation),
+            Self::Invert => Some(Action::Invert),
+            Self::Grayscale => Some(Action::Grayscale),
+            Self::ZoomIn => Some(Action::ZoomIn),
+            Self::ZoomOut => Some(Action::ZoomOut),
+            Self::Zoom100 => Some(Action::Zoom100),
+            Self::FitWindow => Some(Action::FitWindow),
+            Self::LayerAdd => Some(Action::LayerAdd),
+            Self::LayerDuplicate => Some(Action::LayerDuplicate),
+            Self::LayerMergeDown => Some(Action::LayerMergeDown),
+            Self::LayerFlatten => Some(Action::LayerFlatten),
+            Self::OpenPreferences => Some(Action::OpenPreferences),
+            _ => None,
+        }
+    }
+
+    fn shortcut_label(self) -> String {
+        if self == Self::Exit {
+            "Alt+F4".to_owned()
+        } else {
+            self.shortcut().map(keymap::label_for).unwrap_or_default()
+        }
+    }
+
+    fn enabled(self, state: &MenuState) -> bool {
+        match self {
+            Self::Undo => state.can_undo,
+            Self::Redo => state.can_redo,
+            Self::Cut
+            | Self::Copy
+            | Self::CopyMerged
+            | Self::Delete
+            | Self::Deselect
+            | Self::SelectInverse
+            | Self::Crop
+            | Self::CutSelectionToTab => state.has_selection,
+            Self::InpaintSelection => state.has_selection && !state.background_job_running,
+            Self::DuplicateSelectionToTab => state.can_duplicate_selection_to_tab,
+            Self::LayerAdd | Self::LayerDuplicate => state.can_add_layer,
+            Self::LayerDelete => state.can_delete_layer,
+            Self::LayerMoveUp => state.can_move_layer_up,
+            Self::LayerMoveDown => state.can_move_layer_down,
+            Self::LayerMergeDown => state.can_merge_layer_down,
+            Self::LayerFlatten => state.can_flatten_layers,
+            _ => true,
+        }
+    }
+
+    fn selected(self, state: &MenuState) -> bool {
+        self == Self::TogglePixelGrid && state.pixel_grid_visible
+    }
+
+    fn icon(self) -> PaintFn {
+        match self {
+            Self::New => icons::paint_new_document_icon,
+            Self::Open => icons::paint_open_icon,
+            Self::OpenRecent(_) => icons::paint_recent_files_icon,
+            Self::Save => icons::paint_save_icon,
+            Self::SaveAs => icons::paint_save_as_icon,
+            Self::CloseTab => icons::paint_close_tab_icon,
+            Self::Exit => icons::paint_exit_icon,
+            Self::Undo => icons::paint_undo_icon,
+            Self::Redo => icons::paint_redo_icon,
+            Self::Cut => icons::paint_cut_icon,
+            Self::Copy => icons::paint_copy_icon,
+            Self::CopyMerged => icons::paint_copy_merged_icon,
+            Self::Paste => icons::paint_paste_icon,
+            Self::PasteFromFile => icons::paint_paste_file_icon,
+            Self::Delete => icons::paint_delete_icon,
+            Self::SelectAll => icons::paint_select_all_icon,
+            Self::Deselect => icons::paint_deselect_icon,
+            Self::SelectInverse => icons::paint_select_inverse_icon,
+            Self::InpaintSelection => icons::paint_inpaint_icon,
+            Self::FreeTransform => icons::paint_free_transform_icon,
+            Self::ImageResize => icons::paint_image_resize_icon,
+            Self::CanvasResize => icons::paint_canvas_resize_icon,
+            Self::Crop => icons::paint_crop_icon,
+            Self::DuplicateSelectionToTab => icons::paint_duplicate_to_tab_icon,
+            Self::CutSelectionToTab => icons::paint_cut_to_tab_icon,
+            Self::FlipHorizontal => icons::paint_flip_horizontal_icon,
+            Self::FlipVertical => icons::paint_flip_vertical_icon,
+            Self::RotateCw => icons::paint_rotate_cw_icon,
+            Self::RotateCcw => icons::paint_rotate_ccw_icon,
+            Self::BrightnessContrast => icons::paint_brightness_contrast_icon,
+            Self::HueSaturation => icons::paint_hue_saturation_icon,
+            Self::Invert => icons::paint_invert_icon,
+            Self::Grayscale => icons::paint_grayscale_icon,
+            Self::Mosaic => icons::paint_mosaic_icon,
+            Self::ZoomIn => icons::paint_zoom_in_icon,
+            Self::ZoomOut => icons::paint_zoom_out_icon,
+            Self::Zoom100 => icons::paint_zoom_100_icon,
+            Self::FitWindow => icons::paint_fit_window_icon,
+            Self::TogglePixelGrid => icons::paint_pixel_grid_icon,
+            Self::ResetPanelLayout => icons::paint_panel_reset_icon,
+            Self::LayerAdd => icons::paint_layer_add_icon,
+            Self::LayerDuplicate => icons::paint_layer_duplicate_icon,
+            Self::LayerDelete => icons::paint_layer_delete_icon,
+            Self::LayerMoveUp => icons::paint_layer_move_up_icon,
+            Self::LayerMoveDown => icons::paint_layer_move_down_icon,
+            Self::LayerMergeDown => icons::paint_layer_merge_down_icon,
+            Self::LayerFlatten => icons::paint_layer_flatten_icon,
+            Self::About => icons::paint_about_icon,
+            Self::OpenPreferences => icons::paint_settings_icon,
+        }
+    }
+
+    fn tooltip(self) -> String {
+        match self.shortcut() {
+            Some(shortcut) => keymap::menu_label(self.full_label(), shortcut),
+            None if self == Self::Exit => format!("{} (Alt+F4)", self.full_label()),
+            None => self.full_label().to_owned(),
+        }
+    }
 }
 
-/// メニュー項目の有効/無効判定に使う状態。`recent_files` を借用するため
-/// ライフタイム付き(v4 §26)。
-pub struct MenuState<'a> {
-    pub can_undo: bool,
-    pub can_redo: bool,
-    /// 選択または浮動片がある(切り取り/コピー/削除/トリミングを有効にする)。
-    pub has_selection: bool,
-    /// v12 §53: 非同期ジョブ(修復)が実行中か。実行中は多重発行を防ぐため
-    /// 該当メニューを無効化する。
-    pub background_job_running: bool,
-    /// v5 §31(ARCHITECTURE.md §17.6): 「選択範囲を新規タブに複製」の有効/
-    /// 無効(`has_selection` と同じ値でよい)。
-    pub can_duplicate_selection_to_tab: bool,
-    // -- v2 §13: レイヤーメニューの有効/無効(document.rs の各操作の成否
-    // 条件と 1:1 に対応させる、ARCHITECTURE.md §14.8 V2-M2) -------------
-    pub can_add_layer: bool,
-    pub can_delete_layer: bool,
-    pub can_move_layer_up: bool,
-    pub can_move_layer_down: bool,
-    pub can_merge_layer_down: bool,
-    pub can_flatten_layers: bool,
-    /// v4 §25: 表示メニューの「ピクセルグリッド」チェック表示用(実際の
-    /// トグルは `MenuAction::TogglePixelGrid` を経由して app.rs が行う)。
-    pub pixel_grid_visible: bool,
-    /// v4 §26: 「ファイル > 最近使ったファイル」サブメニューの中身
-    /// (先頭が最新、`app.rs::recent_files` と同じ順序)。
-    pub recent_files: &'a std::collections::VecDeque<std::path::PathBuf>,
+impl MenuGroup {
+    fn enabled(self, state: &MenuState) -> bool {
+        self.items.iter().any(|action| action.enabled(state))
+    }
+
+    fn has_recent_files(self) -> bool {
+        self.label == FILE_GROUP.label
+    }
 }
 
-/// メニューアイコンボタンの外形サイズ(SPEC §33: 「約 20×24px の正方形
-/// ボタン」)。アイコン本体は `ui/icons.rs` の流儀どおり正方形の相対座標
-/// (0..1)から組み立てる前提なので、ボタンの縦横比が 1:1 でなくても
-/// 描画前に正方形の `icon_rect` を切り出す(下記 `icon_button`)。
-const BUTTON_W: f32 = 44.0;
-const BUTTON_H: f32 = 40.0;
-const ICON_SIZE: f32 = 17.0;
-const LABEL_SIZE: f32 = 8.0;
-/// グループ間の区切り線の幅(行分割の計算にも使う、`slot_width` 参照)。
-const SEP_W: f32 = 6.0;
-/// メニュー行のボタン間隔。テーマの既定(8px)より詰めた専用値
-/// (v12 §58 で「パネル配置をリセット」を足した際、既定 1280px 幅で 3 行に
-/// なってしまったため。6px にすると既定幅で 2 行、最小幅 640px でも 5 行→
-/// 4 行に収まり、どの幅でも改善する)。**`pack_rows` に渡す値と実際の
-/// `ui.spacing_mut()` は必ず同じにすること** — ずれると計算した行数と
-/// 実際の折り返しが食い違い、ボタンが見切れる(`show` の docstring 参照)。
-const ROW_ITEM_SPACING_X: f32 = 6.0;
-
-/// アイコン描画関数の共通シグネチャ(`ui/icons.rs` の全関数がこれに従う)。
-/// キャプチャ変数を持たない関数ポインタなので `Copy` にでき、`Slot` の
-/// テーブルに素直に収められる。
-type PaintFn = fn(&egui::Painter, egui::Rect, egui::Color32);
-
-/// 1 個のアイコンボタン(`ui/toolbar.rs::tool_button` と同じ「hover 背景を
-/// 自前で塗ってからアイコンを重ねる」流儀、egui `Button` の text 用 API に
-/// 依存しない)。`selected` はピクセルグリッドのようなトグル状態表示にのみ
-/// true にする(SPEC §33: 「他のツールボタンと同じ .selected(bool)
-/// ハイライト」)。
-///
-/// `enabled == false` のときは `ui.add_enabled_ui`(内部で `ui.scope` =
-/// 子 `Ui` を都度生成する)を使わず、`ui.painter()` を複製して
-/// `Painter::multiply_opacity` で薄くしたものに描くだけにする(クリックも
-/// `Sense::hover()` にして無効化する)。42 個ものボタンを並べる行で毎回
-/// 子 `Ui` を生成するのは無駄なので、単色ペインターの複製だけで済ませる
-/// 軽量な実装にした。
 fn icon_button(
     ui: &mut egui::Ui,
     enabled: bool,
@@ -254,13 +510,12 @@ fn icon_button(
     paint: PaintFn,
     label: &'static str,
 ) -> egui::Response {
-    let size = egui::vec2(BUTTON_W, BUTTON_H);
     let sense = if enabled {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(BUTTON_W, BUTTON_H), sense);
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label)
     });
@@ -271,8 +526,10 @@ fn icon_button(
             painter.multiply_opacity(ui.visuals().disabled_alpha());
         }
         painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
-        let icon_center = egui::pos2(rect.center().x, rect.top() + 12.0);
-        let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(ICON_SIZE, ICON_SIZE));
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 12.0),
+            egui::vec2(ICON_SIZE, ICON_SIZE),
+        );
         paint(&painter, icon_rect, visuals.fg_stroke.color);
         painter.with_clip_rect(rect.shrink(1.0)).text(
             egui::pos2(rect.center().x, rect.bottom() - 3.0),
@@ -285,553 +542,207 @@ fn icon_button(
     response
 }
 
-/// SPEC §33: グループ間の薄い区切り線(「カテゴリごとに薄い区切り線を入れて
-/// 視覚的にグループ化する」)。`SEP_W` 固定の縦線を自前で描く(モジュール
-/// ドキュメントコメント参照: `ui.separator()` は使わない)。
 fn group_separator(ui: &mut egui::Ui) {
-    let size = egui::vec2(SEP_W, BUTTON_H);
-    let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(SEP_W, BUTTON_H), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
         ui.painter().vline(rect.center().x, rect.y_range(), stroke);
     }
 }
 
-/// SPEC §33: 「最近使ったファイル」だけの例外(クリックで小さなポップアップ
-/// リストを開く、モジュールのドキュメントコメント参照)。
-fn recent_files_button(
-    ui: &mut egui::Ui,
-    recent_files: &std::collections::VecDeque<std::path::PathBuf>,
-) -> Option<MenuAction> {
-    let mut action = None;
-    let response = icon_button(ui, true, false, icons::paint_recent_files_icon, "最近開く")
-        .on_hover_text("最近使ったファイル");
-    egui::Popup::menu(&response).show(|ui| {
-        if recent_files.is_empty() {
-            ui.weak("(なし)");
-        } else {
-            for (i, path) in recent_files.iter().enumerate() {
-                let full_path = path.to_string_lossy().into_owned();
-                let label = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| full_path.clone());
-                if ui.button(label).on_hover_text(&full_path).clicked() {
-                    action = Some(MenuAction::OpenRecent(i));
-                    ui.close();
-                }
+fn slot_width(slot: &MenuSlot) -> f32 {
+    match slot {
+        MenuSlot::Separator => SEP_W,
+        MenuSlot::Item(_) | MenuSlot::Group(_) => BUTTON_W,
+    }
+}
+
+fn pack_rows(slots: &[MenuSlot], avail_width: f32, spacing: f32) -> Vec<Vec<usize>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut used = 0.0;
+    for (index, slot) in slots.iter().enumerate() {
+        let additional = slot_width(slot) + if row.is_empty() { 0.0 } else { spacing };
+        if !row.is_empty() && used + additional > avail_width {
+            while matches!(row.last(), Some(last) if matches!(slots[*last], MenuSlot::Separator)) {
+                row.pop();
             }
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            used = 0.0;
+        }
+        if row.is_empty() && matches!(slot, MenuSlot::Separator) {
+            continue;
+        }
+        used += slot_width(slot) + if row.is_empty() { 0.0 } else { spacing };
+        row.push(index);
+    }
+    while matches!(row.last(), Some(last) if matches!(slots[*last], MenuSlot::Separator)) {
+        row.pop();
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn popup_action_row(
+    ui: &mut egui::Ui,
+    state: &MenuState,
+    action: MenuAction,
+) -> (egui::Response, Option<MenuAction>) {
+    let enabled = action.enabled(state);
+    let selected = action.selected(state);
+    let width = ui.available_width().max(POPUP_MIN_WIDTH);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, POPUP_ROW_H), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            enabled,
+            selected,
+            action.full_label(),
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        let mut painter = ui.painter().clone();
+        if !enabled {
+            painter.multiply_opacity(ui.visuals().disabled_alpha());
+        }
+        painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::vec2(POPUP_ICON_SIZE, POPUP_ICON_SIZE),
+        );
+        (action.icon())(&painter, icon_rect, visuals.fg_stroke.color);
+        painter.text(
+            egui::pos2(rect.left() + 28.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            action.full_label(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            visuals.fg_stroke.color,
+        );
+        let shortcut = action.shortcut_label();
+        if !shortcut.is_empty() {
+            painter.text(
+                egui::pos2(rect.right() - 6.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                shortcut,
+                egui::TextStyle::Button.resolve(ui.style()),
+                visuals.fg_stroke.color,
+            );
+        }
+    }
+    let clicked = response.clicked().then_some(action);
+    (response, clicked)
+}
+
+fn show_action_rows(
+    ui: &mut egui::Ui,
+    state: &MenuState,
+    actions: &[MenuAction],
+) -> Option<MenuAction> {
+    for action in actions {
+        let (_, clicked) = popup_action_row(ui, state, *action);
+        if clicked.is_some() {
+            return clicked;
+        }
+    }
+    None
+}
+
+fn recent_file_row(ui: &mut egui::Ui, index: usize, path: &std::path::Path) -> Option<MenuAction> {
+    let full_path = path.to_string_lossy().into_owned();
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| full_path.clone());
+    let width = ui.available_width().max(POPUP_MIN_WIDTH);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, POPUP_ROW_H), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter()
+            .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::vec2(POPUP_ICON_SIZE, POPUP_ICON_SIZE),
+        );
+        icons::paint_recent_files_icon(ui.painter(), icon_rect, visuals.fg_stroke.color);
+        ui.painter().text(
+            egui::pos2(rect.left() + 28.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::TextStyle::Button.resolve(ui.style()),
+            visuals.fg_stroke.color,
+        );
+    }
+    response
+        .on_hover_text(full_path)
+        .clicked()
+        .then_some(MenuAction::OpenRecent(index))
+}
+
+fn show_recent_files(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
+    ui.separator();
+    ui.weak("最近使ったファイル");
+    if state.recent_files.is_empty() {
+        ui.weak("(なし)");
+        return None;
+    }
+    for (index, path) in state.recent_files.iter().enumerate() {
+        if let Some(action) = recent_file_row(ui, index, path) {
+            return Some(action);
+        }
+    }
+    None
+}
+
+fn show_group_contents(
+    ui: &mut egui::Ui,
+    group: MenuGroup,
+    state: &MenuState,
+) -> Option<MenuAction> {
+    ui.set_min_width(POPUP_MIN_WIDTH);
+    if !group.has_recent_files() {
+        return show_action_rows(ui, state, group.items);
+    }
+    if let Some(action) = show_action_rows(ui, state, &group.items[..FILE_RECENT_INSERT_INDEX]) {
+        return Some(action);
+    }
+    if let Some(action) = show_recent_files(ui, state) {
+        return Some(action);
+    }
+    ui.separator();
+    show_action_rows(ui, state, &group.items[FILE_RECENT_INSERT_INDEX..])
+}
+
+fn group_button(ui: &mut egui::Ui, group: MenuGroup, state: &MenuState) -> Option<MenuAction> {
+    let response = icon_button(ui, group.enabled(state), false, group.icon, group.label)
+        .on_hover_text(group.label);
+    let mut action = None;
+    egui::Popup::menu(&response).show(|ui| {
+        if let Some(selected) = show_group_contents(ui, group, state) {
+            action = Some(selected);
+            ui.close();
         }
     });
     action
 }
 
-/// 単発アクションのアイコンボタン 1 個ぶんのデータ(モジュールドキュメント
-/// コメントの「行分割を自前で行う」ためのテーブル行)。
-struct MenuItem {
-    enabled: bool,
-    tooltip: Tooltip,
-    paint: PaintFn,
-    action: MenuAction,
-}
-
-#[derive(Clone, Copy)]
-enum Tooltip {
-    Plain(&'static str),
-    Shortcut(&'static str, Action),
-}
-
-/// アイコン行の 1 スロット。`ui.horizontal_wrapped` を使わず、
-/// `ui.available_width()` から自前で行分割する(モジュールドキュメント
-/// コメント参照)。
-enum Slot {
-    Item(MenuItem),
-    /// SPEC §33: ピクセルグリッド表示のようなトグル状態ボタン。
-    Toggle {
-        selected: bool,
-        tooltip: &'static str,
-        paint: PaintFn,
-        action: MenuAction,
-    },
-    /// SPEC §33 唯一の例外(ポップアップ、`recent_files_button` 参照)。
-    RecentFiles,
-    /// SPEC §33: グループ間の区切り線。
-    Sep,
-}
-
-fn mi(enabled: bool, tooltip: &'static str, paint: PaintFn, action: MenuAction) -> Slot {
-    Slot::Item(MenuItem {
-        enabled,
-        tooltip: Tooltip::Plain(tooltip),
-        paint,
-        action,
-    })
-}
-
-fn mi_shortcut(
-    enabled: bool,
-    label: &'static str,
-    shortcut: Action,
-    paint: PaintFn,
-    action: MenuAction,
-) -> Slot {
-    Slot::Item(MenuItem {
-        enabled,
-        tooltip: Tooltip::Shortcut(label, shortcut),
-        paint,
-        action,
-    })
-}
-
-/// レイアウトの行分割に使う「このスロットの幅」。
-fn slot_width(slot: &Slot) -> f32 {
-    match slot {
-        Slot::Sep => SEP_W,
-        _ => BUTTON_W,
-    }
-}
-
-/// ARCHITECTURE.md §18.1: グループ順序と区切りは
-/// ファイル → 編集 → 画像 → レイヤー → 表示 → その他(ヘルプ/設定)。
-/// SPEC §33 の全項目を宣言順どおりに並べたテーブルを組み立てる(実際の
-/// 副作用は起こさない、`show` が行分割・描画・クリック判定を行う)。
-fn build_slots(state: &MenuState) -> Vec<Slot> {
-    vec![
-        // -- ファイル ---------------------------------------------------
-        mi_shortcut(
-            true,
-            "新規",
-            Action::New,
-            icons::paint_new_document_icon,
-            MenuAction::New,
-        ),
-        mi_shortcut(
-            true,
-            "開く",
-            Action::Open,
-            icons::paint_open_icon,
-            MenuAction::Open,
-        ),
-        mi_shortcut(
-            true,
-            "上書き保存",
-            Action::Save,
-            icons::paint_save_icon,
-            MenuAction::Save,
-        ),
-        mi_shortcut(
-            true,
-            "名前を付けて保存",
-            Action::SaveAs,
-            icons::paint_save_as_icon,
-            MenuAction::SaveAs,
-        ),
-        // v4 §26: 「最近使ったファイル」ポップアップ(SPEC §33 の唯一の例外)。
-        // SPEC §33 のファイルグループ明記順(新規/開く/上書き保存/名前を付けて
-        // 保存/最近使ったファイル/タブを閉じる/終了)どおり、「名前を付けて
-        // 保存」の直後・「タブを閉じる」の直前に置く。
-        Slot::RecentFiles,
-        // v5 §17.6: 「ファイルメニューに「タブを閉じる (Ctrl+W)」を追加
-        // (名前を付けて保存の後、終了の前)」。
-        mi_shortcut(
-            true,
-            "タブを閉じる",
-            Action::CloseTab,
-            icons::paint_close_tab_icon,
-            MenuAction::CloseTab,
-        ),
-        // Alt+F4 は OS/ウィンドウマネージャが `close_requested` として通知
-        // するものであり egui が消費するショートカットではないため、
-        // `keymap::KEYMAP` の対象外(`keymap` モジュールドキュメントコメント
-        // 参照)。表記は固定文字列のままでよい。
-        mi(
-            true,
-            "終了 (Alt+F4)",
-            icons::paint_exit_icon,
-            MenuAction::Exit,
-        ),
-        Slot::Sep,
-        // -- 編集 ---------------------------------------------------------
-        mi_shortcut(
-            state.can_undo,
-            "元に戻す",
-            Action::Undo,
-            icons::paint_undo_icon,
-            MenuAction::Undo,
-        ),
-        mi_shortcut(
-            state.can_redo,
-            "やり直し",
-            Action::Redo,
-            icons::paint_redo_icon,
-            MenuAction::Redo,
-        ),
-        mi_shortcut(
-            state.has_selection,
-            "切り取り",
-            Action::Cut,
-            icons::paint_cut_icon,
-            MenuAction::Cut,
-        ),
-        mi_shortcut(
-            state.has_selection,
-            "コピー",
-            Action::Copy,
-            icons::paint_copy_icon,
-            MenuAction::Copy,
-        ),
-        // v8 §38: 「コピー」の直後に「結合部分をコピー」を追加(SPEC §33 の
-        // 編集グループへの v8 追記)。有効条件はコピーと同じ。
-        mi_shortcut(
-            state.has_selection,
-            "結合部分をコピー",
-            Action::CopyMerged,
-            icons::paint_copy_merged_icon,
-            MenuAction::CopyMerged,
-        ),
-        mi_shortcut(
-            true,
-            "貼り付け",
-            Action::Paste,
-            icons::paint_paste_icon,
-            MenuAction::Paste,
-        ),
-        // v9 §43: 「貼り付け」の直後に「ファイルから貼り付け」を追加。
-        mi(
-            true,
-            "ファイルから貼り付け…",
-            icons::paint_paste_file_icon,
-            MenuAction::PasteFromFile,
-        ),
-        mi_shortcut(
-            state.has_selection,
-            "削除",
-            Action::Delete,
-            icons::paint_delete_icon,
-            MenuAction::Delete,
-        ),
-        mi_shortcut(
-            true,
-            "すべて選択",
-            Action::SelectAll,
-            icons::paint_select_all_icon,
-            MenuAction::SelectAll,
-        ),
-        mi_shortcut(
-            state.has_selection,
-            "選択解除",
-            Action::Deselect,
-            icons::paint_deselect_icon,
-            MenuAction::Deselect,
-        ),
-        // v8 §37: 「選択解除」の直後に「選択範囲を反転」を追加(SPEC §33 の
-        // 編集グループへの v8 追記)。有効条件は他の選択依存項目と同じ。
-        mi_shortcut(
-            state.has_selection,
-            "選択範囲を反転",
-            Action::SelectInverse,
-            icons::paint_select_inverse_icon,
-            MenuAction::SelectInverse,
-        ),
-        // v12 §53: 「選択範囲を修復」(選択があるときのみ有効。実行中は
-        // 多重発行できないので無効化する)。
-        mi(
-            state.has_selection && !state.background_job_running,
-            "選択範囲を修復",
-            icons::paint_inpaint_icon,
-            MenuAction::InpaintSelection,
-        ),
-        // v6 §33: 編集メニューに新規追加(`MenuAction::FreeTransform`
-        // ドキュメントコメント参照)。
-        mi_shortcut(
-            true,
-            "自由変形",
-            Action::FreeTransform,
-            icons::paint_free_transform_icon,
-            MenuAction::FreeTransform,
-        ),
-        Slot::Sep,
-        // -- 画像 ---------------------------------------------------------
-        mi(
-            true,
-            "画像サイズ変更…",
-            icons::paint_image_resize_icon,
-            MenuAction::ImageResize,
-        ),
-        mi(
-            true,
-            "キャンバスサイズ変更…",
-            icons::paint_canvas_resize_icon,
-            MenuAction::CanvasResize,
-        ),
-        mi(
-            state.has_selection,
-            "選択範囲でトリミング",
-            icons::paint_crop_icon,
-            MenuAction::Crop,
-        ),
-        // v5 §31: 「選択範囲でトリミング」の直後に追加。
-        mi(
-            state.can_duplicate_selection_to_tab,
-            "選択範囲を新規タブに複製",
-            icons::paint_duplicate_to_tab_icon,
-            MenuAction::DuplicateSelectionToTab,
-        ),
-        // v11 §48: 複製の直後に「切り取って新規タブへ」(破壊的な対)。
-        mi(
-            state.has_selection,
-            "選択範囲を切り取って新規タブへ",
-            icons::paint_cut_to_tab_icon,
-            MenuAction::CutSelectionToTab,
-        ),
-        mi(
-            true,
-            "左右反転",
-            icons::paint_flip_horizontal_icon,
-            MenuAction::FlipHorizontal,
-        ),
-        mi(
-            true,
-            "上下反転",
-            icons::paint_flip_vertical_icon,
-            MenuAction::FlipVertical,
-        ),
-        mi(
-            true,
-            "右に90°回転",
-            icons::paint_rotate_cw_icon,
-            MenuAction::RotateCw,
-        ),
-        mi(
-            true,
-            "左に90°回転",
-            icons::paint_rotate_ccw_icon,
-            MenuAction::RotateCcw,
-        ),
-        // v4 §24: 色調補正(以前はサブメニューだったが、v6 で他の項目と
-        // 同列のアイコンボタンに展開する — 挙動は一切変えない、
-        // ARCHITECTURE.md §18.6 落とし穴4)。
-        mi(
-            true,
-            "明るさ・コントラスト…",
-            icons::paint_brightness_contrast_icon,
-            MenuAction::BrightnessContrast,
-        ),
-        mi_shortcut(
-            true,
-            "色相・彩度・明度…",
-            Action::HueSaturation,
-            icons::paint_hue_saturation_icon,
-            MenuAction::HueSaturation,
-        ),
-        mi_shortcut(
-            true,
-            "階調の反転",
-            Action::Invert,
-            icons::paint_invert_icon,
-            MenuAction::Invert,
-        ),
-        mi_shortcut(
-            true,
-            "グレースケール化",
-            Action::Grayscale,
-            icons::paint_grayscale_icon,
-            MenuAction::Grayscale,
-        ),
-        // v12 §51.1: モザイク(色調補正グループの末尾)。
-        mi(
-            true,
-            "モザイク…",
-            icons::paint_mosaic_icon,
-            MenuAction::Mosaic,
-        ),
-        Slot::Sep,
-        // -- レイヤー -------------------------------------------------------
-        mi_shortcut(
-            state.can_add_layer,
-            "新規レイヤー",
-            Action::LayerAdd,
-            icons::paint_layer_add_icon,
-            MenuAction::LayerAdd,
-        ),
-        mi_shortcut(
-            state.can_add_layer,
-            "レイヤーを複製",
-            Action::LayerDuplicate,
-            icons::paint_layer_duplicate_icon,
-            MenuAction::LayerDuplicate,
-        ),
-        mi(
-            state.can_delete_layer,
-            "レイヤーを削除",
-            icons::paint_layer_delete_icon,
-            MenuAction::LayerDelete,
-        ),
-        mi(
-            state.can_move_layer_up,
-            "上へ移動",
-            icons::paint_layer_move_up_icon,
-            MenuAction::LayerMoveUp,
-        ),
-        mi(
-            state.can_move_layer_down,
-            "下へ移動",
-            icons::paint_layer_move_down_icon,
-            MenuAction::LayerMoveDown,
-        ),
-        mi_shortcut(
-            state.can_merge_layer_down,
-            "下のレイヤーと結合",
-            Action::LayerMergeDown,
-            icons::paint_layer_merge_down_icon,
-            MenuAction::LayerMergeDown,
-        ),
-        mi_shortcut(
-            state.can_flatten_layers,
-            "画像の統合",
-            Action::LayerFlatten,
-            icons::paint_layer_flatten_icon,
-            MenuAction::LayerFlatten,
-        ),
-        Slot::Sep,
-        // -- 表示 -----------------------------------------------------------
-        mi_shortcut(
-            true,
-            "拡大",
-            Action::ZoomIn,
-            icons::paint_zoom_in_icon,
-            MenuAction::ZoomIn,
-        ),
-        mi_shortcut(
-            true,
-            "縮小",
-            Action::ZoomOut,
-            icons::paint_zoom_out_icon,
-            MenuAction::ZoomOut,
-        ),
-        mi_shortcut(
-            true,
-            "100%",
-            Action::Zoom100,
-            icons::paint_zoom_100_icon,
-            MenuAction::Zoom100,
-        ),
-        mi_shortcut(
-            true,
-            "ウィンドウに合わせる",
-            Action::FitWindow,
-            icons::paint_fit_window_icon,
-            MenuAction::FitWindow,
-        ),
-        // v4 §25: 「ピクセルグリッド…表示メニューにトグル」。v6 §33 で
-        // チェックボックスから「他のツールボタンと同じ .selected(bool)
-        // ハイライト」に変わった(実際の状態更新は従来どおり
-        // `MenuAction::TogglePixelGrid` を経由して app.rs が行う)。
-        Slot::Toggle {
-            selected: state.pixel_grid_visible,
-            tooltip: "ピクセルグリッド",
-            paint: icons::paint_pixel_grid_icon,
-            action: MenuAction::TogglePixelGrid,
-        },
-        // v12 §58: パネル(色/レイヤー/履歴)の配置を既定へ戻す。
-        mi(
-            true,
-            "パネル配置をリセット",
-            icons::paint_panel_reset_icon,
-            MenuAction::ResetPanelLayout,
-        ),
-        Slot::Sep,
-        // -- その他(バージョン情報・設定、SPEC §33) --------------------------
-        mi(
-            true,
-            "バージョン情報",
-            icons::paint_about_icon,
-            MenuAction::About,
-        ),
-        // v6 §34: 設定(環境設定)ダイアログ。ツールバーの歯車ボタン
-        // (`ui/toolbar.rs::ToolbarAction::OpenPreferences`)と同じアイコンを
-        // 使う(`icons::paint_settings_icon` を共有)。
-        mi_shortcut(
-            true,
-            "設定",
-            Action::OpenPreferences,
-            icons::paint_settings_icon,
-            MenuAction::OpenPreferences,
-        ),
-    ]
-}
-
-/// `slots` を `avail_width` に収まるよう貪欲に行分割する(各行のスロット
-/// index の `Vec`)。モジュールドキュメントコメント参照。
-fn pack_rows(slots: &[Slot], avail_width: f32, spacing: f32) -> Vec<Vec<usize>> {
-    let mut rows: Vec<Vec<usize>> = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    let mut current_width = 0.0_f32;
-    for (i, slot) in slots.iter().enumerate() {
-        let w = slot_width(slot);
-        let candidate = if current.is_empty() {
-            w
-        } else {
-            current_width + spacing + w
-        };
-        if !current.is_empty() && candidate > avail_width {
-            rows.push(std::mem::take(&mut current));
-            current_width = w;
-            current.push(i);
-        } else {
-            current_width = candidate;
-            current.push(i);
-        }
-    }
-    if !current.is_empty() {
-        rows.push(current);
-    }
-    // 折り返し自体がカテゴリ境界になるため、行頭・行末に孤立した区切り線は
-    // 描かない。狭い幅で「線だけの行」や行末の不自然な線を作らない。
-    for row in &mut rows {
-        while row
-            .first()
-            .is_some_and(|&index| matches!(slots[index], Slot::Sep))
-        {
-            row.remove(0);
-        }
-        while row
-            .last()
-            .is_some_and(|&index| matches!(slots[index], Slot::Sep))
-        {
-            row.pop();
-        }
-    }
-    rows.retain(|row| !row.is_empty());
-    rows
-}
-
-/// `Frame::side_top_panel`(egui 既定、`ui/menu.rs` はカスタム `Frame` を
-/// 設定していないのでこれがそのまま使われる)の `inner_margin`。水平
-/// (左右それぞれ)・垂直(上下それぞれ)の順。パネルの厳密な高さを自前で
-/// 計算する(下記 `show` のドキュメントコメント参照)ために必要な値。
-const PANEL_MARGIN_H: f32 = 8.0;
-const PANEL_MARGIN_V: f32 = 2.0;
-
-/// クリックされた項目があれば返す(複数同時クリックは起こらないので
-/// `Option` でよい)。
-///
-/// **パネルの高さは自動計算(`Panel` の既定の「前フレームの高さを引き継ぐ」
-/// 挙動)に任せず、`exact_size` で現在のフレームの `avail_width` から毎回
-/// 厳密に計算し直す。**(モジュールドキュメントコメントの「折り返しの実装
-/// について」参照: リサイズ直後の 1 フレーム目から正しい行数で確定させる
-/// ため)。
+/// メニューバーを描画し、クリックされた操作を返す。
 pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
     let mut action = None;
-    let slots = build_slots(state);
     let spacing = ui.spacing().item_spacing;
-    // `Panel` の内側 `Ui`(= 実際にボタンを並べる `ui`)の幅は、ここで見えて
-    // いる `ui.available_width()` から `Frame::side_top_panel` の水平
-    // `inner_margin`(左右それぞれ `PANEL_MARGIN_H`)を引いたもの。ここを
-    // 過大評価すると行分割が 1 個多くボタンを詰め込んでしまい、ウィンドウ
-    // 右端でボタンが見切れる。
     let avail_width = (ui.available_width() - PANEL_MARGIN_H * 2.0).max(0.0);
-    let rows = pack_rows(&slots, avail_width, ROW_ITEM_SPACING_X);
+    let rows = pack_rows(TOP_LEVEL_SLOTS, avail_width, ROW_ITEM_SPACING_X);
     let row_count = (rows.len().max(1) - 1) as f32;
     let content_height = rows.len().max(1) as f32 * BUTTON_H + row_count * spacing.y;
     let panel_height = content_height + PANEL_MARGIN_V * 2.0;
@@ -839,63 +750,30 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
     egui::Panel::top("menu_bar")
         .exact_size(panel_height)
         .show(ui, |ui| {
-            // `pack_rows` に渡したものと同じ間隔を実際のレイアウトにも使う。
             ui.spacing_mut().item_spacing.x = ROW_ITEM_SPACING_X;
             for row in &rows {
                 ui.horizontal(|ui| {
-                    for &i in row {
-                        match &slots[i] {
-                            Slot::Item(item) => {
+                    for index in row {
+                        match TOP_LEVEL_SLOTS[*index] {
+                            MenuSlot::Item(item) => {
                                 let response = icon_button(
                                     ui,
-                                    item.enabled,
-                                    false,
-                                    item.paint,
-                                    item.action.short_label(),
-                                );
-                                let clicked = response.clicked();
-                                if response.hovered() {
-                                    match item.tooltip {
-                                        Tooltip::Plain(text) => {
-                                            response.on_hover_text(text);
-                                        }
-                                        Tooltip::Shortcut(label, shortcut) => {
-                                            response
-                                                .on_hover_text(keymap::menu_label(label, shortcut));
-                                        }
-                                    }
-                                }
-                                if clicked {
-                                    action = Some(item.action);
+                                    item.enabled(state),
+                                    item.selected(state),
+                                    item.icon(),
+                                    item.short_label(),
+                                )
+                                .on_hover_text(item.tooltip());
+                                if response.clicked() {
+                                    action = Some(item);
                                 }
                             }
-                            Slot::Toggle {
-                                selected,
-                                tooltip,
-                                paint,
-                                action: toggle_action,
-                            } => {
-                                let response = icon_button(
-                                    ui,
-                                    true,
-                                    *selected,
-                                    *paint,
-                                    toggle_action.short_label(),
-                                );
-                                let clicked = response.clicked();
-                                if response.hovered() {
-                                    response.on_hover_text(*tooltip);
-                                }
-                                if clicked {
-                                    action = Some(*toggle_action);
+                            MenuSlot::Group(group) => {
+                                if let Some(selected) = group_button(ui, group, state) {
+                                    action = Some(selected);
                                 }
                             }
-                            Slot::RecentFiles => {
-                                if let Some(a) = recent_files_button(ui, state.recent_files) {
-                                    action = Some(a);
-                                }
-                            }
-                            Slot::Sep => group_separator(ui),
+                            MenuSlot::Separator => group_separator(ui),
                         }
                     }
                 });
@@ -908,217 +786,321 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
 mod tests {
     use super::*;
 
-    fn dummy_item() -> Slot {
-        mi(true, "x", icons::paint_about_icon, MenuAction::About)
-    }
+    const ALL_MENU_ACTIONS: &[MenuAction] = &[
+        MenuAction::New,
+        MenuAction::Open,
+        MenuAction::Save,
+        MenuAction::SaveAs,
+        MenuAction::CloseTab,
+        MenuAction::Exit,
+        MenuAction::Undo,
+        MenuAction::Redo,
+        MenuAction::Cut,
+        MenuAction::Copy,
+        MenuAction::CopyMerged,
+        MenuAction::Paste,
+        MenuAction::PasteFromFile,
+        MenuAction::OpenRecent(0),
+        MenuAction::Delete,
+        MenuAction::SelectAll,
+        MenuAction::Deselect,
+        MenuAction::SelectInverse,
+        MenuAction::InpaintSelection,
+        MenuAction::FreeTransform,
+        MenuAction::ImageResize,
+        MenuAction::CanvasResize,
+        MenuAction::Crop,
+        MenuAction::DuplicateSelectionToTab,
+        MenuAction::CutSelectionToTab,
+        MenuAction::FlipHorizontal,
+        MenuAction::FlipVertical,
+        MenuAction::RotateCw,
+        MenuAction::RotateCcw,
+        MenuAction::BrightnessContrast,
+        MenuAction::HueSaturation,
+        MenuAction::Invert,
+        MenuAction::Grayscale,
+        MenuAction::Mosaic,
+        MenuAction::ZoomIn,
+        MenuAction::ZoomOut,
+        MenuAction::Zoom100,
+        MenuAction::FitWindow,
+        MenuAction::TogglePixelGrid,
+        MenuAction::ResetPanelLayout,
+        MenuAction::LayerAdd,
+        MenuAction::LayerDuplicate,
+        MenuAction::LayerDelete,
+        MenuAction::LayerMoveUp,
+        MenuAction::LayerMoveDown,
+        MenuAction::LayerMergeDown,
+        MenuAction::LayerFlatten,
+        MenuAction::About,
+        MenuAction::OpenPreferences,
+    ];
 
-    fn all_enabled_state(
-        recent_files: &std::collections::VecDeque<std::path::PathBuf>,
-    ) -> MenuState<'_> {
+    fn state_with<'a>(
+        recent_files: &'a std::collections::VecDeque<std::path::PathBuf>,
+        enabled: bool,
+    ) -> MenuState<'a> {
         MenuState {
-            can_undo: true,
-            can_redo: true,
-            has_selection: true,
+            can_undo: enabled,
+            can_redo: enabled,
+            has_selection: enabled,
             background_job_running: false,
-            can_duplicate_selection_to_tab: true,
-            can_add_layer: true,
-            can_delete_layer: true,
-            can_move_layer_up: true,
-            can_move_layer_down: true,
-            can_merge_layer_down: true,
-            can_flatten_layers: true,
-            pixel_grid_visible: true,
+            can_duplicate_selection_to_tab: enabled,
+            can_add_layer: enabled,
+            can_delete_layer: enabled,
+            can_move_layer_up: enabled,
+            can_move_layer_down: enabled,
+            can_merge_layer_down: enabled,
+            can_flatten_layers: enabled,
+            pixel_grid_visible: enabled,
             recent_files,
         }
     }
 
+    fn dummy_item() -> MenuSlot {
+        MenuSlot::Item(MenuAction::About)
+    }
+
     #[test]
     fn slot_width_separator_is_narrower_than_an_item() {
-        assert_eq!(slot_width(&Slot::Sep), SEP_W);
+        assert_eq!(slot_width(&MenuSlot::Separator), SEP_W);
         assert_eq!(slot_width(&dummy_item()), BUTTON_W);
     }
 
     #[test]
-    fn pack_rows_fits_as_many_items_as_the_width_allows() {
-        let slots: Vec<Slot> = (0..5).map(|_| dummy_item()).collect();
-        let rows = pack_rows(&slots, BUTTON_W * 3.0, 0.0);
-        assert_eq!(rows, vec![vec![0, 1, 2], vec![3, 4]]);
-    }
-
-    #[test]
-    fn pack_rows_accounts_for_item_spacing_between_slots() {
-        let slots: Vec<Slot> = (0..3).map(|_| dummy_item()).collect();
-        // 2 個ぶんの幅+間隔ちょうどなら 2 個目までは入るが 3 個目は入らない。
-        let avail = BUTTON_W * 2.0 + 4.0;
-        let rows = pack_rows(&slots, avail, 4.0);
-        assert_eq!(rows, vec![vec![0, 1], vec![2]]);
-    }
-
-    #[test]
-    fn pack_rows_places_every_index_exactly_once_with_no_empty_rows() {
-        let slots: Vec<Slot> = (0..10).map(|_| dummy_item()).collect();
-        let rows = pack_rows(&slots, BUTTON_W * 4.0, 2.0);
-        assert!(rows.iter().all(|r| !r.is_empty()));
-        let mut all_indices: Vec<usize> = rows.iter().flatten().copied().collect();
-        all_indices.sort_unstable();
-        assert_eq!(all_indices, (0..10).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn pack_rows_handles_a_slot_wider_than_avail_width_without_panicking() {
-        // 1 個も収まらない幅でも無限ループやパニックにならず、最低 1 個は
-        // 強制的に置く(ARCHITECTURE.md §18.6-6: 640px 最小幅でも操作不能に
-        // ならないことの土台となる性質)。
-        let slots = vec![dummy_item(), dummy_item()];
-        let rows = pack_rows(&slots, 0.0, 0.0);
-        assert_eq!(rows, vec![vec![0], vec![1]]);
-    }
-
-    #[test]
-    fn pack_rows_of_empty_slots_produces_no_rows() {
-        let slots: Vec<Slot> = Vec::new();
-        assert!(pack_rows(&slots, 100.0, 4.0).is_empty());
-    }
-
-    #[test]
-    fn compact_minimum_width_layout_has_no_orphan_separator_and_at_most_five_rows() {
-        // v9 §43 で編集グループが 45 項目になり、最小幅 640px では 5 行に
-        // なった(ARCHITECTURE.md §18.1 の「4 行以内」は目安であり、本質は
-        // §18.6-6 の「最小幅でも操作不能にならない」こと。通常幅(既定
-        // 1280px)では従来どおり 2 行以内に収まる — 下のテスト参照)。
-        let recent_files = std::collections::VecDeque::new();
-        let state = all_enabled_state(&recent_files);
-        let slots = build_slots(&state);
-        let rows = pack_rows(&slots, 640.0 - PANEL_MARGIN_H * 2.0, ROW_ITEM_SPACING_X);
-        assert!(rows.len() <= 5);
-        for row in rows {
-            assert!(!matches!(slots[row[0]], Slot::Sep));
-            assert!(!matches!(slots[*row.last().unwrap()], Slot::Sep));
-        }
-    }
-
-    /// 既定ウィンドウ幅(1280px)での行数。項目が増えるたびに 1 行あたりの
-    /// 収容数(約 25 スロット)を超えると行が増える。v12 §53 で「選択範囲を
-    /// 修復」が加わり 54 スロットになったため 3 行になった(SPEC §33 は行数を
-    /// 定めておらず、本質は ARCHITECTURE.md §18.6-6 の「最小幅でも操作不能に
-    /// ならない」こと — 下の 640px のテストが担保する)。これ以上増えると
-    /// キャンバスの高さを圧迫するので、上限を明示して気づけるようにしておく。
-    #[test]
-    fn default_window_width_layout_stays_within_three_rows() {
-        let recent_files = std::collections::VecDeque::new();
-        let state = all_enabled_state(&recent_files);
-        let slots = build_slots(&state);
-        let rows = pack_rows(&slots, 1280.0 - PANEL_MARGIN_H * 2.0, ROW_ITEM_SPACING_X);
-        assert!(
-            rows.len() <= 3,
-            "既定幅では 3 行以内(実際は {} 行)",
-            rows.len()
+    fn pack_rows_obeys_width_and_spacing() {
+        let slots: Vec<MenuSlot> = (0..5).map(|_| dummy_item()).collect();
+        assert_eq!(
+            pack_rows(&slots, BUTTON_W * 3.0, 0.0),
+            vec![vec![0, 1, 2], vec![3, 4]]
+        );
+        let three: Vec<MenuSlot> = (0..3).map(|_| dummy_item()).collect();
+        assert_eq!(
+            pack_rows(&three, BUTTON_W * 2.0 + 4.0, 4.0),
+            vec![vec![0, 1], vec![2]]
         );
     }
 
     #[test]
-    fn every_visible_action_label_is_short_and_nonempty() {
+    fn pack_rows_places_every_index_once() {
+        let slots: Vec<MenuSlot> = (0..10).map(|_| dummy_item()).collect();
+        let rows = pack_rows(&slots, BUTTON_W * 4.0, 2.0);
+        assert!(rows.iter().all(|row| !row.is_empty()));
+        let mut indices: Vec<usize> = rows.iter().flatten().copied().collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pack_rows_handles_too_narrow_width() {
+        let slots = vec![dummy_item(), dummy_item()];
+        assert_eq!(pack_rows(&slots, 0.0, 0.0), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn standard_widths_use_one_and_two_rows() {
+        let rows_1280 = pack_rows(
+            TOP_LEVEL_SLOTS,
+            1280.0 - PANEL_MARGIN_H * 2.0,
+            ROW_ITEM_SPACING_X,
+        );
+        let rows_640 = pack_rows(
+            TOP_LEVEL_SLOTS,
+            640.0 - PANEL_MARGIN_H * 2.0,
+            ROW_ITEM_SPACING_X,
+        );
+        assert_eq!(rows_1280.len(), 1, "1280px の実測行数: {}", rows_1280.len());
+        assert_eq!(rows_640.len(), 2, "640px の実測行数: {}", rows_640.len());
+        for row in rows_640 {
+            assert!(!matches!(TOP_LEVEL_SLOTS[row[0]], MenuSlot::Separator));
+            if let Some(last) = row.last() {
+                assert!(!matches!(TOP_LEVEL_SLOTS[*last], MenuSlot::Separator));
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_order_matches_spec_59() {
+        let labels: Vec<&str> = TOP_LEVEL_SLOTS
+            .iter()
+            .map(|slot| match slot {
+                MenuSlot::Item(action) => action.full_label(),
+                MenuSlot::Group(group) => group.label,
+                MenuSlot::Separator => "|",
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "新規",
+                "開く",
+                "上書き保存",
+                "ファイル…",
+                "|",
+                "元に戻す",
+                "やり直し",
+                "切り取り",
+                "コピー",
+                "貼り付け",
+                "自由変形",
+                "選択…",
+                "|",
+                "サイズ…",
+                "変形…",
+                "色調補正…",
+                "AI・修復…",
+                "|",
+                "レイヤー…",
+                "|",
+                "表示…",
+                "その他…",
+            ]
+        );
+    }
+
+    #[test]
+    fn all_49_menu_entries_appear_exactly_once() {
+        let mut placed = Vec::new();
+        for slot in TOP_LEVEL_SLOTS {
+            match slot {
+                MenuSlot::Item(action) => placed.push(*action),
+                MenuSlot::Group(group) if group.has_recent_files() => {
+                    placed.extend_from_slice(&group.items[..FILE_RECENT_INSERT_INDEX]);
+                    placed.push(MenuAction::OpenRecent(0));
+                    placed.extend_from_slice(&group.items[FILE_RECENT_INSERT_INDEX..]);
+                }
+                MenuSlot::Group(group) => placed.extend_from_slice(group.items),
+                MenuSlot::Separator => {}
+            }
+        }
+        assert_eq!(placed.len(), ALL_MENU_ACTIONS.len());
+        for action in ALL_MENU_ACTIONS {
+            assert_eq!(
+                placed.iter().filter(|placed| *placed == action).count(),
+                1,
+                "{action:?} の配置数"
+            );
+        }
+        assert_eq!(placed.len(), 49);
+    }
+
+    #[test]
+    fn group_is_disabled_only_when_every_item_is_disabled() {
         let recent_files = std::collections::VecDeque::new();
-        let state = all_enabled_state(&recent_files);
-        for slot in build_slots(&state) {
+        let disabled = state_with(&recent_files, false);
+        assert!(!AI_GROUP.enabled(&disabled));
+        assert!(!LAYER_GROUP.enabled(&disabled));
+
+        let mut one_enabled = state_with(&recent_files, false);
+        one_enabled.has_selection = true;
+        assert!(AI_GROUP.enabled(&one_enabled));
+        one_enabled.has_selection = false;
+        one_enabled.can_add_layer = true;
+        assert!(LAYER_GROUP.enabled(&one_enabled));
+    }
+
+    #[test]
+    fn file_group_keeps_recent_files_between_paste_and_close() {
+        assert_eq!(FILE_RECENT_INSERT_INDEX, 2);
+        assert_eq!(
+            FILE_GROUP.items,
+            [
+                MenuAction::SaveAs,
+                MenuAction::PasteFromFile,
+                MenuAction::CloseTab,
+                MenuAction::Exit,
+            ]
+        );
+    }
+
+    #[test]
+    fn every_static_action_has_complete_display_metadata() {
+        for action in ALL_MENU_ACTIONS {
+            assert!(!action.full_label().is_empty(), "{action:?}");
+            let icon = action.icon();
+            assert_ne!(icon as usize, 0, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn popup_rows_return_the_same_menu_actions() {
+        let recent_files = std::collections::VecDeque::new();
+        let state = state_with(&recent_files, true);
+        for expected in [
+            MenuAction::SaveAs,
+            MenuAction::SelectAll,
+            MenuAction::Mosaic,
+        ] {
+            let ctx = egui::Context::default();
+            let mut row_rect = None;
+            let mut returned = None;
+            let input = |events| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input(Vec::new()), |ui| {
+                let (response, action) = popup_action_row(ui, &state, expected);
+                row_rect = Some(response.rect);
+                returned = action;
+            });
+            assert_eq!(returned, None);
+
+            let center = match row_rect {
+                Some(rect) => rect.center(),
+                None => panic!("popup row rect was not allocated"),
+            };
+            let _ = ctx.run_ui(input(vec![egui::Event::PointerMoved(center)]), |ui| {
+                let (_, action) = popup_action_row(ui, &state, expected);
+                returned = action;
+            });
+            let pointer_button = |pressed| egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = ctx.run_ui(
+                input(vec![
+                    egui::Event::PointerMoved(center),
+                    pointer_button(true),
+                ]),
+                |ui| {
+                    let (_, action) = popup_action_row(ui, &state, expected);
+                    returned = action;
+                },
+            );
+            assert_eq!(returned, None);
+
+            let _ = ctx.run_ui(
+                input(vec![
+                    egui::Event::PointerMoved(center),
+                    pointer_button(false),
+                ]),
+                |ui| {
+                    let (_, action) = popup_action_row(ui, &state, expected);
+                    returned = action;
+                },
+            );
+            assert_eq!(returned, Some(expected));
+        }
+    }
+
+    #[test]
+    fn every_top_level_label_is_short_and_nonempty() {
+        for slot in TOP_LEVEL_SLOTS {
             let label = match slot {
-                Slot::Item(item) => item.action.short_label(),
-                Slot::Toggle { action, .. } => action.short_label(),
-                Slot::RecentFiles => "最近開く",
-                Slot::Sep => continue,
+                MenuSlot::Item(action) => action.short_label(),
+                MenuSlot::Group(group) => group.label,
+                MenuSlot::Separator => continue,
             };
             assert!(!label.is_empty());
             assert!(label.chars().count() <= 6, "label too long: {label}");
         }
-    }
-
-    /// SPEC §33 の全項目(ファイル7・編集9・画像12・レイヤー7・表示5・その他2
-    /// の合計42)に v8 §37〜§38 の編集グループ 2 項目(結合部分をコピー・
-    /// 選択範囲を反転)と v9 §43 の 1 項目(ファイルから貼り付け)を足した
-    /// 45、区切り5、合わせて50スロットであることの静的テスト
-    /// (ARCHITECTURE.md §18.6-3 と同種の「項目の過不足に気づく」ための
-    /// 数合わせ)。
-    #[test]
-    fn build_slots_has_the_expected_total_count() {
-        let recent_files = std::collections::VecDeque::new();
-        let state = MenuState {
-            can_undo: false,
-            can_redo: false,
-            has_selection: false,
-            background_job_running: false,
-            can_duplicate_selection_to_tab: false,
-            can_add_layer: true,
-            can_delete_layer: false,
-            can_move_layer_up: false,
-            can_move_layer_down: false,
-            can_merge_layer_down: false,
-            can_flatten_layers: false,
-            pixel_grid_visible: false,
-            recent_files: &recent_files,
-        };
-        let slots = build_slots(&state);
-        let item_count = slots.iter().filter(|s| !matches!(s, Slot::Sep)).count();
-        let sep_count = slots.iter().filter(|s| matches!(s, Slot::Sep)).count();
-        // v11 §48 で「切り出し」が加わり 46(+区切り 5 = 51)。
-        // v12 §58 で表示グループに「パネル配置をリセット」が加わり 47(+5 = 52)。
-        // v12 §51.1 で色調補正グループに「モザイク…」が加わり 48(+5 = 53)。
-        // v12 §53 で編集グループに「選択範囲を修復」が加わり 49(+5 = 54)。
-        assert_eq!(item_count, 49);
-        assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 54);
-    }
-
-    /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を
-    /// 「新規 / 開く / 上書き保存 / 名前を付けて保存 / 最近使ったファイル /
-    /// タブを閉じる / 終了」と明記している。以前は `Slot::RecentFiles` が
-    /// `Open` の直後(3番目)に来ており SPEC が指定する `SaveAs` の直後
-    /// (5番目)ではなかった(項目の存在・個数だけを見る
-    /// `build_slots_has_the_expected_total_count` では検知できない並び順の
-    /// 不一致)。この回帰を防ぐため、先頭 7 スロット(ファイルグループ)の
-    /// `MenuAction` 列を SPEC の明記順と 1:1 で突き合わせる。
-    #[test]
-    fn build_slots_file_group_order_matches_spec_33() {
-        let recent_files = std::collections::VecDeque::new();
-        let state = MenuState {
-            can_undo: false,
-            can_redo: false,
-            has_selection: false,
-            background_job_running: false,
-            can_duplicate_selection_to_tab: false,
-            can_add_layer: true,
-            can_delete_layer: false,
-            can_move_layer_up: false,
-            can_move_layer_down: false,
-            can_merge_layer_down: false,
-            can_flatten_layers: false,
-            pixel_grid_visible: false,
-            recent_files: &recent_files,
-        };
-        let slots = build_slots(&state);
-        // SPEC §33: 新規 / 開く / 上書き保存 / 名前を付けて保存 /
-        // 最近使ったファイル(RecentFiles ポップアップ、MenuAction 無し) /
-        // タブを閉じる / 終了、に続いて区切り線。
-        let expected_actions: [Option<MenuAction>; 7] = [
-            Some(MenuAction::New),
-            Some(MenuAction::Open),
-            Some(MenuAction::Save),
-            Some(MenuAction::SaveAs),
-            None,
-            Some(MenuAction::CloseTab),
-            Some(MenuAction::Exit),
-        ];
-        for (i, expected) in expected_actions.iter().enumerate() {
-            match (&slots[i], expected) {
-                (Slot::Item(item), Some(action)) => {
-                    assert_eq!(item.action, *action, "file group slot {i} action mismatch")
-                }
-                (Slot::RecentFiles, None) => {}
-                _ => panic!("file group slot {i} order mismatch"),
-            }
-        }
-        assert!(
-            matches!(slots[7], Slot::Sep),
-            "file group must be followed by a separator before 編集"
-        );
     }
 }
