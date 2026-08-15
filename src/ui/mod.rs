@@ -13,6 +13,7 @@ pub mod icons;
 pub mod layers_panel;
 pub mod menu;
 pub mod options_bar;
+pub mod panels;
 pub mod side_panel;
 pub mod status_bar;
 pub mod tab_bar;

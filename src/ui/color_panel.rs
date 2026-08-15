@@ -59,6 +59,23 @@ pub struct ColorPanelCtx<'a> {
     pub user_palette: &'a mut Vec<Color32>,
 }
 
+impl ColorPanelCtx<'_> {
+    /// より短い寿命で借り直したコピーを作る(v12 §58: 同じフレーム中に
+    /// 「ドック」「フローティング」のどちらから呼ばれても使えるように、
+    /// `app.rs` が組み立てた 1 個の `ColorPanelCtx` を `show` へ渡し直す
+    /// ため。`show` は所有権を取るので、そのままでは 1 回しか使えない)。
+    pub fn reborrow(&mut self) -> ColorPanelCtx<'_> {
+        ColorPanelCtx {
+            primary: &mut *self.primary,
+            secondary: &mut *self.secondary,
+            wheel: &mut *self.wheel,
+            hex_buffer: &mut *self.hex_buffer,
+            recent_colors: self.recent_colors,
+            user_palette: &mut *self.user_palette,
+        }
+    }
+}
+
 pub fn show(ui: &mut egui::Ui, ctx: ColorPanelCtx) {
     let ColorPanelCtx {
         primary,

@@ -27,6 +27,7 @@ use crate::tools::gradient::GradientColors;
 use crate::tools::shapes::ShapeMode;
 use crate::tools::ToolKind;
 use crate::ui::color_panel::{format_hex, parse_hex_color};
+use crate::ui::panels::{self, PanelLayout};
 
 /// SPEC §26: 「最近使ったファイル(最大 8)」。
 pub const MAX_RECENT_FILES: usize = 8;
@@ -107,6 +108,10 @@ pub struct Settings {
     /// ダイアログの OK で更新され、開いている全タブへ即座に反映される
     /// (`app.rs::apply_preferences` 参照)。
     pub max_undo_steps: u32,
+    /// v12 §58: ドッキングパネルの配置(右/左/フローティング・ドック内順序・
+    /// 折りたたみ・フローティングの位置と寸法)。パースと直列化の実体は
+    /// `ui/panels.rs`(キーは `panel.<kind>.*`)。
+    pub panels: PanelLayout,
 }
 
 impl Default for Settings {
@@ -135,6 +140,8 @@ impl Default for Settings {
             // SPEC §25: 「デフォルト ON」。
             show_pixel_grid: true,
             max_undo_steps: DEFAULT_MAX_UNDO_STEPS,
+            // SPEC §58: 既定は全パネル右ドック(色→レイヤー→履歴)。
+            panels: PanelLayout::default(),
         }
     }
 }
@@ -422,6 +429,9 @@ pub fn parse(text: &str) -> Settings {
         .filter_map(parse_hex_color)
         .collect();
 
+    // v12 §58: `panel.<kind>.*`(不正・欠損はあちらで既定配置へ落ちる)。
+    settings.panels = panels::parse(&entries);
+
     settings.clamp_window_dims();
     settings.clamp_max_undo_steps();
     settings
@@ -487,6 +497,9 @@ pub fn serialize(settings: &Settings) -> String {
     push_line(&mut out, "last_tool", tool_kind_tag(s.last_tool));
     push_line(&mut out, "pixel_grid", bool_tag(s.show_pixel_grid));
     push_line(&mut out, "history.max_steps", &s.max_undo_steps.to_string());
+    // v12 §58: `panel.<kind>.*` は行数がパネル数×配置で変わるため、
+    // `ui/panels.rs` に `キー\t値\n` の塊を作らせて末尾へ連結する。
+    out.push_str(&panels::serialize(&s.panels));
     out
 }
 
@@ -562,6 +575,22 @@ pub fn save(settings: &Settings) {
 mod tests {
     use super::*;
 
+    /// v12 §58: 既定と異なるパネル配置(左ドック・フローティング・折りたたみ
+    /// を 1 つずつ含む)。往復テストで「配置も設定として保存される」ことを
+    /// 検証するために使う。
+    fn sample_panel_layout() -> PanelLayout {
+        use crate::ui::panels::{DockSide, PanelKind};
+        let mut layout = PanelLayout::default();
+        layout.dock_at_slot(PanelKind::History, DockSide::Left, 0);
+        layout.float_at(
+            PanelKind::Color,
+            eframe::egui::pos2(400.0, 220.0),
+            eframe::egui::vec2(260.0, 340.0),
+        );
+        layout.toggle_collapsed(PanelKind::Layers);
+        layout
+    }
+
     fn sample_settings() -> Settings {
         let mut recent = VecDeque::new();
         recent.push_back(PathBuf::from(r"C:\Users\test\Pictures\a.png"));
@@ -591,6 +620,7 @@ mod tests {
             last_tool: ToolKind::Gradient,
             show_pixel_grid: false,
             max_undo_steps: 123,
+            panels: sample_panel_layout(),
         }
     }
 
@@ -770,6 +800,28 @@ palette.0\t#FF0000
     fn garbage_max_undo_steps_value_falls_back_to_default() {
         let parsed = parse("history.max_steps\tnot_a_number\n");
         assert_eq!(parsed.max_undo_steps, Settings::default().max_undo_steps);
+    }
+
+    // -- v12 §58: ドッキングパネルの配置(詳細な規則は ui/panels.rs のテスト) --
+
+    #[test]
+    fn panel_layout_round_trips_through_the_settings_file() {
+        let settings = Settings {
+            panels: sample_panel_layout(),
+            ..Settings::default()
+        };
+        let parsed = parse(&serialize(&settings));
+        assert_eq!(parsed.panels, sample_panel_layout());
+    }
+
+    #[test]
+    fn missing_or_broken_panel_keys_fall_back_to_the_default_layout() {
+        // 他の設定だけがある(v11 以前の settings.txt)/ 値が壊れている、
+        // どちらも既定配置(SPEC §58: 「破損時は既定配置」)。
+        let parsed = parse("window.width\t1280\n");
+        assert_eq!(parsed.panels, PanelLayout::default());
+        let parsed = parse("panel.color.place\t???\npanel.layers.order\tzzz\n");
+        assert_eq!(parsed.panels, PanelLayout::default());
     }
 
     #[test]

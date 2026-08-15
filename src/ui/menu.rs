@@ -101,6 +101,9 @@ pub enum MenuAction {
     FitWindow,
     // -- v4 §25: ピクセルグリッド --------------------------------------------
     TogglePixelGrid,
+    /// v12 §58: 「パネル配置をリセット」(色/レイヤー/履歴を既定の右ドックへ
+    /// 戻し、設定にも反映する。`app.rs::reset_panel_layout`)。
+    ResetPanelLayout,
     // -- v2 §13: レイヤーメニュー(ARCHITECTURE.md §14.8 V2-M2) -----------
     LayerAdd,
     LayerDuplicate,
@@ -160,6 +163,7 @@ impl MenuAction {
             Self::Zoom100 => "100%",
             Self::FitWindow => "全体表示",
             Self::TogglePixelGrid => "グリッド",
+            Self::ResetPanelLayout => "パネル配置",
             Self::LayerAdd => "追加",
             Self::LayerDuplicate => "複製",
             Self::LayerDelete => "削除",
@@ -209,6 +213,13 @@ const ICON_SIZE: f32 = 17.0;
 const LABEL_SIZE: f32 = 8.0;
 /// グループ間の区切り線の幅(行分割の計算にも使う、`slot_width` 参照)。
 const SEP_W: f32 = 6.0;
+/// メニュー行のボタン間隔。テーマの既定(8px)より詰めた専用値
+/// (v12 §58 で「パネル配置をリセット」を足した際、既定 1280px 幅で 3 行に
+/// なってしまったため。6px にすると既定幅で 2 行、最小幅 640px でも 5 行→
+/// 4 行に収まり、どの幅でも改善する)。**`pack_rows` に渡す値と実際の
+/// `ui.spacing_mut()` は必ず同じにすること** — ずれると計算した行数と
+/// 実際の折り返しが食い違い、ボタンが見切れる(`show` の docstring 参照)。
+const ROW_ITEM_SPACING_X: f32 = 6.0;
 
 /// アイコン描画関数の共通シグネチャ(`ui/icons.rs` の全関数がこれに従う)。
 /// キャプチャ変数を持たない関数ポインタなので `Copy` にでき、`Slot` の
@@ -698,6 +709,13 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             paint: icons::paint_pixel_grid_icon,
             action: MenuAction::TogglePixelGrid,
         },
+        // v12 §58: パネル(色/レイヤー/履歴)の配置を既定へ戻す。
+        mi(
+            true,
+            "パネル配置をリセット",
+            icons::paint_panel_reset_icon,
+            MenuAction::ResetPanelLayout,
+        ),
         Slot::Sep,
         // -- その他(バージョン情報・設定、SPEC §33) --------------------------
         mi(
@@ -789,7 +807,7 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
     // 過大評価すると行分割が 1 個多くボタンを詰め込んでしまい、ウィンドウ
     // 右端でボタンが見切れる。
     let avail_width = (ui.available_width() - PANEL_MARGIN_H * 2.0).max(0.0);
-    let rows = pack_rows(&slots, avail_width, spacing.x);
+    let rows = pack_rows(&slots, avail_width, ROW_ITEM_SPACING_X);
     let row_count = (rows.len().max(1) - 1) as f32;
     let content_height = rows.len().max(1) as f32 * BUTTON_H + row_count * spacing.y;
     let panel_height = content_height + PANEL_MARGIN_V * 2.0;
@@ -797,6 +815,8 @@ pub fn show(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuAction> {
     egui::Panel::top("menu_bar")
         .exact_size(panel_height)
         .show(ui, |ui| {
+            // `pack_rows` に渡したものと同じ間隔を実際のレイアウトにも使う。
+            ui.spacing_mut().item_spacing.x = ROW_ITEM_SPACING_X;
             for row in &rows {
                 ui.horizontal(|ui| {
                     for &i in row {
@@ -944,7 +964,7 @@ mod tests {
         let recent_files = std::collections::VecDeque::new();
         let state = all_enabled_state(&recent_files);
         let slots = build_slots(&state);
-        let rows = pack_rows(&slots, 640.0 - PANEL_MARGIN_H * 2.0, 8.0);
+        let rows = pack_rows(&slots, 640.0 - PANEL_MARGIN_H * 2.0, ROW_ITEM_SPACING_X);
         assert!(rows.len() <= 5);
         for row in rows {
             assert!(!matches!(slots[row[0]], Slot::Sep));
@@ -957,7 +977,7 @@ mod tests {
         let recent_files = std::collections::VecDeque::new();
         let state = all_enabled_state(&recent_files);
         let slots = build_slots(&state);
-        let rows = pack_rows(&slots, 1280.0 - PANEL_MARGIN_H * 2.0, 8.0);
+        let rows = pack_rows(&slots, 1280.0 - PANEL_MARGIN_H * 2.0, ROW_ITEM_SPACING_X);
         assert!(
             rows.len() <= 2,
             "既定幅では 2 行以内(実際は {} 行)",
@@ -1008,9 +1028,10 @@ mod tests {
         let item_count = slots.iter().filter(|s| !matches!(s, Slot::Sep)).count();
         let sep_count = slots.iter().filter(|s| matches!(s, Slot::Sep)).count();
         // v11 §48 で「切り出し」が加わり 46(+区切り 5 = 51)。
-        assert_eq!(item_count, 46);
+        // v12 §58 で表示グループに「パネル配置をリセット」が加わり 47(+5 = 52)。
+        assert_eq!(item_count, 47);
         assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 51);
+        assert_eq!(slots.len(), 52);
     }
 
     /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を

@@ -72,6 +72,7 @@ use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
 use crate::ui::layers_panel::{LayersPanelAction, RenameState, ThumbnailCache};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
+use crate::ui::panels::PanelLayout;
 use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
 use crate::ui::toolbar::{self, ToolbarAction};
 use crate::ui::{dialogs, menu, options_bar, side_panel, status_bar};
@@ -644,6 +645,17 @@ pub struct DaraskApp {
     /// 「既存タブが取り残される、というバグを作らない」)。
     max_undo_steps: u32,
 
+    // -- v12 §58: ドッキングパネル(ARCHITECTURE.md §22.6b) ---------------
+    /// パネル(色/レイヤー/履歴)の配置。SPEC §26 の永続化対象
+    /// (`settings.rs` の `panel.<kind>.*`)。描画とユーザー操作の反映は
+    /// `ui/side_panel.rs`。
+    panels: PanelLayout,
+    /// SPEC §58: 「フローティング座標が画面外になった場合は表示範囲内へ
+    /// クランプして復元」。復元は起動後に画面矩形が分かる最初のフレームで
+    /// 1 回だけ行う(実行中の位置は egui の `constrain` が面倒を見る —
+    /// ARCHITECTURE.md §22.6b 落とし穴 3)。
+    panels_need_clamp: bool,
+
     // -- v2 §14: カラーパネル(ARCHITECTURE.md §14.3/§14.4, V2-M3) --------
     /// 色相リング + SV 三角形の編集中状態(ドラッグ中は HSV を正とする、
     /// ARCHITECTURE.md §14.9-1)。
@@ -905,6 +917,9 @@ impl DaraskApp {
             alt_eyedropper_active: false,
             show_pixel_grid: settings.show_pixel_grid,
             max_undo_steps: settings.max_undo_steps,
+            // v12 §58: 設定から復元した配置。画面外クランプは最初のフレーム。
+            panels: settings.panels,
+            panels_need_clamp: true,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
             // だけ空欄がちらつく)。
@@ -3842,7 +3857,22 @@ impl DaraskApp {
             last_tool: self.tool,
             show_pixel_grid: self.show_pixel_grid,
             max_undo_steps: self.max_undo_steps,
+            // v12 §58: ドッキングパネルの配置(ドラッグ・メニュー操作の結果は
+            // `self.panels` に随時反映されているので、ここはその写しでよい)。
+            panels: self.panels.clone(),
         }
+    }
+
+    /// v12 §58: 表示メニューの「パネル配置をリセット」。既定配置(全部右
+    /// ドック・色→レイヤー→履歴)へ戻し、SPEC §58 の「設定にも反映」に
+    /// したがってその場で保存する(通常の配置変更は他の設定と同じく終了時
+    /// 保存だが、この項目だけは「リセットしたのに次回起動で戻っている」を
+    /// 避けるため即時に書き出す)。
+    fn reset_panel_layout(&mut self) {
+        self.panels.reset();
+        self.panels_need_clamp = false;
+        self.save_settings();
+        self.show_toast("パネル配置を既定に戻しました".to_string());
     }
 
     /// ARCHITECTURE.md §16.7: 「書き込みは終了時と最近使ったファイル更新時
@@ -4933,6 +4963,8 @@ impl DaraskApp {
                 tab.view.fit_to_window(&tab.doc);
             }
             MenuAction::TogglePixelGrid => self.show_pixel_grid = !self.show_pixel_grid,
+            // v12 §58: 「パネル配置をリセット」(既定配置へ+設定へ反映)。
+            MenuAction::ResetPanelLayout => self.reset_panel_layout(),
             MenuAction::LayerAdd => self.layer_add(),
             MenuAction::LayerDuplicate => self.layer_duplicate(),
             MenuAction::LayerDelete => self.layer_delete(),
@@ -5348,22 +5380,42 @@ impl eframe::App for DaraskApp {
         // `Tab` の docstring 参照)ため、`active_tab_mut()`(`*self` 全体を
         // 借用してしまうメソッド呼び出し)ではなく `Tab` への可変参照を
         // 1 回だけ取って両フィールドへ分割借用する。
+        //
+        // v12 §58: 右パネル固定ではなく「左ドック→右ドック→フローティング」を
+        // まとめて出す(`ui/side_panel.rs`)。左ドックはツールバーの直後、
+        // 右ドックはオプションバー(top)より前、という宣言順は上記の理由で
+        // そのまま重要(ARCHITECTURE.md §22.6b 落とし穴 1)。
+        if self.panels_need_clamp {
+            // SPEC §58: 復元したフローティング座標を表示範囲内へ(1 回だけ)。
+            // 画面矩形がまだ確定していないフレーム(`Rect::NOTHING` 等)では
+            // クランプ自体が行われないので、そのときはフラグを落とさず次の
+            // フレームへ持ち越す(落としてしまうと復元位置が画面外のままに
+            // なる、というレビュー指摘への対応)。
+            self.panels_need_clamp = !self.panels.clamp_floating_to_screen(content_rect);
+        }
+        // v12 §58: モーダル表示中はパネルの配置操作を受け付けない
+        // (`side_panel::show` の `interactive`。ドロップ判定はポインタ座標の
+        // 幾何比較で行うため、egui のモーダル入力ブロックだけでは
+        // 「モーダルの裏で再ドックされる」のを防げない)。
+        let panels_interactive = self.modal.is_none();
         let tab = &mut self.tabs[self.active_tab];
-        let (layer_action, history_jump) = side_panel::show(
+        let panels_out = side_panel::show(
             ui,
-            side_panel::SidePanelCtx {
+            &mut self.panels,
+            &mut side_panel::PanelsCtx {
                 doc: &tab.doc,
                 rename: &mut tab.layer_rename,
                 thumbnails: &mut tab.thumbnails,
                 history: &tab.history,
+                color: color_ctx,
             },
-            color_ctx,
+            panels_interactive,
         );
-        if let Some(action) = layer_action {
+        if let Some(action) = panels_out.layer_action {
             self.handle_layers_panel_action(action);
         }
         // v6-M3(SPEC §35、ARCHITECTURE.md §18.4): 履歴パネルの行クリック。
-        if let Some(target_len) = history_jump {
+        if let Some(target_len) = panels_out.history_jump {
             self.jump_history_to(target_len);
         }
 
@@ -5693,6 +5745,8 @@ mod tests {
             alt_eyedropper_active: false,
             show_pixel_grid: true,
             max_undo_steps: settings::DEFAULT_MAX_UNDO_STEPS,
+            panels: PanelLayout::default(),
+            panels_need_clamp: false,
             color_wheel: ColorWheelState::new(),
             // 起動 1 フレーム目から正しい表記を出す(空文字だと 1 フレーム
             // だけ空欄がちらつく)。プライマリの初期値(黒)に合わせる。
@@ -8373,6 +8427,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v12 §58: 表示メニューの「パネル配置をリセット」。
+    #[test]
+    fn reset_panel_layout_menu_action_restores_the_default_placement() {
+        use crate::ui::panels::{DockSide, PanelKind, PanelLayout, PanelMove};
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.panels
+            .apply_move(PanelKind::Color, PanelMove::Dock(DockSide::Left));
+        app.panels.apply_move(PanelKind::History, PanelMove::Float);
+        app.panels.toggle_collapsed(PanelKind::Layers);
+        assert_ne!(app.panels, PanelLayout::default());
+
+        app.handle_menu_action(MenuAction::ResetPanelLayout);
+
+        assert_eq!(app.panels, PanelLayout::default());
+        assert!(
+            app.toast.is_some(),
+            "リセットしたことをトーストで知らせる(無反応に見せない)"
+        );
+    }
+
     #[test]
     fn current_settings_reflects_live_app_state() {
         let mut app = new_for_test(Document::new(4, 4, Background::White));
@@ -8390,8 +8464,14 @@ mod tests {
         app.window_size = egui::vec2(1600.0, 900.0);
         app.window_maximized = true;
         app.max_undo_steps = 250;
+        // v12 §58: パネル配置も終了時の保存対象。
+        app.panels.apply_move(
+            crate::ui::panels::PanelKind::History,
+            crate::ui::panels::PanelMove::Dock(crate::ui::panels::DockSide::Left),
+        );
 
         let s = app.current_settings();
+        assert_eq!(s.panels, app.panels);
         assert_eq!(s.primary, app.primary);
         assert_eq!(s.secondary, app.secondary);
         assert_eq!(s.brush_size, app.brush_size);

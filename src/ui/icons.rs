@@ -1190,6 +1190,23 @@ pub fn paint_pixel_grid_icon(painter: &Painter, rect: Rect, color: Color32) {
     }
 }
 
+/// 表示 = パネル配置をリセット(v12 §58): ウィンドウの枠と、既定配置
+/// (右ドックに 3 パネル)を表す右側の列。SPEC §15 の流儀どおり、渡された
+/// 1 色の線だけで組み立てる。
+pub fn paint_panel_reset_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    let outer = Rect::from_min_max(p(rect, 0.14, 0.2), p(rect, 0.86, 0.8));
+    painter.rect_stroke(outer, 0.0, st, egui::StrokeKind::Middle);
+    // 右ドック(既定配置)を区切る縦線。
+    let dock_x = outer.min.x + outer.width() * 0.58;
+    painter.line_segment([pos2(dock_x, outer.min.y), pos2(dock_x, outer.max.y)], st);
+    // ドック内の 3 パネル(色/レイヤー/履歴)の境目。
+    for t in [1.0 / 3.0, 2.0 / 3.0] {
+        let y = outer.min.y + t * outer.height();
+        painter.line_segment([pos2(dock_x, y), pos2(outer.max.x, y)], st);
+    }
+}
+
 /// その他 = バージョン情報: 丸に「i」(SPEC §33)。
 pub fn paint_about_icon(painter: &Painter, rect: Rect, color: Color32) {
     let st = line_stroke(rect, color);
