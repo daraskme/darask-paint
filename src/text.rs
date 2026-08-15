@@ -135,8 +135,19 @@ fn allocate_buffer(width: u32, height: u32) -> Result<Vec<u8>, TextRasterError> 
     Ok(buffer)
 }
 
-/// ラスタライズ先のバッファ(寸法・塗り色つき)。グリフ描画のヘルパーを
-/// メソッドとして持たせ、横書き・縦書きの両方から同じ経路で書く。
+/// v12 §52.2: グリフのカバレッジ(0.0–1.0)を受け取る書き込み先。
+///
+/// レイアウト(どこに何のグリフを置くか)と「カバレッジをどう使うか」を
+/// 分離するための唯一の接点。RGBA へ直接焼き込む `GlyphTarget` と、
+/// 袋文字のために**カバレッジ配列**を作る `CoverageMap` の 2 つが実装する
+/// (ARCHITECTURE.md §22.3b: 「レイアウト側をカバレッジ配列を返す内部関数へ
+/// 分離し、色を焼き込む処理を最後段に集約する」)。
+trait CoverageSink {
+    fn put(&mut self, x: i32, y: i32, coverage: f32);
+}
+
+/// ラスタライズ先の RGBA バッファ(寸法・塗り色つき)。袋文字 OFF の経路は
+/// v12 §52 までと**同じ演算**でここへ直接焼き込む(結果はバイト一致)。
 struct GlyphTarget<'a> {
     buffer: &'a mut [u8],
     width: u32,
@@ -144,9 +155,9 @@ struct GlyphTarget<'a> {
     color: [u8; 4],
 }
 
-impl GlyphTarget<'_> {
+impl CoverageSink for GlyphTarget<'_> {
     /// カバレッジ 1 画素を合成する(範囲外は捨てる = パニックしない)。
-    fn blend(&mut self, x: i32, y: i32, coverage: f32) {
+    fn put(&mut self, x: i32, y: i32, coverage: f32) {
         if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
             return;
         }
@@ -164,84 +175,123 @@ impl GlyphTarget<'_> {
         );
         self.buffer[idx..idx + 4].copy_from_slice(&blended);
     }
+}
 
-    /// グリフを `(x, baseline_y)` に描く(横書き・縦書きの非回転文字で共通)。
-    fn draw_glyph(
-        &mut self,
-        font: &FontRef<'_>,
-        id: GlyphId,
-        px_size: f32,
-        x: f32,
-        baseline_y: f32,
-    ) {
-        let glyph = id.with_scale_and_position(px_size, point(x, baseline_y));
-        let Some(outlined) = font.outline_glyph(glyph) else {
+/// v12 §52.2: 色を持たないカバレッジ配列(袋文字の縁取りが必要とする素材)。
+/// 重なりは source-over(`c + v(1-c)`)で累積する。
+struct CoverageMap {
+    width: u32,
+    height: u32,
+    data: Vec<f32>,
+}
+
+impl CoverageMap {
+    fn new(width: u32, height: u32) -> Result<Self, TextRasterError> {
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(TextRasterError::TooLarge)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| TextRasterError::TooLarge)?;
+        data.resize(len, 0.0);
+        Ok(Self {
+            width,
+            height,
+            data,
+        })
+    }
+}
+
+impl CoverageSink for CoverageMap {
+    fn put(&mut self, x: i32, y: i32, coverage: f32) {
+        if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return;
+        }
+        let idx = y as usize * self.width as usize + x as usize;
+        let Some(slot) = self.data.get_mut(idx) else {
             return;
         };
-        let bounds = outlined.px_bounds();
-        let origin_x = bounds.min.x.floor() as i32;
-        let origin_y = bounds.min.y.floor() as i32;
-        outlined.draw(|gx, gy, coverage| {
-            self.blend(origin_x + gx as i32, origin_y + gy as i32, coverage);
-        });
+        let v = coverage.clamp(0.0, 1.0);
+        *slot += v * (1.0 - *slot);
     }
+}
 
-    /// v12 §52: グリフを**セル中心 `(cx, cy)` で 90° 回転**して描く。
-    ///
-    /// グリフのカバレッジをいったん小バッファへラスタライズし、
-    /// `rotate_coverage_cw`(時計回り 90°)で書き出す。これにより「ー」の
-    /// ような横長の記号が縦長になる(SPEC §52 の回転文字)。
-    ///
-    /// 中間バッファも `try_reserve` で確保し、異常なグリフ寸法(壊れた
-    /// フォント・極端な `px_size`)は `TooLarge` として返す(確保前に弾く)。
-    fn draw_glyph_rotated(
-        &mut self,
-        font: &FontRef<'_>,
-        id: GlyphId,
-        px_size: f32,
-        cx: f32,
-        cy: f32,
-    ) -> Result<(), TextRasterError> {
-        let glyph = id.with_scale_and_position(px_size, point(0.0, 0.0));
-        let Some(outlined) = font.outline_glyph(glyph) else {
-            return Ok(());
-        };
-        let bounds = outlined.px_bounds();
-        let gw = to_dimension(bounds.width())? as usize;
-        let gh = to_dimension(bounds.height())? as usize;
-        if gw == 0 || gh == 0 {
-            return Ok(());
-        }
-        let len = gw.checked_mul(gh).ok_or(TextRasterError::TooLarge)?;
-        let mut coverage: Vec<f32> = Vec::new();
-        coverage
-            .try_reserve_exact(len)
-            .map_err(|_| TextRasterError::TooLarge)?;
-        coverage.resize(len, 0.0);
-        outlined.draw(|gx, gy, c| {
-            let (gx, gy) = (gx as usize, gy as usize);
-            if gx >= gw || gy >= gh {
-                return;
-            }
-            coverage[gy * gw + gx] = c;
-        });
+/// グリフを `(x, baseline_y)` に描く(横書き・縦書きの非回転文字で共通)。
+fn draw_glyph(
+    sink: &mut dyn CoverageSink,
+    font: &FontRef<'_>,
+    id: GlyphId,
+    px_size: f32,
+    x: f32,
+    baseline_y: f32,
+) {
+    let glyph = id.with_scale_and_position(px_size, point(x, baseline_y));
+    let Some(outlined) = font.outline_glyph(glyph) else {
+        return;
+    };
+    let bounds = outlined.px_bounds();
+    let origin_x = bounds.min.x.floor() as i32;
+    let origin_y = bounds.min.y.floor() as i32;
+    outlined.draw(|gx, gy, coverage| {
+        sink.put(origin_x + gx as i32, origin_y + gy as i32, coverage);
+    });
+}
 
-        // 回転後は縦横が入れ替わる。中心 (cx, cy) に合わせて配置する。
-        let (rot_w, rot_h) = (gh, gw);
-        let origin_x = (cx - rot_w as f32 / 2.0).floor() as i32;
-        let origin_y = (cy - rot_h as f32 / 2.0).floor() as i32;
-        for gy in 0..gh {
-            for gx in 0..gw {
-                let c = coverage[gy * gw + gx];
-                if c <= 0.0 {
-                    continue;
-                }
-                let (nx, ny) = rotate_coverage_cw(gx, gy, gh);
-                self.blend(origin_x + nx as i32, origin_y + ny as i32, c);
-            }
-        }
-        Ok(())
+/// v12 §52: グリフを**セル中心 `(cx, cy)` で 90° 回転**して描く。
+///
+/// グリフのカバレッジをいったん小バッファへラスタライズし、
+/// `rotate_coverage_cw`(時計回り 90°)で書き出す。これにより「ー」の
+/// ような横長の記号が縦長になる(SPEC §52 の回転文字)。
+///
+/// 中間バッファも `try_reserve` で確保し、異常なグリフ寸法(壊れた
+/// フォント・極端な `px_size`)は `TooLarge` として返す(確保前に弾く)。
+fn draw_glyph_rotated(
+    sink: &mut dyn CoverageSink,
+    font: &FontRef<'_>,
+    id: GlyphId,
+    px_size: f32,
+    cx: f32,
+    cy: f32,
+) -> Result<(), TextRasterError> {
+    let glyph = id.with_scale_and_position(px_size, point(0.0, 0.0));
+    let Some(outlined) = font.outline_glyph(glyph) else {
+        return Ok(());
+    };
+    let bounds = outlined.px_bounds();
+    let gw = to_dimension(bounds.width())? as usize;
+    let gh = to_dimension(bounds.height())? as usize;
+    if gw == 0 || gh == 0 {
+        return Ok(());
     }
+    let len = gw.checked_mul(gh).ok_or(TextRasterError::TooLarge)?;
+    let mut coverage: Vec<f32> = Vec::new();
+    coverage
+        .try_reserve_exact(len)
+        .map_err(|_| TextRasterError::TooLarge)?;
+    coverage.resize(len, 0.0);
+    outlined.draw(|gx, gy, c| {
+        let (gx, gy) = (gx as usize, gy as usize);
+        if gx >= gw || gy >= gh {
+            return;
+        }
+        coverage[gy * gw + gx] = c;
+    });
+
+    // 回転後は縦横が入れ替わる。中心 (cx, cy) に合わせて配置する。
+    let (rot_w, rot_h) = (gh, gw);
+    let origin_x = (cx - rot_w as f32 / 2.0).floor() as i32;
+    let origin_y = (cy - rot_h as f32 / 2.0).floor() as i32;
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let c = coverage[gy * gw + gx];
+            if c <= 0.0 {
+                continue;
+            }
+            let (nx, ny) = rotate_coverage_cw(gx, gy, gh);
+            sink.put(origin_x + nx as i32, origin_y + ny as i32, c);
+        }
+    }
+    Ok(())
 }
 
 /// v12 §52: カバレッジ座標の**時計回り 90°**写像(`(gx, gy)` →
@@ -254,13 +304,266 @@ fn rotate_coverage_cw(gx: usize, gy: usize, gh: usize) -> (usize, usize) {
     (gh.saturating_sub(1).saturating_sub(gy), gx)
 }
 
+/// フォント + 正規化済みのオプション(レイアウト計算の共通の前提)。
+struct Prepared<'a> {
+    font: FontRef<'a>,
+    px_size: f32,
+    char_spacing: f32,
+    line_spacing: f32,
+}
+
+fn prepare<'a>(
+    font_bytes: &'a [u8],
+    px_size: f32,
+    char_spacing: f32,
+    line_spacing: f32,
+) -> Result<Prepared<'a>, TextRasterError> {
+    let font = FontRef::try_from_slice_and_index(font_bytes, FONT_COLLECTION_INDEX)
+        .map_err(|_| TextRasterError::Font)?;
+    Ok(Prepared {
+        font,
+        px_size: sanitize_px_size(px_size),
+        char_spacing: sanitize_spacing(char_spacing),
+        line_spacing: sanitize_spacing(line_spacing),
+    })
+}
+
+/// 横書きのレイアウト結果(寸法とベースライン計算に必要な値)。
+struct HorizontalLayout {
+    width: u32,
+    height: u32,
+    line_height: f32,
+    ascent: f32,
+}
+
+/// 1 行ぶんのグリフを並べ、行末の x(= 行の幅)を返す。`on_glyph` は
+/// 描画パスでだけ `Some` になる(寸法計算パスと描画パスで**同じコード**を
+/// 通し、レイアウトのずれを防ぐ)。
+fn layout_line(
+    prepared: &Prepared<'_>,
+    line: &str,
+    mut on_glyph: Option<&mut dyn FnMut(GlyphId, f32)>,
+) -> f32 {
+    let scaled = prepared.font.as_scaled(prepared.px_size);
+    let mut cursor_x = 0.0f32;
+    let mut prev: Option<GlyphId> = None;
+    for ch in line.chars() {
+        let id = prepared.font.glyph_id(ch);
+        if let Some(prev_id) = prev {
+            cursor_x += scaled.kern(prev_id, id);
+            // v12 §52: 文字間は字送りへの加算(文字と文字の**間**にだけ
+            // 入れるので、行末に余白が付かない)。
+            cursor_x += prepared.char_spacing;
+        }
+        if let Some(callback) = on_glyph.as_deref_mut() {
+            callback(id, cursor_x);
+        }
+        cursor_x += scaled.h_advance(id);
+        prev = Some(id);
+    }
+    cursor_x
+}
+
+/// 横書きの寸法計算パス。結果が空(幅か高さが 0)なら `None`。
+fn measure_horizontal(
+    prepared: &Prepared<'_>,
+    text: &str,
+) -> Result<Option<HorizontalLayout>, TextRasterError> {
+    let scaled = prepared.font.as_scaled(prepared.px_size);
+    // v12 §52: 行間は行送りへの加算(字送りへの加算は `layout_line`)。
+    let line_height = ((scaled.height() + scaled.line_gap()) * LINE_HEIGHT_FACTOR).max(1.0)
+        + prepared.line_spacing;
+
+    // 行数だけ先に数え、上限を超える入力は**確保する前に**弾く
+    // (`line_height >= 1` なので、行数が上限を超えれば高さも必ず超える)。
+    let line_count = text.split('\n').count();
+    if line_count > MAX_TEXT_DIMENSION as usize {
+        return Err(TextRasterError::TooLarge);
+    }
+
+    let mut max_x = 0.0f32;
+    for line in text.split('\n') {
+        max_x = max_x.max(layout_line(prepared, line, None));
+    }
+
+    let width = to_dimension(max_x)?;
+    let height = to_dimension(line_height * line_count as f32)?;
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    Ok(Some(HorizontalLayout {
+        width,
+        height,
+        line_height,
+        ascent: scaled.ascent(),
+    }))
+}
+
+/// 横書きの描画パス(カバレッジの送り先は呼び出し側が決める)。
+fn draw_horizontal(
+    prepared: &Prepared<'_>,
+    text: &str,
+    layout: &HorizontalLayout,
+    sink: &mut dyn CoverageSink,
+) {
+    for (row, line) in text.split('\n').enumerate() {
+        let baseline_y = layout.ascent + row as f32 * layout.line_height;
+        let mut draw = |id: GlyphId, x: f32| {
+            draw_glyph(sink, &prepared.font, id, prepared.px_size, x, baseline_y);
+        };
+        layout_line(prepared, line, Some(&mut draw));
+    }
+}
+
+/// 縦書きのレイアウト結果。
+struct VerticalLayout {
+    width: u32,
+    height: u32,
+    ascent: f32,
+    /// セルの「文字ぶん」の高さ(回転・句読点の中心合わせに使う)。
+    cell_core: f32,
+    /// 実際の字送り(= セル高 + 文字間)。
+    cell_advance: f32,
+    /// 全角 1 文字ぶんの幅(空列のセル幅)。
+    full_width: f32,
+    col_widths: Vec<f32>,
+    total_width: f32,
+}
+
+/// 縦書きの寸法計算パス。結果が空なら `None`。
+fn measure_vertical(
+    prepared: &Prepared<'_>,
+    text: &str,
+) -> Result<Option<VerticalLayout>, TextRasterError> {
+    let scaled = prepared.font.as_scaled(prepared.px_size);
+    let cell_core = (scaled.height() + scaled.line_gap()).max(1.0);
+    let cell_advance = cell_core + prepared.char_spacing;
+    // 全角 1 文字ぶんの幅(空列のセル幅)。表意文字スペース(U+3000)の
+    // advance を使い、フォントに無ければセル高で代用する。
+    let full_width = {
+        let advance = scaled.h_advance(prepared.font.glyph_id('\u{3000}'));
+        if advance > 0.0 {
+            advance
+        } else {
+            cell_core
+        }
+    };
+
+    // v12 §52(追いレビュー②): 列ごとの文字列は保持せず(`Vec<Vec<char>>` を
+    // 作らない)、列幅だけを検査付きで確保した `Vec<f32>` に持って、描画時に
+    // 文字列を再走査する。列数は先に数え、上限超過は**確保する前に**弾く
+    // (列幅は必ず 1px 以上なので、列数が上限を超えれば幅も必ず超える)。
+    let column_count = text.split('\n').count();
+    if column_count > MAX_TEXT_DIMENSION as usize {
+        return Err(TextRasterError::TooLarge);
+    }
+    let mut col_widths: Vec<f32> = Vec::new();
+    col_widths
+        .try_reserve_exact(column_count)
+        .map_err(|_| TextRasterError::TooLarge)?;
+    let mut max_cells = 1usize;
+    for column in text.split('\n') {
+        let mut width = 0.0f32;
+        let mut cells = 0usize;
+        for ch in column.chars() {
+            width = width.max(scaled.h_advance(prepared.font.glyph_id(ch)));
+            cells += 1;
+        }
+        // 空列は全角 1 文字ぶんの幅のセルを占める(SPEC §52)。
+        col_widths.push(width.max(if cells == 0 { full_width } else { 1.0 }));
+        max_cells = max_cells.max(cells.max(1));
+    }
+
+    let total_width: f32 = col_widths.iter().sum::<f32>()
+        + prepared.line_spacing * (column_count.saturating_sub(1)) as f32;
+    // 空列も 1 セルぶんの高さを占める(SPEC §52)。末尾の文字間は含めない。
+    let total_height = cell_advance * max_cells as f32 - prepared.char_spacing;
+
+    let width = to_dimension(total_width)?;
+    let height = to_dimension(total_height)?;
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    Ok(Some(VerticalLayout {
+        width,
+        height,
+        ascent: scaled.ascent(),
+        cell_core,
+        cell_advance,
+        full_width,
+        col_widths,
+        total_width,
+    }))
+}
+
+/// 縦書きの描画パス(カバレッジの送り先は呼び出し側が決める)。
+fn draw_vertical(
+    prepared: &Prepared<'_>,
+    text: &str,
+    layout: &VerticalLayout,
+    sink: &mut dyn CoverageSink,
+) -> Result<(), TextRasterError> {
+    let font = &prepared.font;
+    let px_size = prepared.px_size;
+    let scaled = font.as_scaled(px_size);
+    // 右から左へ列を配置する(最初の列が最も右)。
+    let mut right = layout.total_width;
+    for (col_index, column) in text.split('\n').enumerate() {
+        let col_width = layout
+            .col_widths
+            .get(col_index)
+            .copied()
+            .unwrap_or(layout.full_width);
+        let x = right - col_width;
+        for (cell, ch) in column.chars().enumerate() {
+            let id = font.glyph_id(ch);
+            let baseline_y = layout.ascent + cell as f32 * layout.cell_advance;
+            if VERTICAL_ROTATED_CHARS.contains(ch) {
+                // セル中心を軸に 90° 回転。
+                let cx = x + col_width / 2.0;
+                let cy = baseline_y - layout.ascent + layout.cell_core / 2.0;
+                draw_glyph_rotated(sink, font, id, px_size, cx, cy)?;
+            } else if VERTICAL_PUNCT_CHARS.contains(ch) {
+                // 句読点は右上寄せ(描画起点を右へ半セル・上へ半セルずらす)。
+                let punct_x = x + col_width / 2.0;
+                let mut punct_y = baseline_y - layout.cell_core / 2.0;
+                // 列の 1 セル目だけは、半セル上げるとインクが画像の上端より
+                // 外へ出て切れてしまう(参照実装は余白付きのウィジェットへ
+                // 描くので気づかない)。はみ出したぶんだけ下げて、インクが
+                // セル内に収まるようにする(他のセルでは補正は働かない)。
+                let probe = id.with_scale_and_position(px_size, point(punct_x, punct_y));
+                if let Some(outlined) = font.outline_glyph(probe) {
+                    let top = outlined.px_bounds().min.y;
+                    if top < 0.0 {
+                        punct_y -= top;
+                    }
+                }
+                draw_glyph(sink, font, id, px_size, punct_x, punct_y);
+            } else {
+                // セル内で水平センタリング。
+                let advance = scaled.h_advance(id);
+                draw_glyph(
+                    sink,
+                    font,
+                    id,
+                    px_size,
+                    x + (col_width - advance) / 2.0,
+                    baseline_y,
+                );
+            }
+        }
+        right = x - prepared.line_spacing;
+    }
+    Ok(())
+}
+
 /// `text` を `font_bytes`(TTF/TTC のバイト列)を使って `px_size` ピクセルの
 /// アンチエイリアス付きでラスタライズし、`color`(straight-alpha RGBA)で
 /// 塗る。戻り値は `(幅, 高さ, RGBA8 straight-alpha バッファ)`。
 ///
-/// - 空文字列、フォント解析の失敗、レイアウト結果の幅/高さが 0 になる場合は
-///   `(0, 0, Vec::new())` を返す(SPEC §19: 「空文字列の確定は何もしない」の
-///   判定に呼び出し側がそのまま使える)。
+/// - 空文字列、レイアウト結果の幅/高さが 0 になる場合は `(0, 0, Vec::new())`
+///   を返す(SPEC §19: 「空文字列の確定は何もしない」の判定に使える)。
+///   フォント解析の失敗・寸法超過は `Err`(v12 §52)。
 /// - 複数行対応(`\n` 区切り、SPEC §19)。行送りはフォントメトリクス準拠。
 /// - `h_advance` + カーニングでグリフを横に並べる。
 /// - 境界チェック済みでパニックしない(CLAUDE.md 鉄則: I/O・ユーザー入力
@@ -277,75 +580,19 @@ pub fn rasterize_text(
     if text.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
-    let px_size = sanitize_px_size(px_size);
-    let char_spacing = sanitize_spacing(char_spacing);
-    let line_spacing = sanitize_spacing(line_spacing);
-    let font = FontRef::try_from_slice_and_index(font_bytes, FONT_COLLECTION_INDEX)
-        .map_err(|_| TextRasterError::Font)?;
-    let scaled = font.as_scaled(px_size);
-    // v12 §52: 行間は行送りへの加算(字送りへの加算は下の `char_spacing`)。
-    let line_height =
-        ((scaled.height() + scaled.line_gap()) * LINE_HEIGHT_FACTOR).max(1.0) + line_spacing;
-    let ascent = scaled.ascent();
-
-    // 行数だけ先に数え、上限を超える入力は**確保する前に**弾く
-    // (`line_height >= 1` なので、行数が上限を超えれば高さも必ず超える)。
-    let line_count = text.split('\n').count();
-    if line_count > MAX_TEXT_DIMENSION as usize {
-        return Err(TextRasterError::TooLarge);
-    }
-
-    // v12 §52(追いレビュー②): グリフ位置を `Vec` に貯めず、
-    // 「寸法計算パス → 描画パス」の 2 パスにする(巨大な貼り付けで
-    // 未検査の中間確保が起きないようにするため)。両パスで同じ
-    // クロージャ `advance_line` を使い、レイアウトのずれを防ぐ。
-    let layout_line = |line: &str, mut on_glyph: Option<&mut dyn FnMut(GlyphId, f32)>| -> f32 {
-        let mut cursor_x = 0.0f32;
-        let mut prev: Option<GlyphId> = None;
-        for ch in line.chars() {
-            let id = font.glyph_id(ch);
-            if let Some(prev_id) = prev {
-                cursor_x += scaled.kern(prev_id, id);
-                // v12 §52: 文字間は字送りへの加算(文字と文字の**間**にだけ
-                // 入れるので、行末に余白が付かない)。
-                cursor_x += char_spacing;
-            }
-            if let Some(callback) = on_glyph.as_deref_mut() {
-                callback(id, cursor_x);
-            }
-            cursor_x += scaled.h_advance(id);
-            prev = Some(id);
-        }
-        cursor_x
-    };
-
-    let mut max_x = 0.0f32;
-    for line in text.split('\n') {
-        max_x = max_x.max(layout_line(line, None));
-    }
-
-    let width = to_dimension(max_x)?;
-    let height = to_dimension(line_height * line_count as f32)?;
-    if width == 0 || height == 0 {
+    let prepared = prepare(font_bytes, px_size, char_spacing, line_spacing)?;
+    let Some(layout) = measure_horizontal(&prepared, text)? else {
         return Ok((0, 0, Vec::new()));
-    }
-
-    let mut buffer = allocate_buffer(width, height)?;
+    };
+    let mut buffer = allocate_buffer(layout.width, layout.height)?;
     let mut target = GlyphTarget {
         buffer: &mut buffer,
-        width,
-        height,
+        width: layout.width,
+        height: layout.height,
         color,
     };
-    for (row, line) in text.split('\n').enumerate() {
-        let baseline_y = ascent + row as f32 * line_height;
-        let mut draw = |id: GlyphId, x: f32| {
-            target.draw_glyph(&font, id, px_size, x, baseline_y);
-        };
-        layout_line(line, Some(&mut draw));
-    }
-
-    Ok((width, height, buffer))
+    draw_horizontal(&prepared, text, &layout, &mut target);
+    Ok((layout.width, layout.height, buffer))
 }
 
 /// v12 §52: 縦書きのラスタライズ(manga_tool 準拠の簡略移植 — ピクセル完全
@@ -371,116 +618,265 @@ pub fn rasterize_text_vertical(
     if text.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
-    let px_size = sanitize_px_size(px_size);
-    let char_spacing = sanitize_spacing(char_spacing);
-    let line_spacing = sanitize_spacing(line_spacing);
-    let font = FontRef::try_from_slice_and_index(font_bytes, FONT_COLLECTION_INDEX)
-        .map_err(|_| TextRasterError::Font)?;
-    let scaled = font.as_scaled(px_size);
-    let ascent = scaled.ascent();
-    // セルの「文字ぶん」の高さ(回転・句読点の中心合わせに使う)と、実際の
-    // 字送り(= セル高 + 文字間)。
-    let cell_core = (scaled.height() + scaled.line_gap()).max(1.0);
-    let cell_advance = cell_core + char_spacing;
-    // 全角 1 文字ぶんの幅(空列のセル幅)。表意文字スペース(U+3000)の
-    // advance を使い、フォントに無ければセル高で代用する。
-    let full_width = {
-        let advance = scaled.h_advance(font.glyph_id('\u{3000}'));
-        if advance > 0.0 {
-            advance
+    let prepared = prepare(font_bytes, px_size, char_spacing, line_spacing)?;
+    let Some(layout) = measure_vertical(&prepared, text)? else {
+        return Ok((0, 0, Vec::new()));
+    };
+    let mut buffer = allocate_buffer(layout.width, layout.height)?;
+    let mut target = GlyphTarget {
+        buffer: &mut buffer,
+        width: layout.width,
+        height: layout.height,
+        color,
+    };
+    draw_vertical(&prepared, text, &layout, &mut target)?;
+    Ok((layout.width, layout.height, buffer))
+}
+
+/// v12 §52.2: 色を焼き込む前の**カバレッジ配列**を返す(袋文字の素材)。
+/// `vertical` で横書き/縦書きのレイアウトを選ぶ(同じ設定が両方で効くよう、
+/// 分岐はここ 1 箇所だけ)。戻り値は `(幅, 高さ, 0.0–1.0 のカバレッジ)`。
+pub fn text_coverage(
+    font_bytes: &[u8],
+    text: &str,
+    px_size: f32,
+    char_spacing: f32,
+    line_spacing: f32,
+    vertical: bool,
+) -> Result<(u32, u32, Vec<f32>), TextRasterError> {
+    if text.is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+    let prepared = prepare(font_bytes, px_size, char_spacing, line_spacing)?;
+    if vertical {
+        let Some(layout) = measure_vertical(&prepared, text)? else {
+            return Ok((0, 0, Vec::new()));
+        };
+        let mut map = CoverageMap::new(layout.width, layout.height)?;
+        draw_vertical(&prepared, text, &layout, &mut map)?;
+        Ok((map.width, map.height, map.data))
+    } else {
+        let Some(layout) = measure_horizontal(&prepared, text)? else {
+            return Ok((0, 0, Vec::new()));
+        };
+        let mut map = CoverageMap::new(layout.width, layout.height)?;
+        draw_horizontal(&prepared, text, &layout, &mut map);
+        Ok((map.width, map.height, map.data))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v12 §52.2: 袋文字(縁取り)
+// ---------------------------------------------------------------------------
+
+/// 距離場の「まだ種から遠い」初期値(画素数より十分大きい値。∞ を使わず
+/// 有限値にして NaN を避ける)。
+const DISTANCE_FIELD_FAR: i32 = 1 << 20;
+
+/// 距離場の種(= 文字の内側)とみなすカバレッジのしきい値。
+///
+/// `ab_glyph` のラスタライザはグリフの外接矩形内に **1e-7 級のごく小さい
+/// カバレッジ**を大量に返す(RGBA へ焼くと α が 0 に丸まるので従来は
+/// 無害だった)。`> 0.0` を種にすると外接矩形がまるごと「文字」と見なされ、
+/// 縁が字形ではなく**四角い箱**になってしまう(実機の目視で発見)。
+/// 見た目の輪郭である 50% 等高線を種にすることで、縁が字形に沿う。
+const DISTANCE_FIELD_INK_THRESHOLD: f32 = 0.5;
+
+/// 種(インク)からの**ユークリッド距離**の場を作る(8SSEDT: 最近傍種への
+/// オフセットベクトルを前方・後方の 2 パスで伝播させる古典的アルゴリズム)。
+///
+/// ARCHITECTURE.md §22.3b は「2 パスのチャンファー距離変換」を指定しているが、
+/// チャンファー(3-4 近似)は対角方向の距離を 6% ほど過小評価するため、
+/// 角が真円にならず「対角の到達距離 ≤ 半径」を保証できない。同じ 2 パス・
+/// 同じ `O(w*h)` で**実質厳密なユークリッド距離**が得られる 8SSEDT を採用した
+/// (計算量の要件は満たしつつ、SPEC §52.2 の「角は丸く」をテスト可能な形で
+/// 満たすための選択)。
+fn distance_field(
+    coverage: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<Vec<f32>, TextRasterError> {
+    let len = width.checked_mul(height).ok_or(TextRasterError::TooLarge)?;
+    let mut grid: Vec<(i32, i32)> = Vec::new();
+    grid.try_reserve_exact(len)
+        .map_err(|_| TextRasterError::TooLarge)?;
+    let mut seeds = 0usize;
+    let mut max_coverage = 0.0f32;
+    for i in 0..len {
+        let cov = coverage.get(i).copied().unwrap_or(0.0);
+        max_coverage = max_coverage.max(cov);
+        let inked = cov >= DISTANCE_FIELD_INK_THRESHOLD;
+        if inked {
+            seeds += 1;
+        }
+        grid.push(if inked {
+            (0, 0)
         } else {
-            cell_core
+            (DISTANCE_FIELD_FAR, DISTANCE_FIELD_FAR)
+        });
+    }
+    // 追いレビュー②: 極小フォント・細い記号では全画素が 50% 未満になりうる。
+    // そのまま種ゼロで進むと「文字は見えているのに縁だけ消える」ので、
+    // 見えているカバレッジがあるなら**最も濃い画素**を種にフォールバックする。
+    if seeds == 0 && max_coverage > 0.0 {
+        for (i, cell) in grid.iter_mut().enumerate() {
+            if coverage.get(i).copied().unwrap_or(0.0) >= max_coverage {
+                *cell = (0, 0);
+            }
+        }
+    }
+
+    let dist2 =
+        |c: (i32, i32)| -> i64 { (c.0 as i64) * (c.0 as i64) + (c.1 as i64) * (c.1 as i64) };
+    let compare = |grid: &mut Vec<(i32, i32)>, idx: usize, other: usize, dx: i32, dy: i32| {
+        let Some(&(ox, oy)) = grid.get(other) else {
+            return;
+        };
+        let candidate = (ox + dx, oy + dy);
+        let Some(current) = grid.get_mut(idx) else {
+            return;
+        };
+        if dist2(candidate) < dist2(*current) {
+            *current = candidate;
         }
     };
 
-    // v12 §52(追いレビュー②): 列ごとの文字列は保持せず(`Vec<Vec<char>>` を
-    // 作らない)、列幅だけを検査付きで確保した `Vec<f32>` に持って、描画時に
-    // 文字列を再走査する。列数は先に数え、上限超過は**確保する前に**弾く
-    // (列幅は必ず 1px 以上なので、列数が上限を超えれば幅も必ず超える)。
-    let column_count = text.split('\n').count();
-    if column_count > MAX_TEXT_DIMENSION as usize {
-        return Err(TextRasterError::TooLarge);
-    }
-    let mut col_widths: Vec<f32> = Vec::new();
-    col_widths
-        .try_reserve_exact(column_count)
-        .map_err(|_| TextRasterError::TooLarge)?;
-    let mut max_cells = 1usize;
-    for column in text.split('\n') {
-        let mut width = 0.0f32;
-        let mut cells = 0usize;
-        for ch in column.chars() {
-            width = width.max(scaled.h_advance(font.glyph_id(ch)));
-            cells += 1;
+    // 前方パス(左上→右下)。
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            if x > 0 {
+                compare(&mut grid, idx, idx - 1, 1, 0);
+            }
+            if y > 0 {
+                compare(&mut grid, idx, idx - width, 0, 1);
+                if x > 0 {
+                    compare(&mut grid, idx, idx - width - 1, 1, 1);
+                }
+                if x + 1 < width {
+                    compare(&mut grid, idx, idx - width + 1, -1, 1);
+                }
+            }
         }
-        // 空列は全角 1 文字ぶんの幅のセルを占める(SPEC §52)。
-        col_widths.push(width.max(if cells == 0 { full_width } else { 1.0 }));
-        max_cells = max_cells.max(cells.max(1));
+        // 行内の右→左(前方パスの仕上げ)。
+        for x in (0..width.saturating_sub(1)).rev() {
+            let idx = y * width + x;
+            compare(&mut grid, idx, idx + 1, -1, 0);
+        }
+    }
+    // 後方パス(右下→左上)。
+    for y in (0..height).rev() {
+        for x in (0..width).rev() {
+            let idx = y * width + x;
+            if x + 1 < width {
+                compare(&mut grid, idx, idx + 1, -1, 0);
+            }
+            if y + 1 < height {
+                compare(&mut grid, idx, idx + width, 0, -1);
+                if x + 1 < width {
+                    compare(&mut grid, idx, idx + width + 1, -1, -1);
+                }
+                if x > 0 {
+                    compare(&mut grid, idx, idx + width - 1, 1, -1);
+                }
+            }
+        }
+        for x in 1..width {
+            let idx = y * width + x;
+            compare(&mut grid, idx, idx - 1, 1, 0);
+        }
     }
 
-    let total_width: f32 =
-        col_widths.iter().sum::<f32>() + line_spacing * (column_count.saturating_sub(1)) as f32;
-    // 空列も 1 セルぶんの高さを占める(SPEC §52)。末尾の文字間は含めない。
-    let total_height = cell_advance * max_cells as f32 - char_spacing;
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| TextRasterError::TooLarge)?;
+    out.extend(grid.iter().map(|c| (dist2(*c) as f64).sqrt() as f32));
+    Ok(out)
+}
 
-    let width = to_dimension(total_width)?;
-    let height = to_dimension(total_height)?;
+/// v12 §52.2: 袋文字(縁取り)。`coverage`(`text_coverage` の出力)を
+/// `radius` px ぶん膨張させた領域から**文字自身の被覆を差し引いた**部分に
+/// `outline` 色を置き、その上に `fill` 色で文字を描く。
+///
+/// - 出力は四方に `ceil(radius)` 拡張した寸法(縁が切れない)。
+/// - 縁のカバレッジは `clamp(radius + 0.5 - d, 0, 1)`(境界 1px で AA)。
+/// - `outline_cov = max(0, outline_cov - glyph_cov)` なので、**塗りと縁は
+///   重ならない**(半透明のプライマリ色でも縁が透けて濁らない)。
+/// - 合成順は 縁 → 塗り。
+/// - 距離場・カバレッジ・出力バッファはすべて `try_reserve` で確保し、
+///   膨張後の寸法が上限を超えれば `TooLarge`。
+pub fn outline_text(
+    coverage: &[f32],
+    width: u32,
+    height: u32,
+    radius: f32,
+    fill: [u8; 4],
+    outline: [u8; 4],
+) -> Result<RasterizedText, TextRasterError> {
     if width == 0 || height == 0 {
         return Ok((0, 0, Vec::new()));
     }
-    let mut buffer = allocate_buffer(width, height)?;
-    let mut target = GlyphTarget {
-        buffer: &mut buffer,
-        width,
-        height,
-        color,
-    };
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(TextRasterError::TooLarge)?;
+    if coverage.len() < expected {
+        // 呼び出し側の取り違え(寸法とバッファの不一致)。パニックせず拒否する。
+        return Err(TextRasterError::TooLarge);
+    }
+    let radius = sanitize_spacing(radius);
+    let pad = to_dimension(radius.ceil())?;
+    // 膨張後の寸法で上限を判定する(SPEC §52.2)。
+    let out_width = to_dimension(width as f32 + pad as f32 * 2.0)?;
+    let out_height = to_dimension(height as f32 + pad as f32 * 2.0)?;
+    let out_len = (out_width as usize)
+        .checked_mul(out_height as usize)
+        .ok_or(TextRasterError::TooLarge)?;
 
-    // 右から左へ列を配置する(最初の列が最も右)。
-    let mut right = total_width;
-    for (col_index, column) in text.split('\n').enumerate() {
-        let col_width = col_widths.get(col_index).copied().unwrap_or(full_width);
-        let x = right - col_width;
-        for (cell, ch) in column.chars().enumerate() {
-            let id = font.glyph_id(ch);
-            let baseline_y = ascent + cell as f32 * cell_advance;
-            if VERTICAL_ROTATED_CHARS.contains(ch) {
-                // セル中心を軸に 90° 回転。
-                let cx = x + col_width / 2.0;
-                let cy = baseline_y - ascent + cell_core / 2.0;
-                target.draw_glyph_rotated(&font, id, px_size, cx, cy)?;
-            } else if VERTICAL_PUNCT_CHARS.contains(ch) {
-                // 句読点は右上寄せ(描画起点を右へ半セル・上へ半セルずらす)。
-                let punct_x = x + col_width / 2.0;
-                let mut punct_y = baseline_y - cell_core / 2.0;
-                // 列の 1 セル目だけは、半セル上げるとインクが画像の上端より
-                // 外へ出て切れてしまう(参照実装は余白付きのウィジェットへ
-                // 描くので気づかない)。はみ出したぶんだけ下げて、インクが
-                // セル内に収まるようにする(他のセルでは補正は働かない)。
-                let probe = id.with_scale_and_position(px_size, point(punct_x, punct_y));
-                if let Some(outlined) = font.outline_glyph(probe) {
-                    let top = outlined.px_bounds().min.y;
-                    if top < 0.0 {
-                        punct_y -= top;
-                    }
-                }
-                target.draw_glyph(&font, id, px_size, punct_x, punct_y);
-            } else {
-                // セル内で水平センタリング。
-                let advance = scaled.h_advance(id);
-                target.draw_glyph(
-                    &font,
-                    id,
-                    px_size,
-                    x + (col_width - advance) / 2.0,
-                    baseline_y,
-                );
-            }
+    // 四方へ広げたカバレッジ(中央に元のカバレッジを置く)。
+    let mut padded: Vec<f32> = Vec::new();
+    padded
+        .try_reserve_exact(out_len)
+        .map_err(|_| TextRasterError::TooLarge)?;
+    padded.resize(out_len, 0.0);
+    for y in 0..height as usize {
+        let src = y * width as usize;
+        let dst = (y + pad as usize) * out_width as usize + pad as usize;
+        for x in 0..width as usize {
+            padded[dst + x] = coverage[src + x].clamp(0.0, 1.0);
         }
-        right = x - line_spacing;
     }
 
-    Ok((width, height, buffer))
+    let distance = distance_field(&padded, out_width as usize, out_height as usize)?;
+    let mut buffer = allocate_buffer(out_width, out_height)?;
+    for (i, &glyph_cov) in padded.iter().enumerate().take(out_len) {
+        let d = distance.get(i).copied().unwrap_or(f32::MAX);
+        // 縁は「膨張領域 − 文字自身」。境界 1px は AA。
+        let outline_cov = ((radius + 0.5 - d).clamp(0.0, 1.0) - glyph_cov).max(0.0);
+        if outline_cov <= 0.0 && glyph_cov <= 0.0 {
+            continue;
+        }
+        // 追いレビュー①: `outline_cov` と `glyph_cov` は差し引き済み =
+        // **同じ画素の中で重ならない面積被覆**。これを source-over で 2 回
+        // 重ねると総カバレッジが不足し(例: 0.5 と 0.5 で α が 0.75 にしか
+        // ならない)、縁と塗りの境界に透過の溝ができる。premultiplied で
+        // 面積寄与を**加算**し、最後に straight-alpha へ戻す。
+        let outline_alpha = (outline[3] as f32 / 255.0) * outline_cov;
+        let fill_alpha = (fill[3] as f32 / 255.0) * glyph_cov;
+        let alpha = (outline_alpha + fill_alpha).clamp(0.0, 1.0);
+        let idx = i * 4;
+        let Some(dst) = buffer.get_mut(idx..idx + 4) else {
+            continue;
+        };
+        if alpha <= 0.0 {
+            continue;
+        }
+        for c in 0..3 {
+            let premultiplied = outline[c] as f32 * outline_alpha + fill[c] as f32 * fill_alpha;
+            dst[c] = (premultiplied / alpha).round().clamp(0.0, 255.0) as u8;
+        }
+        dst[3] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Ok((out_width, out_height, buffer))
 }
 
 #[cfg(test)]
@@ -607,6 +1003,274 @@ mod tests {
         );
     }
 
+    // -- v12 §52.2: 袋文字(縁取り)------------------------------------
+
+    /// `w*h` のカバレッジ配列(`inked` が真の画素だけ 1.0)。
+    fn coverage_map(w: u32, h: u32, inked: impl Fn(u32, u32) -> bool) -> Vec<f32> {
+        let mut out = vec![0f32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if inked(x, y) {
+                    out[(y * w + x) as usize] = 1.0;
+                }
+            }
+        }
+        out
+    }
+
+    fn pixel(w: u32, buffer: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]
+    }
+
+    #[test]
+    fn outline_expands_the_buffer_by_the_radius_on_every_side() {
+        let cov = coverage_map(4, 6, |_, _| true);
+        let (w, h, _) =
+            outline_text(&cov, 4, 6, 3.0, [0, 0, 0, 255], [255, 255, 255, 255]).expect("ok");
+        assert_eq!((w, h), (4 + 6, 6 + 6), "四方に ceil(radius) ぶん広がる");
+
+        // 小数の半径は切り上げ。
+        let (w, h, _) =
+            outline_text(&cov, 4, 6, 2.2, [0, 0, 0, 255], [255, 255, 255, 255]).expect("ok");
+        assert_eq!((w, h), (4 + 6, 6 + 6));
+    }
+
+    #[test]
+    fn outline_surrounds_the_glyph_on_all_four_sides() {
+        // 中央の 1 画素だけインク。半径 3。
+        let (iw, ih) = (5u32, 5u32);
+        let cov = coverage_map(iw, ih, |x, y| x == 2 && y == 2);
+        let radius = 3.0f32;
+        let (w, h, buffer) =
+            outline_text(&cov, iw, ih, radius, [0, 0, 0, 255], [255, 0, 0, 255]).expect("ok");
+        let pad = 3u32;
+        let (cx, cy) = (pad + 2, pad + 2);
+        assert_eq!((w, h), (iw + pad * 2, ih + pad * 2));
+
+        // 上下左右とも: radius−1 までは不透明、radius でちょうど境界(AA)、
+        // radius+1 より外は透明。
+        for (dx, dy) in [(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
+            let at = |k: i32| {
+                pixel(
+                    w,
+                    &buffer,
+                    (cx as i32 + dx * k) as u32,
+                    (cy as i32 + dy * k) as u32,
+                )
+            };
+            let inner = at(2);
+            assert_eq!(inner[3], 255, "({dx},{dy})×2 は縁の内側: {inner:?}");
+            assert_eq!([inner[0], inner[1], inner[2]], [255, 0, 0], "縁の色が違う");
+            let edge = at(3);
+            assert!(edge[3] > 0, "({dx},{dy})×3 は縁の境界(AA): {edge:?}");
+            let outside = at(4);
+            assert_eq!(outside[3], 0, "({dx},{dy})×4 は半径の外: {outside:?}");
+        }
+    }
+
+    #[test]
+    fn outline_does_not_show_through_a_semi_transparent_fill() {
+        // SPEC §52.2: 縁は文字の外側だけ(重なりを差し引く)。半透明の塗りでも
+        // 縁色が透けて濁らない。
+        let (iw, ih) = (5u32, 5u32);
+        let cov = coverage_map(iw, ih, |x, y| x == 2 && y == 2);
+        let fill = [0u8, 0, 255, 128];
+        let (w, _, buffer) = outline_text(&cov, iw, ih, 2.0, fill, [255, 0, 0, 255]).expect("ok");
+        let pad = 2u32;
+        let px = pixel(w, &buffer, pad + 2, pad + 2);
+        assert_eq!(px, fill, "塗りの画素は塗り色そのもの(縁が下に無い): {px:?}");
+    }
+
+    #[test]
+    fn outline_corners_are_round_not_square() {
+        // SPEC §52.2: 角は丸く(距離場に基づく膨張)。単一画素のインクに
+        // 半径 5 をかけると、対角方向の到達距離は radius を超えない
+        // (正方形膨張なら (5,5) = 7.07px 先まで塗られてしまう)。
+        let (iw, ih) = (3u32, 3u32);
+        let cov = coverage_map(iw, ih, |x, y| x == 1 && y == 1);
+        let radius = 5.0f32;
+        let (w, _, buffer) =
+            outline_text(&cov, iw, ih, radius, [0, 0, 0, 0], [255, 255, 255, 255]).expect("ok");
+        let pad = 5u32;
+        let (cx, cy) = (pad + 1, pad + 1);
+
+        // 軸方向は radius ぶん届く。
+        for (dx, dy) in [(5i32, 0i32), (-5, 0), (0, 5), (0, -5)] {
+            let px = pixel(w, &buffer, (cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+            assert!(px[3] > 0, "軸方向 ({dx},{dy}) に縁が無い");
+        }
+        // 対角方向で「真の距離 > radius + 0.5」の画素は塗られない。
+        for k in 1..=5i32 {
+            let distance = (k as f32) * std::f32::consts::SQRT_2;
+            let px = pixel(w, &buffer, (cx as i32 + k) as u32, (cy as i32 + k) as u32);
+            if distance > radius + 0.5 {
+                assert_eq!(
+                    px[3], 0,
+                    "対角 ({k},{k}) = {distance:.2}px は radius {radius} を超えるので塗らない"
+                );
+            } else {
+                assert!(px[3] > 0, "対角 ({k},{k}) = {distance:.2}px には縁が要る");
+            }
+        }
+    }
+
+    /// 実機の目視で見つけた回帰: `ab_glyph` はグリフの外接矩形内に 1e-7 級の
+    /// ごく小さいカバレッジを大量に返す。これを「文字」と見なすと、縁が
+    /// 字形ではなく**四角い箱**になる(RGBA へ焼くと α 0 に丸まるので
+    /// 従来の経路では見えなかった)。50% 等高線を種にすることで防ぐ。
+    #[test]
+    fn outline_ignores_negligible_coverage_noise_around_the_glyph_box() {
+        let (iw, ih) = (7u32, 7u32);
+        // 中央 1 画素だけが本物のインク。周囲は「ほぼ 0」のノイズ。
+        let mut cov = vec![5.96e-8f32; (iw * ih) as usize];
+        cov[(3 * iw + 3) as usize] = 1.0;
+        let radius = 2.0f32;
+        let (w, _, buffer) =
+            outline_text(&cov, iw, ih, radius, [0, 0, 0, 255], [255, 255, 255, 255]).expect("ok");
+        let pad = 2u32;
+        // 箱状に膨張していたら、外接矩形の角(元画像の左上 + 半径)にも
+        // 縁が乗ってしまう。字形沿いなら中心から遠い角は透明のまま。
+        let corner = pixel(w, &buffer, pad, pad);
+        assert_eq!(
+            corner[3], 0,
+            "外接矩形の角に縁が出ている(ノイズを種にしている): {corner:?}"
+        );
+        // 中心のすぐ隣には縁がある。
+        let near = pixel(w, &buffer, pad + 3 + 2, pad + 3);
+        assert!(near[3] > 0, "字形の周りには縁が要る: {near:?}");
+    }
+
+    /// 追いレビュー①: `outline_cov` と `glyph_cov` は**重ならない面積被覆**
+    /// なので、加算(premultiplied)で合成しなければ境界に透過の溝ができる。
+    /// 中央画素のカバレッジ 0.5・周囲は十分内側(膨張カバレッジ 1.0)という
+    /// 状況で、不透明な塗り+不透明な縁なら出力 α は 255 になる。
+    #[test]
+    fn outline_and_fill_areas_add_up_without_a_transparent_seam() {
+        // 3x3 の中央だけ 0.5(= 種になる)。半径 2 なら中央も膨張領域の内側。
+        let (iw, ih) = (3u32, 3u32);
+        let mut cov = vec![0f32; (iw * ih) as usize];
+        cov[(iw + 1) as usize] = 0.5;
+        let (w, _, buffer) =
+            outline_text(&cov, iw, ih, 2.0, [255, 0, 0, 255], [0, 0, 255, 255]).expect("ok");
+        let pad = 2u32;
+        let px = pixel(w, &buffer, pad + 1, pad + 1);
+        assert_eq!(
+            px[3], 255,
+            "縁 0.5 + 塗り 0.5 で完全不透明になる(溝ができない): {px:?}"
+        );
+        // RGB は面積比 1:1 の混色(premultiplied 加算)。
+        assert_eq!(px[0], 128, "赤(塗り)の寄与: {px:?}");
+        assert_eq!(px[2], 128, "青(縁)の寄与: {px:?}");
+
+        // 半透明の塗り(α=128)でも premultiplied の期待値どおりになる。
+        let (w, _, buffer) =
+            outline_text(&cov, iw, ih, 2.0, [255, 0, 0, 128], [0, 0, 255, 255]).expect("ok");
+        let px = pixel(w, &buffer, pad + 1, pad + 1);
+        // fill_alpha = 128/255*0.5 ≈ 0.2510、outline_alpha = 0.5
+        // α = 0.7510 → 192、R = 255*0.2510/0.7510 ≈ 85、B = 255*0.5/0.7510 ≈ 170
+        assert_eq!(px[3], 192, "α = (0.5 + 0.251) * 255: {px:?}");
+        assert!(
+            (px[0] as i32 - 85).abs() <= 1,
+            "R が premultiplied 期待値: {px:?}"
+        );
+        assert!(
+            (px[2] as i32 - 170).abs() <= 1,
+            "B が premultiplied 期待値: {px:?}"
+        );
+    }
+
+    /// 追いレビュー②: 全画素が 50% 未満(極小フォント・細い記号)でも、
+    /// 見えているカバレッジがあるなら縁は出る。
+    #[test]
+    fn outline_still_appears_when_every_pixel_is_below_the_ink_threshold() {
+        for cov in [vec![0.49f32], vec![0.1f32, 0.49, 0.1]] {
+            let width = cov.len() as u32;
+            let (w, _, buffer) =
+                outline_text(&cov, width, 1, 2.0, [0, 0, 0, 255], [255, 255, 255, 255])
+                    .expect("ok");
+            let has_outline = buffer
+                .chunks_exact(4)
+                .any(|p| p[3] > 0 && p[0] > 200 && p[1] > 200 && p[2] > 200);
+            assert!(
+                has_outline,
+                "カバレッジ {cov:?} で縁が消えている(種のフォールバックが効いていない)"
+            );
+            // 塗りも残っている(縁だけになっていない)。
+            let has_fill = buffer.chunks_exact(4).any(|p| p[3] > 0 && p[0] < 200);
+            assert!(has_fill, "塗りが消えている: {cov:?}");
+            let _ = w;
+        }
+    }
+
+    #[test]
+    fn outline_rejects_oversized_results_and_mismatched_input() {
+        // 膨張後の寸法で上限判定(8192 を超える)。
+        let cov = vec![0f32; 4];
+        assert_eq!(
+            outline_text(&cov, 2, 2, 9000.0, [0, 0, 0, 255], [0, 0, 0, 255]),
+            Err(TextRasterError::TooLarge)
+        );
+        // 寸法とバッファ長の不一致は拒否(パニックしない)。
+        assert_eq!(
+            outline_text(&cov, 100, 100, 1.0, [0, 0, 0, 255], [0, 0, 0, 255]),
+            Err(TextRasterError::TooLarge)
+        );
+        // 空入力は空を返す。
+        assert_eq!(
+            outline_text(&[], 0, 0, 3.0, [0, 0, 0, 255], [0, 0, 0, 255]),
+            Ok((0, 0, Vec::new()))
+        );
+    }
+
+    #[test]
+    fn text_coverage_matches_the_alpha_of_the_plain_rasterizer() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        // 不透明色で焼いた RGBA の α と、カバレッジ配列は(丸めの範囲で)一致する。
+        for vertical in [false, true] {
+            let (cw, ch, cov) =
+                text_coverage(&font, "あA", 32.0, 0.0, 0.0, vertical).expect("coverage");
+            let (rw, rh, rgba) = if vertical {
+                rasterize_text_vertical(&font, "あA", 32.0, [0, 0, 0, 255], 0.0, 0.0)
+            } else {
+                rasterize_text(&font, "あA", 32.0, [0, 0, 0, 255], 0.0, 0.0)
+            }
+            .expect("rgba");
+            assert_eq!((cw, ch), (rw, rh), "寸法が一致する(vertical={vertical})");
+            for (i, c) in cov.iter().enumerate() {
+                let alpha = rgba[i * 4 + 3] as f32 / 255.0;
+                assert!(
+                    (alpha - c).abs() <= 2.0 / 255.0,
+                    "画素 {i} のカバレッジが α と食い違う: {c} vs {alpha}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outlined_vertical_text_is_larger_than_the_plain_one_and_has_outline_color() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let radius = 4.0f32;
+        let (pw, ph, _) =
+            rasterize_text_vertical(&font, "あ\nい", 32.0, [0, 0, 0, 255], 0.0, 0.0).expect("ok");
+        let (cw, chh, cov) = text_coverage(&font, "あ\nい", 32.0, 0.0, 0.0, true).expect("ok");
+        let (ow, oh, buffer) =
+            outline_text(&cov, cw, chh, radius, [0, 0, 0, 255], [0, 255, 0, 255]).expect("ok");
+        assert_eq!((ow, oh), (pw + 8, ph + 8), "縦書きでも四方へ広がる");
+        assert!(
+            buffer
+                .chunks_exact(4)
+                .any(|p| p[3] > 0 && p[1] > 200 && p[0] < 50),
+            "縁色(緑)の画素がある"
+        );
+    }
+
     // -- v12 §52(追いレビュー): 旧実装との一致・回転の向き・句読点の量 ----
 
     /// v11(Phase 2 まで)の `rasterize_text` そのままの参照実装。
@@ -699,6 +1363,255 @@ mod tests {
         }
 
         (width, height, buffer)
+    }
+
+    /// v12 §52.2(追いレビュー③)の参照実装: **Phase 3 コミット時点
+    /// (e1114dc)の縦書きラスタライザ**をテスト専用に固定したもの。
+    /// `CoverageSink` リファクタで縦書きの出力が変わっていないことを
+    /// バイト単位で確かめるためだけに置く(描画のピクセル合成も当時のまま
+    /// ローカルに持ち、現在の描画ヘルパーには依存しない)。
+    struct LegacyTarget<'a> {
+        buffer: &'a mut [u8],
+        width: u32,
+        height: u32,
+        color: [u8; 4],
+    }
+
+    impl LegacyTarget<'_> {
+        fn blend(&mut self, x: i32, y: i32, coverage: f32) {
+            if x < 0 || y < 0 || x as u32 >= self.width || y as u32 >= self.height {
+                return;
+            }
+            let idx = (y as usize * self.width as usize + x as usize) * 4;
+            let Some(dst) = self.buffer.get(idx..idx + 4) else {
+                return;
+            };
+            let existing = [dst[0], dst[1], dst[2], dst[3]];
+            let alpha = (self.color[3] as f32 * coverage.clamp(0.0, 1.0))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let blended = raster::blend_over(
+                existing,
+                [self.color[0], self.color[1], self.color[2], alpha],
+            );
+            self.buffer[idx..idx + 4].copy_from_slice(&blended);
+        }
+
+        fn draw_glyph(
+            &mut self,
+            font: &FontRef<'_>,
+            id: GlyphId,
+            px_size: f32,
+            x: f32,
+            baseline_y: f32,
+        ) {
+            let glyph = id.with_scale_and_position(px_size, point(x, baseline_y));
+            let Some(outlined) = font.outline_glyph(glyph) else {
+                return;
+            };
+            let bounds = outlined.px_bounds();
+            let origin_x = bounds.min.x.floor() as i32;
+            let origin_y = bounds.min.y.floor() as i32;
+            outlined.draw(|gx, gy, coverage| {
+                self.blend(origin_x + gx as i32, origin_y + gy as i32, coverage);
+            });
+        }
+
+        fn draw_glyph_rotated(
+            &mut self,
+            font: &FontRef<'_>,
+            id: GlyphId,
+            px_size: f32,
+            cx: f32,
+            cy: f32,
+        ) -> Result<(), TextRasterError> {
+            let glyph = id.with_scale_and_position(px_size, point(0.0, 0.0));
+            let Some(outlined) = font.outline_glyph(glyph) else {
+                return Ok(());
+            };
+            let bounds = outlined.px_bounds();
+            let gw = to_dimension(bounds.width())? as usize;
+            let gh = to_dimension(bounds.height())? as usize;
+            if gw == 0 || gh == 0 {
+                return Ok(());
+            }
+            let len = gw.checked_mul(gh).ok_or(TextRasterError::TooLarge)?;
+            let mut coverage = vec![0f32; len];
+            outlined.draw(|gx, gy, c| {
+                let (gx, gy) = (gx as usize, gy as usize);
+                if gx >= gw || gy >= gh {
+                    return;
+                }
+                coverage[gy * gw + gx] = c;
+            });
+            let (rot_w, rot_h) = (gh, gw);
+            let origin_x = (cx - rot_w as f32 / 2.0).floor() as i32;
+            let origin_y = (cy - rot_h as f32 / 2.0).floor() as i32;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let c = coverage[gy * gw + gx];
+                    if c <= 0.0 {
+                        continue;
+                    }
+                    // 時計回り 90°(当時と同じ写像)。
+                    let nx = gh - 1 - gy;
+                    let ny = gx;
+                    self.blend(origin_x + nx as i32, origin_y + ny as i32, c);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn legacy_rasterize_text_vertical(
+        font_bytes: &[u8],
+        text: &str,
+        px_size: f32,
+        color: [u8; 4],
+        char_spacing: f32,
+        line_spacing: f32,
+    ) -> Result<RasterizedText, TextRasterError> {
+        if text.is_empty() {
+            return Ok((0, 0, Vec::new()));
+        }
+        let px_size = sanitize_px_size(px_size);
+        let char_spacing = sanitize_spacing(char_spacing);
+        let line_spacing = sanitize_spacing(line_spacing);
+        let font = FontRef::try_from_slice_and_index(font_bytes, FONT_COLLECTION_INDEX)
+            .map_err(|_| TextRasterError::Font)?;
+        let scaled = font.as_scaled(px_size);
+        let ascent = scaled.ascent();
+        let cell_core = (scaled.height() + scaled.line_gap()).max(1.0);
+        let cell_advance = cell_core + char_spacing;
+        let full_width = {
+            let advance = scaled.h_advance(font.glyph_id('\u{3000}'));
+            if advance > 0.0 {
+                advance
+            } else {
+                cell_core
+            }
+        };
+
+        let column_count = text.split('\n').count();
+        if column_count > MAX_TEXT_DIMENSION as usize {
+            return Err(TextRasterError::TooLarge);
+        }
+        let mut col_widths: Vec<f32> = Vec::new();
+        col_widths
+            .try_reserve_exact(column_count)
+            .map_err(|_| TextRasterError::TooLarge)?;
+        let mut max_cells = 1usize;
+        for column in text.split('\n') {
+            let mut width = 0.0f32;
+            let mut cells = 0usize;
+            for ch in column.chars() {
+                width = width.max(scaled.h_advance(font.glyph_id(ch)));
+                cells += 1;
+            }
+            col_widths.push(width.max(if cells == 0 { full_width } else { 1.0 }));
+            max_cells = max_cells.max(cells.max(1));
+        }
+
+        let total_width: f32 =
+            col_widths.iter().sum::<f32>() + line_spacing * (column_count.saturating_sub(1)) as f32;
+        let total_height = cell_advance * max_cells as f32 - char_spacing;
+
+        let width = to_dimension(total_width)?;
+        let height = to_dimension(total_height)?;
+        if width == 0 || height == 0 {
+            return Ok((0, 0, Vec::new()));
+        }
+        let mut buffer = allocate_buffer(width, height)?;
+        let mut target = LegacyTarget {
+            buffer: &mut buffer,
+            width,
+            height,
+            color,
+        };
+
+        let mut right = total_width;
+        for (col_index, column) in text.split('\n').enumerate() {
+            let col_width = col_widths.get(col_index).copied().unwrap_or(full_width);
+            let x = right - col_width;
+            for (cell, ch) in column.chars().enumerate() {
+                let id = font.glyph_id(ch);
+                let baseline_y = ascent + cell as f32 * cell_advance;
+                if VERTICAL_ROTATED_CHARS.contains(ch) {
+                    let cx = x + col_width / 2.0;
+                    let cy = baseline_y - ascent + cell_core / 2.0;
+                    target.draw_glyph_rotated(&font, id, px_size, cx, cy)?;
+                } else if VERTICAL_PUNCT_CHARS.contains(ch) {
+                    let punct_x = x + col_width / 2.0;
+                    let mut punct_y = baseline_y - cell_core / 2.0;
+                    let probe = id.with_scale_and_position(px_size, point(punct_x, punct_y));
+                    if let Some(outlined) = font.outline_glyph(probe) {
+                        let top = outlined.px_bounds().min.y;
+                        if top < 0.0 {
+                            punct_y -= top;
+                        }
+                    }
+                    target.draw_glyph(&font, id, px_size, punct_x, punct_y);
+                } else {
+                    let advance = scaled.h_advance(id);
+                    target.draw_glyph(
+                        &font,
+                        id,
+                        px_size,
+                        x + (col_width - advance) / 2.0,
+                        baseline_y,
+                    );
+                }
+            }
+            right = x - line_spacing;
+        }
+
+        Ok((width, height, buffer))
+    }
+
+    /// 追いレビュー③: 縦書きも `CoverageSink` リファクタ前(e1114dc)と
+    /// **寸法・RGBA バッファまでバイト一致**すること。回転文字・句読点・
+    /// 先頭句読点の補正・空列・複数列・半透明色・文字間/行間を網羅する。
+    #[test]
+    fn vertical_matches_the_phase3_implementation_byte_for_byte() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let cases: [(&str, f32, [u8; 4], f32, f32); 9] = [
+            // 通常文字のみ。
+            ("あいう", 32.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 回転文字(長音・括弧)。
+            ("ー「あ」", 40.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 句読点(2 セル目以降)。
+            ("あ。い、", 36.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 先頭句読点(上端はみ出し補正が働くケース)。
+            ("。あ", 48.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 空列を含む複数列。
+            ("あ\n\nい", 24.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 複数列 + 混在。
+            ("縦書き\nテスト。\nー〜", 28.0, [0, 0, 0, 255], 0.0, 0.0),
+            // 半透明色。
+            ("あい", 32.0, [10, 200, 30, 128], 0.0, 0.0),
+            // 文字間・行間あり。
+            ("あい\nうえ", 32.0, [0, 0, 0, 255], 7.0, 13.0),
+            // 全部入り。
+            ("ー。\nあ\n「い」、", 44.0, [200, 10, 10, 200], 3.0, 9.0),
+        ];
+        for (text, px, color, cs, ls) in cases {
+            let legacy =
+                legacy_rasterize_text_vertical(&font, text, px, color, cs, ls).expect("legacy ok");
+            let current =
+                rasterize_text_vertical(&font, text, px, color, cs, ls).expect("current ok");
+            assert_eq!(
+                (current.0, current.1),
+                (legacy.0, legacy.1),
+                "寸法が Phase 3 実装と一致しない: {text:?}"
+            );
+            assert!(
+                current.2 == legacy.2,
+                "RGBA バッファが Phase 3 実装と一致しない: {text:?}"
+            );
+        }
     }
 
     #[test]

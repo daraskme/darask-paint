@@ -72,6 +72,11 @@ pub const DEFAULT_TEXT_LINE_SPACING: u8 = 0;
 pub const MAX_TEXT_CHAR_SPACING: u8 = 50;
 pub const MAX_TEXT_LINE_SPACING: u8 = 100;
 
+/// v12 §52.2: 袋文字の縁の太さ(既定 3px、範囲 1〜20px)。
+pub const DEFAULT_TEXT_OUTLINE_WIDTH: u8 = 3;
+pub const MIN_TEXT_OUTLINE_WIDTH: u8 = 1;
+pub const MAX_TEXT_OUTLINE_WIDTH: u8 = 20;
+
 /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。
 /// `history.rs::DEFAULT_MAX_STEPS`(`History::new()` の既定値)と同じ 50 だが、
 /// あちらは `usize`・こちら側は設定ファイルの値域を表す `u32` で、モジュールも
@@ -117,6 +122,10 @@ pub struct Settings {
     pub text_char_spacing: u8,
     /// v12 §52: テキストの行間(0〜100px)。
     pub text_line_spacing: u8,
+    /// v12 §52.2: 袋文字(縁取り)。
+    pub text_outline: bool,
+    /// v12 §52.2: 縁の太さ(1〜20px)。
+    pub text_outline_width: u8,
     pub show_pixel_grid: bool,
     /// SPEC §34: 「履歴パネルの表示件数」(1–500、既定 50)。設定
     /// ダイアログの OK で更新され、開いている全タブへ即座に反映される
@@ -143,6 +152,8 @@ impl Default for Settings {
             text_vertical: false,
             text_char_spacing: DEFAULT_TEXT_CHAR_SPACING,
             text_line_spacing: DEFAULT_TEXT_LINE_SPACING,
+            text_outline: false,
+            text_outline_width: DEFAULT_TEXT_OUTLINE_WIDTH,
             fill_tolerance: 0,
             magic_wand_tolerance: 0,
             rect_mode: ShapeMode::Outline,
@@ -190,6 +201,10 @@ impl Settings {
     fn clamp_text_spacing(&mut self) {
         self.text_char_spacing = self.text_char_spacing.min(MAX_TEXT_CHAR_SPACING);
         self.text_line_spacing = self.text_line_spacing.min(MAX_TEXT_LINE_SPACING);
+        // v12 §52.2: 縁の太さは 1〜20px。
+        self.text_outline_width = self
+            .text_outline_width
+            .clamp(MIN_TEXT_OUTLINE_WIDTH, MAX_TEXT_OUTLINE_WIDTH);
     }
 }
 
@@ -401,6 +416,17 @@ pub fn parse(text: &str) -> Settings {
                     settings.text_line_spacing = v;
                 }
             }
+            // v12 §52.2: 袋文字(縁取り)。
+            "text.outline" => {
+                if let Some(v) = parse_bool(value) {
+                    settings.text_outline = v;
+                }
+            }
+            "text.outline_width" => {
+                if let Ok(v) = value.parse::<u8>() {
+                    settings.text_outline_width = v;
+                }
+            }
             "tool.fill_tolerance" => {
                 if let Ok(v) = value.parse::<u8>() {
                     settings.fill_tolerance = v;
@@ -518,6 +544,12 @@ pub fn serialize(settings: &Settings) -> String {
         &mut out,
         "text.line_spacing",
         &s.text_line_spacing.to_string(),
+    );
+    push_line(&mut out, "text.outline", bool_tag(s.text_outline));
+    push_line(
+        &mut out,
+        "text.outline_width",
+        &s.text_outline_width.to_string(),
     );
     push_line(
         &mut out,
@@ -664,6 +696,8 @@ mod tests {
             text_vertical: true,
             text_char_spacing: 7,
             text_line_spacing: 21,
+            text_outline: true,
+            text_outline_width: 9,
             fill_tolerance: 10,
             magic_wand_tolerance: 20,
             rect_mode: ShapeMode::Fill,

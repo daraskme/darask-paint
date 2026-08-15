@@ -854,6 +854,17 @@ SPEC.md「v12 拡張仕様」(§50〜§57)に対応。実装は 7 フェーズ(P
 - オプションバー: 縦書きチェック+文字間/行間スライダー(設定永続化 §26 追加)。プレビュー: `TextEditState` に「最終ラスタライズ結果+入力世代」をキャッシュし、テキスト/設定が変わったフレームだけ再生成して canvas_view がテクスチャ描画。
 - テスト: SPEC §52 記載の 6 項目+回転文字の ink 検証(「ー」の縦横比が入れ替わる)。
 
+## 22.3b P3.5 — 袋文字(SPEC §52.2)
+
+- `text.rs` のラスタライズ結果は**カバレッジ(α)を持つ RGBA バッファ**なので、縁取りは「カバレッジ配列に対する後処理」として横書き・縦書きの**共通後段**に置く(レイアウトの種類を知らない純関数にする)。
+  - `outline_text(coverage: &[f32], w, h, radius, fill: [u8;4], outline: [u8;4]) -> Result<(u32,u32,Vec<u8>), TextRasterError>`。
+  - 膨張は**2 パスのチャンファー距離変換**(`O(w*h)`。半径ぶんの円形カーネル総当たり `O(w*h*r²)` にしない)。距離 d に対し縁のカバレッジ = `clamp(radius + 0.5 − d, 0, 1)`(境界 1px で AA)。**塗りとの重なりは差し引く**(`outline_cov = max(0, outline_cov − glyph_cov)`)。
+  - 出力バッファは四方に `ceil(radius)` 拡張。合成順は 縁 → 塗り。
+- そのため、レイアウト側(`rasterize_text` / `rasterize_text_vertical`)は**カバレッジ配列を返す内部関数**へ分離し、色を焼き込む処理を最後段に集約する(現在は描画時に直接 RGBA へ blend している — この分離が今回の主なリファクタ)。
+- 配置位置の相殺: `app.rs` のテキスト確定・プレビューは、袋文字 ON のとき浮動片の配置座標を `−ceil(radius)` だけずらす(見た目の文字位置が ON/OFF で動かない)。
+- 8192 上限は膨張後の寸法で判定。中間の距離場・カバレッジ配列も `try_reserve_exact`。
+- 設定キー: `text.outline`(bool)/ `text.outline_width`(1〜20)。
+
 ## 22.4 P4 — 内蔵修復(SPEC §53)
 
 - 新規 `src/inpaint.rs`: `telea_inpaint(snapshot: InpaintInput) -> Result<InpaintOutput, InpaintError>` 純関数(bbox+マージンの画素・マスク・半径)。FMM: 境界画素を距離 0 で BinaryHeap へ、eikonal 更新で距離場を前進、既知近傍(半径内)の 方向×距離×レベル 重み平均で画素決定。RGBA は premultiplied で平均し straight へ戻す。

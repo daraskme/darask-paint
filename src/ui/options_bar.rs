@@ -52,6 +52,13 @@ pub struct OptionsBarCtx<'a> {
     pub text_char_spacing: &'a mut u8,
     /// v12 §52: 行間 0〜100px(横=行送り・縦=列間への加算)。
     pub text_line_spacing: &'a mut u8,
+    /// v12 §52.2: 袋文字(縁取り。既定 OFF)。
+    pub text_outline: &'a mut bool,
+    /// v12 §52.2: 縁の太さ 1〜20px(既定 3)。
+    pub text_outline_width: &'a mut u8,
+    /// v12 §52.2: 縁に使われる色(セカンダリ)。表示専用 — どの色が縁に
+    /// なるかを一目で分かるようにスウォッチで見せる。
+    pub secondary_color: egui::Color32,
     /// v4 §22: なげなわの自由/多角形モード(Shift+L で切替)。表示専用
     /// (直接編集はできない。ここに出すのは ARCHITECTURE.md §16.10-10:
     /// 「巡回系はオプションバーの整合を忘れない」ため)。
@@ -82,6 +89,9 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
         text_vertical,
         text_char_spacing,
         text_line_spacing,
+        text_outline,
+        text_outline_width,
+        secondary_color,
         lasso_mode,
         magic_wand_tolerance,
         transparent_selection,
@@ -111,6 +121,9 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
                     text_vertical,
                     text_char_spacing,
                     text_line_spacing,
+                    text_outline,
+                    text_outline_width,
+                    secondary_color,
                     lasso_mode,
                     magic_wand_tolerance,
                     transparent_selection,
@@ -137,6 +150,9 @@ fn show_tool_specific(
     text_vertical: &mut bool,
     text_char_spacing: &mut u8,
     text_line_spacing: &mut u8,
+    text_outline: &mut bool,
+    text_outline_width: &mut u8,
+    secondary_color: egui::Color32,
     lasso_mode: LassoMode,
     magic_wand_tolerance: &mut u8,
     transparent_selection: &mut bool,
@@ -218,6 +234,34 @@ fn show_tool_specific(
             {
                 *text_line_spacing = lines.clamp(0, settings::MAX_TEXT_LINE_SPACING as i32) as u8;
             }
+            // v12 §52.2: 袋文字(縁取り)。色は 塗り=プライマリ /
+            // 縁=セカンダリ(新しい色状態は作らない)。どの色が縁になるか
+            // 分かるよう、現在のセカンダリ色の小さなスウォッチを併記する。
+            ui.separator();
+            ui.checkbox(text_outline, "袋文字")
+                .on_hover_text("ON: 文字の外側にセカンダリ色の縁を付ける(塗りはプライマリ色)");
+            ui.add_enabled_ui(*text_outline, |ui| {
+                ui.label("縁の太さ:");
+                let mut width = *text_outline_width as i32;
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut width,
+                            settings::MIN_TEXT_OUTLINE_WIDTH as i32
+                                ..=settings::MAX_TEXT_OUTLINE_WIDTH as i32,
+                        )
+                        .suffix("px"),
+                    )
+                    .changed()
+                {
+                    *text_outline_width = width.clamp(
+                        settings::MIN_TEXT_OUTLINE_WIDTH as i32,
+                        settings::MAX_TEXT_OUTLINE_WIDTH as i32,
+                    ) as u8;
+                }
+                ui.label("縁: セカンダリ色");
+                outline_color_swatch(ui, secondary_color);
+            });
         }
         // v4 §22: なげなわのモードは Shift+L でだけ切り替える(ここは表示
         // 専用。ARCHITECTURE.md §16.10-10 の「オプションバーの整合」)。
@@ -279,6 +323,33 @@ fn transparent_selection_checkbox(ui: &mut egui::Ui, value: &mut bool) {
 fn lasso_mode_label(mode: LassoMode) -> String {
     let shortcut = keymap::label_for(Action::CycleLassoMode);
     format!("モード: {}({shortcut} で切替)", mode.label())
+}
+
+/// v12 §52.2: 「縁: セカンダリ色」の隣に出す小さな色見本(クリックしても
+/// 何も起きない表示専用 — 色の変更は右パネルのカラーパネルで行う)。
+fn outline_color_swatch(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        // 半透明のセカンダリ色でも分かるよう、市松の上に載せる。
+        let painter = ui.painter();
+        let half = rect.size() / 2.0;
+        for (ix, iy) in [(0, 0), (1, 1)] {
+            let min = rect.min + egui::vec2(ix as f32 * half.x, iy as f32 * half.y);
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, half),
+                0.0,
+                egui::Color32::from_gray(150),
+            );
+        }
+        painter.rect_filled(rect, 2.0, color);
+        painter.rect_stroke(
+            rect,
+            2.0,
+            ui.visuals().widgets.inactive.bg_stroke,
+            egui::StrokeKind::Middle,
+        );
+    }
+    response.on_hover_text("縁の色(セカンダリ色。右パネルまたは X キーで入れ替え)");
 }
 
 /// v12 §51.2: 選択ブラシのモード表示。Alt を押している間は「消去」になる

@@ -298,24 +298,52 @@ struct TextPreviewKey {
     color: Color32,
     char_spacing: u8,
     line_spacing: u8,
+    /// v12 §52.2: 袋文字の設定(色だけ変えても作り直されるよう縁色も含める)。
+    outline: bool,
+    outline_width: u8,
+    outline_color: Color32,
+}
+
+/// 照合用の借用ビュー(`String` を作らずに比較するため)。
+struct TextPreviewKeyRef<'a> {
+    text: &'a str,
+    px_size: f32,
+    color: Color32,
+    char_spacing: u8,
+    line_spacing: u8,
+    outline: bool,
+    outline_width: u8,
+    outline_color: Color32,
+}
+
+impl TextPreviewKeyRef<'_> {
+    /// 変更が確認できたときだけ所有版へ(追いレビュー③の趣旨を維持)。
+    fn to_owned_key(&self) -> TextPreviewKey {
+        TextPreviewKey {
+            text: self.text.to_owned(),
+            px_size: self.px_size,
+            color: self.color,
+            char_spacing: self.char_spacing,
+            line_spacing: self.line_spacing,
+            outline: self.outline,
+            outline_width: self.outline_width,
+            outline_color: self.outline_color,
+        }
+    }
 }
 
 impl TextPreviewKey {
     /// 追いレビュー③: 照合の前に `String` を作らない。借用した `buffer` と
     /// スカラ値を先に比べ、**変わっていたときだけ**所有 `String` を作る。
-    fn matches(
-        &self,
-        text: &str,
-        px_size: f32,
-        color: Color32,
-        char_spacing: u8,
-        line_spacing: u8,
-    ) -> bool {
-        self.px_size == px_size
-            && self.color == color
-            && self.char_spacing == char_spacing
-            && self.line_spacing == line_spacing
-            && self.text == text
+    fn matches(&self, other: &TextPreviewKeyRef<'_>) -> bool {
+        self.px_size == other.px_size
+            && self.color == other.color
+            && self.char_spacing == other.char_spacing
+            && self.line_spacing == other.line_spacing
+            && self.outline == other.outline
+            && self.outline_width == other.outline_width
+            && self.outline_color == other.outline_color
+            && self.text == other.text
     }
 }
 
@@ -473,6 +501,8 @@ struct StartupToolState {
     /// クランプしたもの)。
     text_char_spacing: u8,
     text_line_spacing: u8,
+    /// v12 §52.2: 袋文字の縁の太さ(1〜20 へクランプ)。
+    text_outline_width: u8,
 }
 
 impl StartupToolState {
@@ -527,6 +557,10 @@ impl StartupToolState {
             text_line_spacing: settings
                 .text_line_spacing
                 .min(settings::MAX_TEXT_LINE_SPACING),
+            text_outline_width: settings.text_outline_width.clamp(
+                settings::MIN_TEXT_OUTLINE_WIDTH,
+                settings::MAX_TEXT_OUTLINE_WIDTH,
+            ),
         }
     }
 }
@@ -794,6 +828,11 @@ pub struct DaraskApp {
     text_char_spacing: u8,
     /// v12 §52: 行間 0〜100px(横=行送り・縦=列間への加算)。
     text_line_spacing: u8,
+    /// v12 §52.2: 袋文字(縁取り。既定 OFF)。塗り=プライマリ色 /
+    /// 縁=セカンダリ色(新しい色状態は増やさない)。
+    text_outline: bool,
+    /// v12 §52.2: 縁の太さ 1〜20px(既定 3)。
+    text_outline_width: u8,
     /// v12 §52: 縦書きプレビューを実際にラスタライズした回数(テスト専用の
     /// 観測点。「入力が変わったフレームだけ再生成する」ことを固定する)。
     text_preview_rasterizations: u32,
@@ -1050,6 +1089,8 @@ impl DaraskApp {
             text_vertical: settings.text_vertical,
             text_char_spacing: startup.text_char_spacing,
             text_line_spacing: startup.text_line_spacing,
+            text_outline: settings.text_outline,
+            text_outline_width: startup.text_outline_width,
             text_preview_rasterizations: 0,
             text_edit: None,
             modal: None,
@@ -3287,6 +3328,30 @@ impl DaraskApp {
     ) -> Result<(u32, u32, Vec<u8>), text::TextRasterError> {
         let char_spacing = self.text_char_spacing as f32;
         let line_spacing = self.text_line_spacing as f32;
+        // v12 §52.2: 袋文字 ON のときは「カバレッジ → 縁取り」の経路を通る
+        // (横書き・縦書きのどちらでも同じ設定が効く)。塗り=プライマリ・
+        // 縁=セカンダリ。
+        if self.text_outline {
+            let (w, h, coverage) = text::text_coverage(
+                font_bytes,
+                text,
+                self.text_font_size,
+                char_spacing,
+                line_spacing,
+                self.text_vertical,
+            )?;
+            if w == 0 || h == 0 {
+                return Ok((0, 0, Vec::new()));
+            }
+            return text::outline_text(
+                &coverage,
+                w,
+                h,
+                self.text_outline_width as f32,
+                rgba,
+                color_to_straight_rgba(self.secondary),
+            );
+        }
         if self.text_vertical {
             text::rasterize_text_vertical(
                 font_bytes,
@@ -3308,6 +3373,41 @@ impl DaraskApp {
         }
     }
 
+    /// v12 §52.2: 袋文字で四方に広がったぶんの相殺量(px)。
+    ///
+    /// 縁取りは結果バッファを `ceil(太さ)` ぶん四方へ広げるので、配置座標を
+    /// 同じだけ左上へずらすと**クリック位置に対する文字の見た目の位置が
+    /// ON/OFF で変わらない**(SPEC §52.2)。
+    fn text_outline_offset(&self) -> egui::Vec2 {
+        if self.text_outline {
+            let pad = (self.text_outline_width as f32).ceil();
+            egui::vec2(pad, pad)
+        } else {
+            egui::Vec2::ZERO
+        }
+    }
+
+    /// v12 §52.2: クリック位置に対する**ラスタライズ結果の左上**(画像座標)。
+    ///
+    /// 浮動片としての確定・直接合成・縦書きプレビューの 3 経路がすべてこの
+    /// 1 箇所を通ることで、袋文字の ON/OFF による見た目の位置ずれが起き得ない
+    /// (経路ごとに相殺を書くと片方だけ忘れる)。
+    fn text_render_origin(&self, click: Pos2) -> Pos2 {
+        click - self.text_outline_offset()
+    }
+
+    /// 縦書きプレビューを描く画面矩形(画像座標 → 画面座標)。位置の相殺は
+    /// `text_render_origin` に集約してあるので、ここも自動的に追随する。
+    fn text_preview_rect(&self, click: Pos2, size: (u32, u32)) -> egui::Rect {
+        let view = &self.active_tab().view;
+        let scale = view.zoom / view.ppp();
+        let top_left = view.img_to_screen_pos(self.text_render_origin(click));
+        egui::Rect::from_min_size(
+            top_left,
+            egui::vec2(size.0 as f32 * scale, size.1 as f32 * scale),
+        )
+    }
+
     /// SPEC §19 の通常確定(Ctrl+Enter または ボックス外クリック): ラスタ
     /// ライズして**浮動片として配置**する(移動・ハンドル拡縮可、Enter 等で
     /// 通常確定=1 undo 単位、既存の `Floating` 機構をそのまま使う)。
@@ -3318,8 +3418,10 @@ impl DaraskApp {
         let Some((w, h, pixels)) = self.rasterize_pending_text(&state.buffer) else {
             return;
         };
-        // ARCHITECTURE.md §18.3 の対応表: 「テキスト」。
-        self.place_new_floating(state.pos, w, h, pixels, "テキスト");
+        // ARCHITECTURE.md §18.3 の対応表: 「テキスト」。v12 §52.2: 袋文字で
+        // 広がったぶんだけ左上へずらし、見た目の位置を OFF のときと揃える。
+        let pos = self.text_render_origin(state.pos);
+        self.place_new_floating(pos, w, h, pixels, "テキスト");
         self.push_recent_color(self.primary);
     }
 
@@ -3348,7 +3450,8 @@ impl DaraskApp {
         };
         // id は合成後すぐ破棄する使い捨ての `Floating` なので値は問わない
         // (`canvas_view` のテクスチャキャッシュには載らない)。
-        let floating = Floating::new_rect(pixels, w, h, state.pos, None, 0);
+        let floating =
+            Floating::new_rect(pixels, w, h, self.text_render_origin(state.pos), None, 0);
         let target = select::floating_target_rect(&floating);
         let tab = &mut self.tabs[self.active_tab];
         tab.history.begin_stroke(tab.doc.active);
@@ -3436,6 +3539,8 @@ impl DaraskApp {
         if self.text_vertical {
             self.refresh_text_preview(ui.ctx(), &buffer, &mut preview);
             if let Some(rendered) = preview.as_ref().and_then(|cache| cache.result.as_ref()) {
+                // v12 §52.2: 位置の相殺は `text_render_origin` に集約済み
+                // (確定結果とプレビューの位置が必ず一致する)。
                 self.draw_text_preview(painter, pos, rendered);
             }
         } else {
@@ -3478,24 +3583,24 @@ impl DaraskApp {
         };
         // 追いレビュー③: 借用のまま照合し、変わっていなければ何もしない
         // (成功・失敗どちらのキャッシュでも同じ判定)。
-        if preview.as_ref().is_some_and(|cache| {
-            cache.key.matches(
-                buffer,
-                self.text_font_size,
-                self.primary,
-                self.text_char_spacing,
-                self.text_line_spacing,
-            )
-        }) {
-            return;
-        }
-        let key = TextPreviewKey {
-            text: buffer.to_owned(),
+        let key_ref = TextPreviewKeyRef {
+            text: buffer,
             px_size: self.text_font_size,
             color: self.primary,
             char_spacing: self.text_char_spacing,
             line_spacing: self.text_line_spacing,
+            outline: self.text_outline,
+            outline_width: self.text_outline_width,
+            // v12 §52.2: 縁色(セカンダリ)を変えただけでも作り直す。
+            outline_color: self.secondary,
         };
+        if preview
+            .as_ref()
+            .is_some_and(|cache| cache.key.matches(&key_ref))
+        {
+            return;
+        }
+        let key = key_ref.to_owned_key();
         let rgba = color_to_straight_rgba(self.primary);
         self.text_preview_rasterizations = self.text_preview_rasterizations.saturating_add(1);
         let rasterized = self.rasterize_text_with_current_options(&font_bytes, buffer, rgba);
@@ -3535,17 +3640,14 @@ impl DaraskApp {
     }
 
     /// 縦書きプレビューをクリック位置(画像座標)へ、現在のズームで描く。
-    fn draw_text_preview(&self, painter: &egui::Painter, pos: Pos2, preview: &TextPreview) {
-        let view = &self.active_tab().view;
-        let scale = view.zoom / view.ppp();
-        let top_left = view.img_to_screen_pos(pos);
-        let size = egui::vec2(preview.size.0 as f32 * scale, preview.size.1 as f32 * scale);
-        if size.x <= 0.0 || size.y <= 0.0 {
+    fn draw_text_preview(&self, painter: &egui::Painter, click: Pos2, preview: &TextPreview) {
+        let rect = self.text_preview_rect(click, preview.size);
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return;
         }
         painter.image(
             preview.texture.id(),
-            egui::Rect::from_min_size(top_left, size),
+            rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
@@ -4259,6 +4361,9 @@ impl DaraskApp {
             text_vertical: self.text_vertical,
             text_char_spacing: self.text_char_spacing,
             text_line_spacing: self.text_line_spacing,
+            // v12 §52.2: 袋文字(SPEC §26)。
+            text_outline: self.text_outline,
+            text_outline_width: self.text_outline_width,
             window_width: self.window_size.x.round().max(1.0) as u32,
             window_height: self.window_size.y.round().max(1.0) as u32,
             window_maximized: self.window_maximized,
@@ -5981,6 +6086,10 @@ impl eframe::App for DaraskApp {
                     text_vertical: &mut self.text_vertical,
                     text_char_spacing: &mut self.text_char_spacing,
                     text_line_spacing: &mut self.text_line_spacing,
+                    text_outline: &mut self.text_outline,
+                    text_outline_width: &mut self.text_outline_width,
+                    // v12 §52.2: 「縁: セカンダリ色」のスウォッチ表示用。
+                    secondary_color: self.secondary,
                     lasso_mode: self.lasso_mode,
                     magic_wand_tolerance: &mut self.magic_wand_tolerance,
                     transparent_selection: &mut self.transparent_selection,
@@ -6311,6 +6420,8 @@ mod tests {
             text_vertical: false,
             text_char_spacing: settings::DEFAULT_TEXT_CHAR_SPACING,
             text_line_spacing: settings::DEFAULT_TEXT_LINE_SPACING,
+            text_outline: false,
+            text_outline_width: settings::DEFAULT_TEXT_OUTLINE_WIDTH,
             text_preview_rasterizations: 0,
             text_edit: None,
             modal: None,
@@ -11250,6 +11361,286 @@ mod tests {
         app.refresh_text_preview(&ctx, "", &mut preview);
         assert!(preview.is_none());
         assert_eq!(app.text_preview_rasterizations, 4);
+    }
+
+    // -- v12 §52.2: 袋文字(縁取り)----------------------------------------
+
+    /// SPEC §52.2: 袋文字 ON でも、クリック位置に対する**文字の見た目の位置**は
+    /// OFF のときと変わらない(広がったぶんだけ配置座標をずらして相殺する)。
+    #[test]
+    fn outlined_text_keeps_the_same_visual_position_as_the_plain_one() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let click = pos2(40.0, 30.0);
+        let mut app = new_for_test(Document::new(400, 400, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.tool = ToolKind::Text;
+
+        // 袋文字 OFF。
+        app.begin_text_edit(click);
+        if let Some(state) = app.text_edit.as_mut() {
+            state.buffer = "あ".to_owned();
+        }
+        app.commit_pending_text_edit();
+        let plain = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .map(|f| (f.pos, f.w, f.h))
+            .expect("浮動片ができる");
+        app.cancel_floating();
+
+        // 袋文字 ON(太さ 5px)。
+        app.text_outline = true;
+        app.text_outline_width = 5;
+        app.begin_text_edit(click);
+        if let Some(state) = app.text_edit.as_mut() {
+            state.buffer = "あ".to_owned();
+        }
+        app.commit_pending_text_edit();
+        let outlined = app
+            .active_tab()
+            .floating
+            .as_ref()
+            .map(|f| (f.pos, f.w, f.h))
+            .expect("浮動片ができる");
+
+        assert_eq!(outlined.1, plain.1 + 10, "幅が四方 5px ぶん広がる");
+        assert_eq!(outlined.2, plain.2 + 10, "高さも同様");
+        assert_eq!(
+            (outlined.0.x, outlined.0.y),
+            (plain.0.x - 5.0, plain.0.y - 5.0),
+            "配置座標が -ceil(radius) ずれ、文字の見た目の位置は変わらない"
+        );
+    }
+
+    /// 追いレビュー④: **直接合成**の経路(ツール切替などでの確定)でも、
+    /// 袋文字 ON/OFF で文字(塗り)のインク位置が変わらないこと。
+    /// バッファ寸法や `Floating::pos` ではなく、**文書に残ったインクの座標**で
+    /// 比較する(相殺の書き忘れを実際の見た目で検出するため)。
+    #[test]
+    fn outline_keeps_the_ink_position_when_compositing_directly() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        // 塗り=赤・縁=青。白背景の文書に直接合成し、「濃い赤」の画素だけを
+        // 見れば塗りの位置が分かる(縁は青なので混ざらない)。
+        let fill_ink_bounds = |outline: bool| -> (u32, u32, u32, u32) {
+            let mut app = new_for_test(Document::new(300, 300, Background::White));
+            app.text_font = Some(Arc::new(font.clone()));
+            app.tool = ToolKind::Text;
+            app.primary = Color32::from_rgb(255, 0, 0);
+            app.secondary = Color32::from_rgb(0, 0, 255);
+            app.text_font_size = 48.0;
+            app.text_outline = outline;
+            app.text_outline_width = 6;
+            app.begin_text_edit(pos2(80.0, 60.0));
+            if let Some(state) = app.text_edit.as_mut() {
+                state.buffer = "あ".to_owned();
+            }
+            app.commit_pending_text_edit_and_composite();
+            assert!(
+                app.active_tab().floating.is_none(),
+                "直接合成なので浮動片は残らない"
+            );
+            let doc = &app.active_tab().doc;
+            let mut bounds: Option<(u32, u32, u32, u32)> = None;
+            for y in 0..doc.height {
+                for x in 0..doc.width {
+                    let Some(px) = doc.get_pixel(x as i32, y as i32) else {
+                        continue;
+                    };
+                    // 塗り(赤)の中心部だけを拾う(AA 端や縁は除外)。
+                    if px[0] >= 200 && px[1] <= 60 && px[2] <= 60 {
+                        bounds = Some(match bounds {
+                            Some((x0, y0, x1, y1)) => {
+                                (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1))
+                            }
+                            None => (x, y, x + 1, y + 1),
+                        });
+                    }
+                }
+            }
+            bounds.expect("塗りのインクが文書に残っている")
+        };
+
+        let plain = fill_ink_bounds(false);
+        let outlined = fill_ink_bounds(true);
+        assert_eq!(
+            outlined, plain,
+            "袋文字 ON/OFF で塗りのインク座標が変わってはいけない(直接合成経路)"
+        );
+    }
+
+    /// 追いレビュー④: 縦書きプレビューへ渡す画像座標も `−ceil(太さ)` される。
+    #[test]
+    fn text_preview_rect_is_offset_by_the_outline_padding() {
+        let mut app = new_for_test(Document::new(200, 200, Background::White));
+        let click = pos2(40.0, 30.0);
+        let size = (24u32, 36u32);
+
+        // 袋文字 OFF: クリック位置そのまま。
+        let plain = app.text_preview_rect(click, size);
+        let expected_plain = app.active_tab().view.img_to_screen_pos(click);
+        assert_eq!(plain.min, expected_plain);
+        assert_eq!(app.text_render_origin(click), click);
+
+        // 袋文字 ON: 画像座標で −ceil(太さ) ずれる。
+        app.text_outline = true;
+        app.text_outline_width = 7;
+        let outlined = app.text_preview_rect(click, size);
+        let expected_origin = pos2(click.x - 7.0, click.y - 7.0);
+        assert_eq!(app.text_render_origin(click), expected_origin);
+        assert_eq!(
+            outlined.min,
+            app.active_tab().view.img_to_screen_pos(expected_origin),
+            "プレビューの左上も同じだけずれる"
+        );
+        // ズームが掛かっていても、画像座標での相殺は同じ(画面座標へは
+        // `img_to_screen_pos` が変換する)。
+        let scale = app.active_tab().view.zoom / app.active_tab().view.ppp();
+        assert!((outlined.width() - size.0 as f32 * scale).abs() < 0.01);
+        assert!((outlined.height() - size.1 as f32 * scale).abs() < 0.01);
+    }
+
+    /// SPEC §52.2: 縦書きでも同じ設定が効く(縁の色=セカンダリ)。
+    #[test]
+    fn outline_applies_to_vertical_text_too() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(400, 400, Background::White));
+        app.text_font = Some(Arc::new(font.clone()));
+        app.text_vertical = true;
+        app.primary = Color32::from_rgb(0, 0, 0);
+        app.secondary = Color32::from_rgb(0, 255, 0);
+
+        let plain = app
+            .rasterize_text_with_current_options(&font, "あ\nい", [0, 0, 0, 255])
+            .expect("plain ok");
+        app.text_outline = true;
+        app.text_outline_width = 4;
+        let outlined = app
+            .rasterize_text_with_current_options(&font, "あ\nい", [0, 0, 0, 255])
+            .expect("outlined ok");
+
+        assert_eq!(outlined.0, plain.0 + 8, "縦書きでも四方に広がる");
+        assert_eq!(outlined.1, plain.1 + 8);
+        assert!(
+            outlined
+                .2
+                .chunks_exact(4)
+                .any(|p| p[3] > 0 && p[1] > 200 && p[0] < 50),
+            "縁色(セカンダリ = 緑)の画素がある"
+        );
+    }
+
+    /// SPEC §52.2: 縁色(セカンダリ)を変えただけでもプレビューは作り直される。
+    #[test]
+    fn changing_the_outline_settings_regenerates_the_preview() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(200, 200, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.text_vertical = true;
+        app.text_outline = true;
+        app.text_outline_width = 3;
+        let ctx = egui::Context::default();
+        let mut preview = None;
+
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 1);
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(
+            app.text_preview_rasterizations, 1,
+            "同じ入力では作り直さない"
+        );
+
+        // 縁の太さ。
+        app.text_outline_width = 6;
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 2);
+
+        // 縁の色(セカンダリ)だけを変更。
+        app.secondary = Color32::from_rgb(1, 2, 3);
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 3, "縁色の変更も反映する");
+
+        // 袋文字 OFF。
+        app.text_outline = false;
+        app.refresh_text_preview(&ctx, "あ", &mut preview);
+        assert_eq!(app.text_preview_rasterizations, 4);
+    }
+
+    /// SPEC §52.2: 巨大な太さ + 巨大な文字は膨張後の寸法で `TooLarge`。
+    #[test]
+    fn oversized_outline_is_rejected_with_a_toast() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let mut app = new_for_test(Document::new(100, 100, Background::White));
+        app.text_font = Some(Arc::new(font));
+        app.text_font_size = 144.0;
+        app.text_outline = true;
+        app.text_outline_width = 20;
+        app.tool = ToolKind::Text;
+        app.begin_text_edit(pos2(0.0, 0.0));
+        if let Some(state) = app.text_edit.as_mut() {
+            // 8192px 近くまで伸ばし、膨張ぶんで上限を超えさせる。
+            state.buffer = std::iter::repeat_n('あ', 3000).collect();
+        }
+
+        app.commit_pending_text_edit();
+
+        assert!(app.active_tab().floating.is_none(), "確定しない");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.0.contains("大きすぎます")),
+            "トーストで知らせる"
+        );
+    }
+
+    /// v12 §52.2: 袋文字 OFF のときの確定結果は、袋文字を実装する前と
+    /// 同じ(素のラスタライザの出力そのまま)。
+    #[test]
+    fn outline_off_produces_the_plain_rasterizer_output_byte_for_byte() {
+        let Some(font) = crate::text::load_font_bytes() else {
+            eprintln!("skip: no system Japanese font found");
+            return;
+        };
+        let app = new_for_test(Document::new(200, 200, Background::White));
+        for vertical in [false, true] {
+            let mut app = new_for_test(Document::new(200, 200, Background::White));
+            app.text_font = Some(Arc::new(font.clone()));
+            app.text_vertical = vertical;
+            app.text_outline = false;
+            let via_app = app
+                .rasterize_text_with_current_options(&font, "あA\nいB", [10, 20, 30, 255])
+                .expect("ok");
+            let direct = if vertical {
+                crate::text::rasterize_text_vertical(
+                    &font,
+                    "あA\nいB",
+                    24.0,
+                    [10, 20, 30, 255],
+                    0.0,
+                    0.0,
+                )
+            } else {
+                crate::text::rasterize_text(&font, "あA\nいB", 24.0, [10, 20, 30, 255], 0.0, 0.0)
+            }
+            .expect("ok");
+            assert_eq!(via_app, direct, "vertical={vertical}");
+        }
+        let _ = app;
     }
 
     /// v12 §52(追いレビュー①): ラスタライズに**失敗した入力**も鍵ごと
