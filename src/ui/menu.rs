@@ -95,6 +95,8 @@ pub enum MenuAction {
     HueSaturation,
     Invert,
     Grayscale,
+    /// v12 §51.1: 「モザイク…」(色調補正グループ。ライブプレビュー付き)。
+    Mosaic,
     ZoomIn,
     ZoomOut,
     Zoom100,
@@ -158,6 +160,7 @@ impl MenuAction {
             Self::HueSaturation => "色相彩度",
             Self::Invert => "階調反転",
             Self::Grayscale => "グレー化",
+            Self::Mosaic => "モザイク",
             Self::ZoomIn => "拡大",
             Self::ZoomOut => "縮小",
             Self::Zoom100 => "100%",
@@ -621,6 +624,13 @@ fn build_slots(state: &MenuState) -> Vec<Slot> {
             icons::paint_grayscale_icon,
             MenuAction::Grayscale,
         ),
+        // v12 §51.1: モザイク(色調補正グループの末尾)。
+        mi(
+            true,
+            "モザイク…",
+            icons::paint_mosaic_icon,
+            MenuAction::Mosaic,
+        ),
         Slot::Sep,
         // -- レイヤー -------------------------------------------------------
         mi_shortcut(
@@ -1029,9 +1039,10 @@ mod tests {
         let sep_count = slots.iter().filter(|s| matches!(s, Slot::Sep)).count();
         // v11 §48 で「切り出し」が加わり 46(+区切り 5 = 51)。
         // v12 §58 で表示グループに「パネル配置をリセット」が加わり 47(+5 = 52)。
-        assert_eq!(item_count, 47);
+        // v12 §51.1 で色調補正グループに「モザイク…」が加わり 48(+5 = 53)。
+        assert_eq!(item_count, 48);
         assert_eq!(sep_count, 5);
-        assert_eq!(slots.len(), 52);
+        assert_eq!(slots.len(), 53);
     }
 
     /// 回帰テスト: SPEC.md §33(415-420行目)は「ファイル」グループの並び順を

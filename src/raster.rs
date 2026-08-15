@@ -940,6 +940,132 @@ pub fn adjust_hsl_pixel(px: [u8; 4], dh: i32, ds: i32, dl: i32) -> [u8; 4] {
 }
 
 // ---------------------------------------------------------------------------
+// v12 §51.1: モザイク(画像メニューの色調補正グループ)
+// ---------------------------------------------------------------------------
+
+/// SPEC §51.1: 「自動」チェック時のブロックサイズ
+/// (`長辺 >= 400 ? max(4, 長辺 / 100) : 4`。mosaic_editor の審査基準準拠)。
+///
+/// 長辺は**画像全体**の長辺(選択範囲ではない)。0×0 でもパニックしない。
+pub fn auto_block_size(width: u32, height: u32) -> u32 {
+    let long_side = width.max(height);
+    if long_side >= 400 {
+        (long_side / 100).max(4)
+    } else {
+        4
+    }
+}
+
+/// SPEC §51.1: 原点 (0,0) 固定格子のブロック平均によるモザイク。
+///
+/// - **格子は画像全体に固定**(`block` の倍数境界)。選択の形に依存しないので、
+///   隣接する領域に 2 回かけても格子がズレない。
+/// - **平均には選択マスク外の画素も含む**(ブロック全体の平均)。読み取りは
+///   `Surface::get_pixel`(クリップを見ない)なのでこれが自然に成立する。
+/// - **置換は選択内の画素のみ**: 書き込みは `Surface::set_pixel` を通すので、
+///   選択クリップ(`Surface::clip`)とアルファロック(§50.3: α 保存・
+///   `dst_a == 0` スキップ)が 1 箇所で効く。
+/// - 端の欠けブロックは**実在画素のみ**で平均する(画像外は数えない)。
+/// - 平均は **α 加重**: RGB は α を重みとする加重平均、α は単純平均。
+///   ブロックが全透明なら透明黒(RGB も 0)。
+///
+/// ブロックは互いに素で、各ブロックは「読み切ってから書く」ので、`surface` を
+/// その場で書き換えても他のブロックの平均は汚れない(プレビューの再計算は
+/// 呼び出し側が元画素を復元してから呼ぶこと — `app.rs` のモーダル参照)。
+///
+/// 実際に触れた(クランプ済みの)矩形を返す。`block` が 0 のときは 1 として
+/// 扱う(パニックしない)。
+pub fn apply_mosaic(surface: &mut Surface, region: IRect, block: u32) -> IRect {
+    let bounds = region.clamp_to(surface.width, surface.height);
+    if bounds.is_empty() {
+        return bounds;
+    }
+    let block = block.max(1) as i32;
+
+    // 格子(画像原点固定)のうち `bounds` に掛かるものだけを回す。
+    let first_bx = bounds.x0.div_euclid(block);
+    let last_bx = (bounds.x1 - 1).div_euclid(block);
+    let first_by = bounds.y0.div_euclid(block);
+    let last_by = (bounds.y1 - 1).div_euclid(block);
+
+    let width = surface.width as i32;
+    let height = surface.height as i32;
+
+    for by in first_by..=last_by {
+        // 平均を取る範囲は「ブロック ∩ 画像」(マスクも region も見ない)。
+        let avg_y0 = (by * block).max(0);
+        let avg_y1 = ((by + 1) * block).min(height);
+        for bx in first_bx..=last_bx {
+            let avg_x0 = (bx * block).max(0);
+            let avg_x1 = ((bx + 1) * block).min(width);
+            if avg_x0 >= avg_x1 || avg_y0 >= avg_y1 {
+                continue;
+            }
+
+            let mut sum_rgb = [0f32; 3];
+            let mut sum_a = 0f32;
+            let mut count = 0f32;
+            for y in avg_y0..avg_y1 {
+                for x in avg_x0..avg_x1 {
+                    let Some(px) = surface.get_pixel(x, y) else {
+                        continue;
+                    };
+                    let a = px[3] as f32 / 255.0;
+                    sum_rgb[0] += px[0] as f32 * a;
+                    sum_rgb[1] += px[1] as f32 * a;
+                    sum_rgb[2] += px[2] as f32 * a;
+                    sum_a += a;
+                    count += 1.0;
+                }
+            }
+            if count <= 0.0 {
+                continue;
+            }
+            let alpha = (sum_a / count * 255.0).round().clamp(0.0, 255.0) as u8;
+            let mut color = [0u8, 0, 0, alpha];
+            if sum_a > 0.0 {
+                for c in 0..3 {
+                    color[c] = (sum_rgb[c] / sum_a).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            // 書き込みは「ブロック ∩ 対象領域」だけ(選択クリップとアルファ
+            // ロックは `set_pixel` が見る)。
+            let write_x0 = avg_x0.max(bounds.x0);
+            let write_x1 = avg_x1.min(bounds.x1);
+            let write_y0 = avg_y0.max(bounds.y0);
+            let write_y1 = avg_y1.min(bounds.y1);
+            for y in write_y0..write_y1 {
+                for x in write_x0..write_x1 {
+                    surface.set_pixel(x, y, color);
+                }
+            }
+        }
+    }
+    bounds
+}
+
+/// SPEC §51.1: モザイクのプレビュー・確定で使う対象領域
+/// (`選択 bbox`(無ければ全面)を**格子境界へ外側拡張**した矩形)。
+///
+/// 格子平均が bbox 外の画素を含むため、スナップショット(CoW 退避)も
+/// この拡張後の矩形で取る(ARCHITECTURE.md §22.2)。`block` が 0 でも
+/// パニックしない。
+pub fn mosaic_grid_aligned_rect(rect: IRect, block: u32, width: u32, height: u32) -> IRect {
+    let rect = rect.clamp_to(width, height);
+    if rect.is_empty() {
+        return rect;
+    }
+    let block = block.max(1) as i32;
+    IRect {
+        x0: rect.x0.div_euclid(block) * block,
+        y0: rect.y0.div_euclid(block) * block,
+        x1: (rect.x1 - 1).div_euclid(block) * block + block,
+        y1: (rect.y1 - 1).div_euclid(block) * block + block,
+    }
+    .clamp_to(width, height)
+}
+
+// ---------------------------------------------------------------------------
 // v12 §50.1: レイヤーサムネイルの縮小(ui/layers_panel.rs が使う純関数)
 // ---------------------------------------------------------------------------
 
@@ -2418,6 +2544,338 @@ mod tests {
                     "base={base:?} src={src:?}"
                 );
             }
+        }
+    }
+
+    // -- v12 §51.1: モザイク ---------------------------------------------
+
+    /// テスト用: クリップ・ロック無しの `Surface` でモザイクをかける。
+    fn mosaic_on(pixels: &mut Vec<u8>, w: u32, h: u32, region: IRect, block: u32) {
+        let mut s = Surface {
+            width: w,
+            height: h,
+            pixels,
+            clip: None,
+            alpha_lock: false,
+        };
+        apply_mosaic(&mut s, region, block);
+    }
+
+    fn px(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn auto_block_size_matches_the_spec_thresholds() {
+        // SPEC §51.1: 長辺 >= 400 なら max(4, 長辺/100)、未満なら 4。
+        assert_eq!(auto_block_size(399, 100), 4);
+        assert_eq!(auto_block_size(400, 100), 4, "400/100 = 4");
+        assert_eq!(auto_block_size(499, 100), 4, "499/100 = 4(切り捨て)");
+        assert_eq!(auto_block_size(500, 100), 5);
+        // 長辺は幅・高さの大きい方。
+        assert_eq!(auto_block_size(100, 500), 5);
+        assert_eq!(auto_block_size(4000, 3000), 40);
+        // 0×0 でもパニックせず既定値。
+        assert_eq!(auto_block_size(0, 0), 4);
+    }
+
+    #[test]
+    fn mosaic_averages_each_origin_aligned_block() {
+        // 4×2 の画像を block=2 で。格子は (0,0) 起点なので
+        // [0..2)x[0..2) と [2..4)x[0..2) の 2 ブロックになる。
+        let mut buf = Vec::new();
+        for v in [0u8, 100, 200, 255, 0, 100, 200, 255] {
+            buf.extend_from_slice(&[v, v, v, 255]);
+        }
+        mosaic_on(
+            &mut buf,
+            4,
+            2,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 4,
+                y1: 2,
+            },
+            2,
+        );
+        // 左ブロック = (0+100+0+100)/4 = 50、右ブロック = (200+255+200+255)/4 = 227.5 → 228
+        for (x, expected) in [(0u32, 50u8), (1, 50), (2, 228), (3, 228)] {
+            assert_eq!(px(&buf, 4, x, 0)[0], expected, "x={x}");
+            assert_eq!(px(&buf, 4, x, 1)[0], expected, "x={x}");
+        }
+    }
+
+    #[test]
+    fn mosaic_grid_is_anchored_at_the_image_origin_not_the_region() {
+        // region が格子境界からずれていても、格子自体は (0,0) 固定。
+        // 6×1・block=3 → ブロックは [0..3) と [3..6)。region=[2..5) を
+        // 指定すると、x=2 は左ブロックの平均、x=3,4 は右ブロックの平均になる。
+        let mut buf = Vec::new();
+        for v in [0u8, 30, 60, 90, 120, 150] {
+            buf.extend_from_slice(&[v, v, v, 255]);
+        }
+        mosaic_on(
+            &mut buf,
+            6,
+            1,
+            IRect {
+                x0: 2,
+                y0: 0,
+                x1: 5,
+                y1: 1,
+            },
+            3,
+        );
+        assert_eq!(px(&buf, 6, 0, 0)[0], 0, "region 外は不変");
+        assert_eq!(px(&buf, 6, 1, 0)[0], 30, "region 外は不変");
+        assert_eq!(px(&buf, 6, 2, 0)[0], 30, "左ブロック平均 (0+30+60)/3");
+        assert_eq!(px(&buf, 6, 3, 0)[0], 120, "右ブロック平均 (90+120+150)/3");
+        assert_eq!(px(&buf, 6, 4, 0)[0], 120);
+        assert_eq!(px(&buf, 6, 5, 0)[0], 150, "region 外は不変");
+    }
+
+    #[test]
+    fn mosaic_edge_block_averages_only_real_pixels() {
+        // 5×1・block=3 → 端のブロックは 2 画素しかない。画像外は数えない。
+        let mut buf = Vec::new();
+        for v in [0u8, 0, 0, 100, 200] {
+            buf.extend_from_slice(&[v, v, v, 255]);
+        }
+        mosaic_on(
+            &mut buf,
+            5,
+            1,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 5,
+                y1: 1,
+            },
+            3,
+        );
+        assert_eq!(px(&buf, 5, 0, 0)[0], 0);
+        assert_eq!(px(&buf, 5, 3, 0)[0], 150, "(100+200)/2 = 150");
+        assert_eq!(px(&buf, 5, 4, 0)[0], 150);
+    }
+
+    #[test]
+    fn mosaic_average_is_alpha_weighted_and_fully_transparent_blocks_stay_clear() {
+        // 2×1・block=2: 不透明な赤 + 完全透明な緑。
+        let mut buf = vec![255, 0, 0, 255, 0, 255, 0, 0];
+        mosaic_on(
+            &mut buf,
+            2,
+            1,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 1,
+            },
+            2,
+        );
+        // RGB は α 重み(透明な緑は寄与しない)→ 赤のまま。α は単純平均 = 128。
+        assert_eq!(px(&buf, 2, 0, 0), [255, 0, 0, 128]);
+        assert_eq!(px(&buf, 2, 1, 0), [255, 0, 0, 128]);
+
+        // 全透明ブロックは透明黒(RGB も 0)。
+        let mut clear = vec![9, 9, 9, 0, 8, 8, 8, 0];
+        mosaic_on(
+            &mut clear,
+            2,
+            1,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 1,
+            },
+            2,
+        );
+        assert_eq!(px(&clear, 2, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(px(&clear, 2, 1, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn mosaic_replaces_only_selected_pixels_but_averages_across_the_whole_block() {
+        // 2×1・block=2、選択は左の 1 画素だけ。平均は右(非選択)も含む。
+        let mut buf = vec![0, 0, 0, 255, 200, 200, 200, 255];
+        let clip = crate::document::SelMask {
+            bbox: IRect {
+                x0: 0,
+                y0: 0,
+                x1: 1,
+                y1: 1,
+            },
+            mask: vec![255u8],
+        };
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: Some(&clip),
+            alpha_lock: false,
+        };
+        apply_mosaic(
+            &mut s,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 1,
+            },
+            2,
+        );
+        assert_eq!(px(&buf, 2, 0, 0)[0], 100, "選択内は平均 (0+200)/2 で置換");
+        assert_eq!(px(&buf, 2, 1, 0)[0], 200, "選択外は 1 バイトも変えない");
+    }
+
+    #[test]
+    fn mosaic_respects_the_alpha_lock() {
+        // v12 §50.3: α 保存・dst_a==0 は完全スキップ。
+        let mut buf = vec![0, 0, 0, 0, 200, 200, 200, 128];
+        let mut s = Surface {
+            width: 2,
+            height: 1,
+            pixels: &mut buf,
+            clip: None,
+            alpha_lock: true,
+        };
+        apply_mosaic(
+            &mut s,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 1,
+            },
+            2,
+        );
+        assert_eq!(px(&buf, 2, 0, 0), [0, 0, 0, 0], "透明画素は不変");
+        let after = px(&buf, 2, 1, 0);
+        assert_eq!(after[3], 128, "α は元値のまま");
+        assert_eq!(after[0], 200, "透明画素は平均へ寄与しない(α 加重)");
+    }
+
+    #[test]
+    fn mosaic_degenerate_inputs_do_not_panic() {
+        let mut buf = make_buffer(2, 2, [1, 2, 3, 255]);
+        // block=0 は 1 として扱う(= 実質そのまま)。
+        mosaic_on(
+            &mut buf,
+            2,
+            2,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 2,
+            },
+            0,
+        );
+        assert_eq!(px(&buf, 2, 0, 0), [1, 2, 3, 255]);
+        // 空の region・範囲外の region。
+        let empty = IRect {
+            x0: 5,
+            y0: 5,
+            x1: 5,
+            y1: 5,
+        };
+        mosaic_on(&mut buf, 2, 2, empty, 4);
+        mosaic_on(
+            &mut buf,
+            2,
+            2,
+            IRect {
+                x0: -10,
+                y0: -10,
+                x1: 100,
+                y1: 100,
+            },
+            4,
+        );
+    }
+
+    #[test]
+    fn mosaic_grid_aligned_rect_expands_outward_to_block_boundaries() {
+        let doc = (100u32, 100u32);
+        let r = IRect {
+            x0: 10,
+            y0: 21,
+            x1: 33,
+            y1: 44,
+        };
+        let expanded = mosaic_grid_aligned_rect(r, 10, doc.0, doc.1);
+        assert_eq!((expanded.x0, expanded.y0), (10, 20));
+        assert_eq!((expanded.x1, expanded.y1), (40, 50));
+        // 画像境界でクランプされる。
+        let edge = mosaic_grid_aligned_rect(
+            IRect {
+                x0: 95,
+                y0: 95,
+                x1: 100,
+                y1: 100,
+            },
+            32,
+            doc.0,
+            doc.1,
+        );
+        assert_eq!((edge.x0, edge.y0, edge.x1, edge.y1), (64, 64, 100, 100));
+        // 空矩形・block=0 でもパニックしない。
+        assert!(mosaic_grid_aligned_rect(
+            IRect {
+                x0: 5,
+                y0: 5,
+                x1: 5,
+                y1: 5
+            },
+            8,
+            doc.0,
+            doc.1
+        )
+        .is_empty());
+        let z = mosaic_grid_aligned_rect(
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 4,
+                y1: 4,
+            },
+            0,
+            doc.0,
+            doc.1,
+        );
+        assert_eq!((z.x0, z.y0, z.x1, z.y1), (0, 0, 4, 4));
+    }
+
+    /// 4000×4000 の全面モザイクが現実的な時間で終わること(1 回の適用が
+    /// 画素数に比例することの回帰検知)。ブロックが最小(2px = 最悪ケース:
+    /// ブロック数が最大になる)でも同様であることも確認する。
+    #[test]
+    fn mosaic_full_4000x4000_terminates_quickly() {
+        for block in [40u32, 2] {
+            let mut buf = make_buffer(4000, 4000, [10, 20, 30, 255]);
+            let start = std::time::Instant::now();
+            mosaic_on(
+                &mut buf,
+                4000,
+                4000,
+                IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 4000,
+                    y1: 4000,
+                },
+                block,
+            );
+            let elapsed = start.elapsed();
+            assert_eq!(px(&buf, 4000, 0, 0), [10, 20, 30, 255]);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "4000x4000・block={block} のモザイクに {elapsed:?} もかかっている"
+            );
         }
     }
 

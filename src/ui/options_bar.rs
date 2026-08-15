@@ -54,6 +54,9 @@ pub struct OptionsBarCtx<'a> {
     /// v10 §46: 「透明な選択」(選択系・移動ツールのチェックボックス。
     /// ON のとき浮動化・貼り付けでセカンダリ色の画素を選択から除外する)。
     pub transparent_selection: &'a mut bool,
+    /// v12 §51.2: 選択ブラシの現在のモード(`true` = 消去 = Alt 押下中)。
+    /// 表示専用(モードは Alt の押下で決まり、UI から直接は切り替えない)。
+    pub select_brush_erase: bool,
 }
 
 pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
@@ -72,6 +75,7 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
         lasso_mode,
         magic_wand_tolerance,
         transparent_selection,
+        select_brush_erase,
     } = state;
 
     egui::Panel::top("options_bar")
@@ -97,6 +101,7 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
                     lasso_mode,
                     magic_wand_tolerance,
                     transparent_selection,
+                    select_brush_erase,
                 );
             });
         });
@@ -119,6 +124,7 @@ fn show_tool_specific(
     lasso_mode: LassoMode,
     magic_wand_tolerance: &mut u8,
     transparent_selection: &mut bool,
+    select_brush_erase: bool,
 ) {
     match tool {
         ToolKind::Pen | ToolKind::Eraser => {
@@ -197,6 +203,13 @@ fn show_tool_specific(
             ui.separator();
             transparent_selection_checkbox(ui, transparent_selection);
         }
+        // v12 §51.2: 選択ブラシは「追加 / 消去」モード表示(Alt で消去)。
+        // サイズは共通のブラシサイズスライダー(上段)をそのまま使う。
+        ToolKind::SelectBrush => {
+            ui.label(select_brush_mode_label(select_brush_erase));
+            ui.separator();
+            transparent_selection_checkbox(ui, transparent_selection);
+        }
         // v10 §46: 選択系・移動ツールは「透明な選択」トグルを持つ。
         ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move => {
             transparent_selection_checkbox(ui, transparent_selection);
@@ -223,6 +236,13 @@ fn transparent_selection_checkbox(ui: &mut egui::Ui, value: &mut bool) {
 fn lasso_mode_label(mode: LassoMode) -> String {
     let shortcut = keymap::label_for(Action::CycleLassoMode);
     format!("モード: {}({shortcut} で切替)", mode.label())
+}
+
+/// v12 §51.2: 選択ブラシのモード表示。Alt を押している間は「消去」になる
+/// (`lasso_mode_label` と同じく、純関数にしてテストできるようにする)。
+fn select_brush_mode_label(erase: bool) -> String {
+    let mode = if erase { "消去" } else { "追加" };
+    format!("モード: {mode}(Alt ドラッグで消去)")
 }
 
 /// SPEC §17: ブラシ(旧ペン)・消しゴム共通のストロークエンジンオプション
@@ -302,5 +322,18 @@ mod tests {
 
         let label = lasso_mode_label(LassoMode::Polygon);
         assert_eq!(label, "モード: 多角形(Shift+L で切替)");
+    }
+
+    /// v12 §51.2: 選択ブラシのモード表示は Alt の押下に追随する。
+    #[test]
+    fn select_brush_mode_label_reflects_the_alt_modifier() {
+        assert_eq!(
+            select_brush_mode_label(false),
+            "モード: 追加(Alt ドラッグで消去)"
+        );
+        assert_eq!(
+            select_brush_mode_label(true),
+            "モード: 消去(Alt ドラッグで消去)"
+        );
     }
 }

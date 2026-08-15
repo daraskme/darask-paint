@@ -191,6 +191,8 @@ fn tool_kind_tag(kind: ToolKind) -> &'static str {
         ToolKind::EllipseSelect => "ellipse_select",
         ToolKind::Lasso => "lasso",
         ToolKind::MagicWand => "magic_wand",
+        // v12 §51.2: 選択ブラシ。
+        ToolKind::SelectBrush => "select_brush",
         ToolKind::Gradient => "gradient",
     }
 }
@@ -212,6 +214,7 @@ fn tool_kind_from_tag(tag: &str) -> Option<ToolKind> {
         "ellipse_select" => ToolKind::EllipseSelect,
         "lasso" => ToolKind::Lasso,
         "magic_wand" => ToolKind::MagicWand,
+        "select_brush" => ToolKind::SelectBrush,
         "gradient" => ToolKind::Gradient,
         _ => return None,
     })

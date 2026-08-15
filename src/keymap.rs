@@ -126,6 +126,12 @@ pub enum Action {
     SelectLastFillTool,
     /// v4 §23 §27: `Shift+G`: 塗りつぶし↔グラデーションを巡回。
     CycleFillTool,
+    /// v12 §51.2: `W`: 選択ブラシ系(直前に使った `ToolKind::MagicWand`/
+    /// `SelectBrush` のいずれか)。`SelectLastMarqueeTool`(M)と同じ
+    /// 「巡回はするが選択という役割を共有する」設計(`app.rs::last_wand_tool`)。
+    SelectLastWandTool,
+    /// v12 §51.2: `Shift+W`: 自動選択↔選択ブラシを巡回。
+    CycleWandTool,
 
     // -- 色(SPEC §20「色」) -----------------------------------------------
     SwapColors,
@@ -251,11 +257,11 @@ pub const KEYMAP: &[Entry] = &[
     // v4 §22 §27: なげなわ(`L`)・自動選択(`W`)。
     e(Modifiers::NONE, Key::L, Action::SelectTool(ToolKind::Lasso)),
     e(Modifiers::SHIFT, Key::L, Action::CycleLassoMode),
-    e(
-        Modifiers::NONE,
-        Key::W,
-        Action::SelectTool(ToolKind::MagicWand),
-    ),
+    // v12 §51.2: `W` は「直前に使った選択ブラシ系ツール」(自動選択/
+    // 選択ブラシ)。`Shift+W` で 2 つを巡回する(M/Shift+M・G/Shift+G と
+    // 同じ設計)。
+    e(Modifiers::NONE, Key::W, Action::SelectLastWandTool),
+    e(Modifiers::SHIFT, Key::W, Action::CycleWandTool),
     // -- 色 ------------------------------------------------------------
     e(Modifiers::NONE, Key::X, Action::SwapColors),
     e(Modifiers::NONE, Key::D, Action::DefaultColors),
@@ -362,8 +368,8 @@ pub const KEYMAP: &[Entry] = &[
         Key::Tab,
         Action::PrevTab,
     ),
-    // v5 §30/§32(V5-M3): `Ctrl+W`(単一キーの `W` は既に自動選択
-    // `ToolKind::MagicWand` に束縛済みだが、`Ctrl` 修飾があるので衝突しない、
+    // v5 §30/§32(V5-M3): `Ctrl+W`(単一キーの `W` は既に選択ブラシ系
+    // (`SelectLastWandTool`)に束縛済みだが、`Ctrl` 修飾があるので衝突しない、
     // `no_two_entries_share_the_same_binding` 参照)。
     e(Modifiers::CTRL, Key::W, Action::CloseTab),
     // -- 表示 ------------------------------------------------------------
@@ -463,6 +469,8 @@ pub fn tool_shortcut_label(kind: ToolKind) -> String {
         ToolKind::Select | ToolKind::EllipseSelect => Action::SelectLastMarqueeTool,
         // v4 §23: 塗りつぶし/グラデーションも「G」1 本にまとまる。
         ToolKind::Fill | ToolKind::Gradient => Action::SelectLastFillTool,
+        // v12 §51.2: 自動選択/選択ブラシも「W」1 本にまとまる。
+        ToolKind::MagicWand | ToolKind::SelectBrush => Action::SelectLastWandTool,
         other => Action::SelectTool(other),
     };
     label_for(action)
@@ -543,12 +551,22 @@ mod tests {
         );
     }
 
+    /// v12 §51.2: `W` は「直前に使った選択ブラシ系」(自動選択/選択ブラシ)
+    /// になり、`Shift+W` で 2 つを巡回する(M/Shift+M と同じ設計)。
     #[test]
-    fn w_selects_magic_wand() {
+    fn w_and_shift_w_select_and_cycle_wand_tools() {
         assert_eq!(
-            binding_for(Action::SelectTool(ToolKind::MagicWand)),
+            binding_for(Action::SelectLastWandTool),
             Some(Binding::new(Modifiers::NONE, Key::W))
         );
+        assert_eq!(
+            binding_for(Action::CycleWandTool),
+            Some(Binding::new(Modifiers::SHIFT, Key::W))
+        );
+        // 直接 `SelectTool(MagicWand)` に束縛された行はもう無い
+        // (`SelectLastWandTool` 経由になった)。
+        assert_eq!(binding_for(Action::SelectTool(ToolKind::MagicWand)), None);
+        assert_eq!(binding_for(Action::SelectTool(ToolKind::SelectBrush)), None);
     }
 
     // -- v4 §23/§27: 塗りつぶし↔グラデーション(G/Shift+G) ---------------------
@@ -605,6 +623,8 @@ mod tests {
         assert_eq!(tool_shortcut_label(ToolKind::EllipseSelect), "M");
         assert_eq!(tool_shortcut_label(ToolKind::Lasso), "L");
         assert_eq!(tool_shortcut_label(ToolKind::MagicWand), "W");
+        // v12 §51.2: 選択ブラシも同じ「W」にまとまる。
+        assert_eq!(tool_shortcut_label(ToolKind::SelectBrush), "W");
     }
 
     #[test]
@@ -879,7 +899,10 @@ mod tests {
         // Ctrl+Shift+C(CopyMerged) = 63 + 2 = 65。
         // v9 §41 でさらに 8 件追加: 矢印×4(Nudge ±1) + Shift+矢印×4
         // (Nudge ±10) = 65 + 8 = 73。
-        assert_eq!(KEYMAP.len(), 73);
+        // v12 §51.2 でさらに 1 件追加: Shift+W(CycleWandTool。W 自体は
+        // `SelectTool(MagicWand)` → `SelectLastWandTool` に置き換わっただけで
+        // バインド数は変わらない) = 73 + 1 = 74。
+        assert_eq!(KEYMAP.len(), 74);
     }
 
     // -- v9 §41: 矢印キーのナッジ ---------------------------------------------

@@ -339,6 +339,28 @@ impl CanvasView {
         }
     }
 
+    /// v12 §51.2: 選択ブラシの進行中プレビュー(これから追加/消去される
+    /// 範囲)。確定前はマスクを作らない(境界線の再計算は Up の 1 回だけ)
+    /// ため、スタンプ中心に半透明の円を並べて「塗った跡」をそのまま見せる。
+    /// 追加は選択色、消去は赤系で塗り分ける。
+    pub fn draw_select_brush_preview(
+        &self,
+        painter: &egui::Painter,
+        points_img: &[Pos2],
+        radius_img: f32,
+        erase: bool,
+    ) {
+        let radius = (radius_img * self.zoom).max(1.0);
+        let fill = if erase {
+            Color32::from_rgba_unmultiplied(220, 80, 80, 90)
+        } else {
+            Color32::from_rgba_unmultiplied(90, 160, 230, 90)
+        };
+        for p in points_img {
+            painter.circle_filled(self.img_to_screen_pos(*p), radius, fill);
+        }
+    }
+
     /// 選択矩形・浮動片の外周に 8 個のスケールハンドルを描く(SPEC §16、
     /// ARCHITECTURE.md §14.6)。ヒットテストは `select::handle_rects`/
     /// `select::hit_handle`(`app.rs` が使う)と同じ幾何を共有する。

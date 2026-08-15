@@ -192,6 +192,51 @@ pub fn show_brightness_contrast(
     (outcome, changed)
 }
 
+/// SPEC §51.1: 「モザイク…」(自動チェック + ブロックサイズ 2〜100、
+/// ライブプレビュー)。戻り値は `show_brightness_contrast` と同じ規則
+/// (`changed` はこのフレームで値が変わったか = 再適用が必要か)。
+///
+/// `auto_block` は「自動」チェック時に使われる実際のブロックサイズ
+/// (SPEC §51.1: 自動時は実値をダイアログに表示する)。
+pub fn show_mosaic(
+    ctx: &egui::Context,
+    auto: &mut bool,
+    block: &mut u32,
+    auto_block: u32,
+) -> (DialogOutcome, bool) {
+    let mut outcome = DialogOutcome::Pending;
+    let mut changed = false;
+    let modal = egui::Modal::new(egui::Id::new("darask_dialog_mosaic")).show(ctx, |ui| {
+        ui.heading("モザイク");
+        if ui.checkbox(auto, "自動").changed() {
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("ブロックサイズ:");
+            let mut value = *block as i32;
+            // 自動のときはスライダーを無効化し、実際に使われる値を出す。
+            let response =
+                ui.add_enabled(!*auto, egui::Slider::new(&mut value, 2..=100).suffix("px"));
+            if response.changed() {
+                let clamped = value.clamp(2, 100) as u32;
+                if *block != clamped {
+                    *block = clamped;
+                    changed = true;
+                }
+            }
+        });
+        if *auto {
+            ui.weak(format!("自動: {auto_block}px(画像の長辺から決定)"));
+        }
+        ui.separator();
+        confirm_buttons(ui, &mut outcome);
+    });
+    if modal.should_close() && outcome == DialogOutcome::Pending {
+        outcome = DialogOutcome::Cancelled;
+    }
+    (outcome, changed)
+}
+
 /// SPEC §24: 「色相・彩度・明度…」(色相 -180〜+180、彩度/明度 -100〜+100、
 /// ライブプレビュー)。戻り値は `show_brightness_contrast` と同じ規則。
 pub fn show_hue_saturation(
@@ -340,4 +385,42 @@ fn confirm_buttons(ui: &mut egui::Ui, outcome: &mut DialogOutcome) {
             *outcome = DialogOutcome::Cancelled;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v12 §51.1: モザイクダイアログが 1 フレーム描画でき、無操作なら
+    /// `Pending`(= まだ閉じない)を返すこと。「自動」ONのときはスライダーが
+    /// 無効化され、実際に使われるブロックサイズが表示される
+    /// (`ui/history_panel.rs` のテストと同じく、egui の `Context` を
+    /// バックエンド無しで駆動する)。
+    #[test]
+    fn mosaic_dialog_renders_and_stays_pending_without_input() {
+        let ctx = egui::Context::default();
+        let mut auto = true;
+        let mut block = 8u32;
+        let mut outcome = DialogOutcome::Confirmed;
+        let mut changed = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let (o, c) = show_mosaic(&ctx, &mut auto, &mut block, 12);
+            outcome = o;
+            changed = c;
+        });
+        assert_eq!(outcome, DialogOutcome::Pending);
+        assert!(!changed, "無操作のフレームでは再適用を要求しない");
+        assert!(auto, "値は書き換えられない");
+        assert_eq!(block, 8);
+
+        // 自動 OFF(手動)でも描画できる。
+        let mut auto = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let (o, c) = show_mosaic(&ctx, &mut auto, &mut block, 12);
+            outcome = o;
+            changed = c;
+        });
+        assert_eq!(outcome, DialogOutcome::Pending);
+        assert!(!changed);
+    }
 }

@@ -90,6 +90,13 @@ pub enum ToolKind {
     /// レイヤー基準)。`Tool` の実体は持たない(ドラッグ状態を持たない
     /// 1 ショットの操作、`tools/fill.rs` の塗りつぶしと同じ扱い)。
     MagicWand,
+    /// v12 §51.2: 選択ブラシ(Shift+W で自動選択と巡回)。ドラッグで選択
+    /// マスクへ追加、Alt ドラッグで消去する「クイックマスク簡易版」。
+    /// 他の選択ツールと同じく `Tool` の実体は持たず、`Selection` を直接
+    /// 操作する(app.rs::handle_select_brush_event)。既存の選択ツールが
+    /// 常に「置き換え」(SPEC §22)なのに対し、このツールだけが蓄積編集を
+    /// 行う(SPEC §51.2)。
+    SelectBrush,
     /// v4 §23: グラデーション(G。Shift+G で `Fill` と巡回)。ドラッグで
     /// 始点→終点、離して確定(1 undo 単位)。`tools/gradient.rs::GradientTool`
     /// が実体を持つ(直線・矩形・楕円と同じ「独立したツール状態」の設計)。

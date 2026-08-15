@@ -115,6 +115,13 @@ const TOOLS: &[ToolButton] = &[
         label: "自動選択",
         kind: ToolKind::MagicWand,
     },
+    // v12 §51.2: 選択ブラシ(Shift+W で自動選択と巡回する仲間なので、
+    // 自動選択のすぐ後に置く)。
+    ToolButton {
+        name: "選択ブラシ",
+        label: "選択筆",
+        kind: ToolKind::SelectBrush,
+    },
     // v3 §18: 移動・ズーム。選択(浮動化の仲間)の直後、手のひら(表示操作の
     // 仲間)の後にそれぞれ加える。
     ToolButton {
@@ -252,7 +259,8 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_short_visible_label_and_no_kind_is_duplicated() {
-        assert_eq!(TOOLS.len(), 16);
+        // v12 §51.2 で選択ブラシが加わり 17 個。
+        assert_eq!(TOOLS.len(), 17);
         for (index, tool) in TOOLS.iter().enumerate() {
             assert!(!tool.label.is_empty());
             assert!(tool.label.chars().count() <= 5, "{}", tool.label);

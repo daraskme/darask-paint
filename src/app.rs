@@ -307,6 +307,17 @@ enum PendingAction {
     CloseAllTabs(VecDeque<usize>),
 }
 
+/// v12 §51.2: 選択ブラシの進行中ストローク(`DaraskApp::select_brush_stroke`)。
+struct SelectBrushStroke {
+    /// スタンプ中心(画像座標)。`Up` でこの列から一括してマスクを作る。
+    points: Vec<Pos2>,
+    /// Down 時のブラシ半径(ドラッグ中に `[`/`]` でサイズを変えても、この
+    /// ストロークの太さは変わらない — 1 ストローク = 1 太さ)。
+    radius: f32,
+    /// Down 時に Alt が押されていたか(true = 消去モード、SPEC §51.2)。
+    erase: bool,
+}
+
 /// SPEC §7 のダイアログ群(ARCHITECTURE.md §10: `modal: Option<ModalState>`)。
 enum ModalState {
     New {
@@ -350,6 +361,18 @@ enum ModalState {
         lightness: i32,
         rect: crate::document::IRect,
     },
+    /// v12 §51.1: 「モザイク…」(自動チェック + ブロックサイズ 2〜100、
+    /// ライブプレビュー)。`rect` はモーダルを開いた時点の対象領域を
+    /// **格子境界へ外側拡張**した矩形(格子平均が選択 bbox 外の画素を含む
+    /// ため。ARCHITECTURE.md §22.2)。開いた時点で `History::begin_stroke`/
+    /// `ensure_tiles_saved(rect)` 済み。
+    Mosaic {
+        /// SPEC §51.1: 「自動」チェック(既定 ON)。
+        auto: bool,
+        /// 手動時のブロックサイズ(2〜100)。
+        block: u32,
+        rect: crate::document::IRect,
+    },
     /// v4 §26: 「ヘルプ > バージョン情報」。表示するだけで状態を持たない。
     About,
     /// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログ(Ctrl+K)。
@@ -391,6 +414,8 @@ struct StartupToolState {
     last_shape_tool: ToolKind,
     last_marquee_tool: ToolKind,
     last_fill_tool: ToolKind,
+    /// v12 §51.2: `W` が戻る先(自動選択/選択ブラシ)。
+    last_wand_tool: ToolKind,
 }
 
 impl StartupToolState {
@@ -415,6 +440,11 @@ impl StartupToolState {
             ToolKind::Fill | ToolKind::Gradient => settings.last_tool,
             _ => ToolKind::Fill,
         };
+        // v12 §51.2: `W` の巡回グループ(自動選択/選択ブラシ)。
+        let last_wand_tool = match settings.last_tool {
+            ToolKind::MagicWand | ToolKind::SelectBrush => settings.last_tool,
+            _ => ToolKind::MagicWand,
+        };
         Self {
             brush_size: settings.brush_size.clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE),
             brush_hardness: settings
@@ -433,6 +463,7 @@ impl StartupToolState {
             last_shape_tool,
             last_marquee_tool,
             last_fill_tool,
+            last_wand_tool,
         }
     }
 }
@@ -590,6 +621,9 @@ pub struct DaraskApp {
     /// いずれか(`last_shape_tool`/`last_marquee_tool` と全く同じ役割、
     /// `set_tool`/`cycle_fill_tool` 参照)。
     last_fill_tool: ToolKind,
+    /// v12 §51.2: 「W / Shift+W で巡回」。`ToolKind::MagicWand`/`SelectBrush`
+    /// のいずれか(上記 3 つと全く同じ役割、`set_tool`/`cycle_wand_tool`)。
+    last_wand_tool: ToolKind,
     pen: PenTool,
     eraser: EraserTool,
     line: ShapeTool,
@@ -605,6 +639,14 @@ pub struct DaraskApp {
     /// v4 §22: 自由なげなわのドラッグ中に記録した軌跡(画像座標)。ドラッグ
     /// 外・多角形モード中は空。
     lasso_freehand_points: Vec<Pos2>,
+    /// v12 §51.2: 選択ブラシの進行中ストローク(スタンプ中心の列と、Down 時に
+    /// 確定したモード・半径)。`lasso_freehand_points` と同じく「ドラッグ中は
+    /// 軽いベクタ状態だけを持ち、Up でマスクを作る」設計(マスク境界の再計算
+    /// は Up の 1 回だけ — ドラッグ中に毎回やると大きな文書で破綻する)。
+    select_brush_stroke: Option<SelectBrushStroke>,
+    /// v12 §51.1: モザイクモーダルで「開いた直後の 1 フレーム目」にプレビュー
+    /// を 1 回かけたか(値が変わっていなくても初回だけは適用する)。
+    mosaic_preview_applied: bool,
     /// v4 §22: 多角形なげなわの進行中状態(`None` = 未着手)。
     lasso_polygon: Option<LassoPolygonState>,
     /// v4 §22: 自動選択の許容値(SPEC §22: 「クリック画素から許容値
@@ -887,6 +929,7 @@ impl DaraskApp {
             tool: settings.last_tool,
             last_shape_tool: startup.last_shape_tool,
             last_marquee_tool: startup.last_marquee_tool,
+            last_wand_tool: startup.last_wand_tool,
             last_fill_tool: startup.last_fill_tool,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
@@ -900,6 +943,8 @@ impl DaraskApp {
             // なげなわのモードは SPEC §26 の永続化対象に含まれていない。
             lasso_mode: LassoMode::Freehand,
             lasso_freehand_points: Vec::new(),
+            select_brush_stroke: None,
+            mosaic_preview_applied: false,
             lasso_polygon: None,
             magic_wand_tolerance: settings.magic_wand_tolerance,
             // v10 §46: 既定 OFF・非永続(なげなわのモードと同じ扱い)。
@@ -1041,9 +1086,16 @@ impl DaraskApp {
         // だけを行うため、`MagicWand` に対しても安全にそのまま使える)。
         // なげなわの Esc=進行中多角形の中止(選択には影響しない)は SPEC
         // §22 の明示的な例外規定なのでこのままでよい。
+        // v12 §51.2(追いレビュー②): 選択ブラシで作った選択も「既存のマスク
+        // 選択と同一」に扱う(SPEC §51.2)ので、Esc(解除)/Enter(確定)の
+        // 対象ツールに含める。含めないとこのツールのときだけ Esc が効かない。
         let is_select_move_or_wand = matches!(
             self.tool,
-            ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move | ToolKind::MagicWand
+            ToolKind::Select
+                | ToolKind::EllipseSelect
+                | ToolKind::Move
+                | ToolKind::MagicWand
+                | ToolKind::SelectBrush
         );
 
         for action in keymap::poll(ctx) {
@@ -1061,6 +1113,10 @@ impl DaraskApp {
                 Action::SelectLastFillTool => self.set_tool(self.last_fill_tool),
                 // SPEC §23 §27: 「Shift+G で巡回」。
                 Action::CycleFillTool => self.cycle_fill_tool(),
+                // v12 §51.2: 「W: 選択ブラシ系(直前に使ったツール)」
+                // 「Shift+W で巡回」。
+                Action::SelectLastWandTool => self.set_tool(self.last_wand_tool),
+                Action::CycleWandTool => self.cycle_wand_tool(),
                 // SPEC §22 §27: 「Shift+L で自由↔多角形の切替」。進行中の
                 // 多角形なげなわは(モードが変わる以上)継続不能なので破棄する
                 // (Esc 中止と同じ挙動、選択自体には影響しない)。
@@ -1224,6 +1280,10 @@ impl DaraskApp {
         if matches!(new_tool, ToolKind::Fill | ToolKind::Gradient) {
             self.last_fill_tool = new_tool;
         }
+        // v12 §51.2: 「W / Shift+W で巡回」。同上。
+        if matches!(new_tool, ToolKind::MagicWand | ToolKind::SelectBrush) {
+            self.last_wand_tool = new_tool;
+        }
         if new_tool == self.tool {
             return;
         }
@@ -1269,6 +1329,21 @@ impl DaraskApp {
     }
 
     /// SPEC §23: 「Shift+G で巡回」。`cycle_marquee_tool` と同じ形の 2 値巡回。
+    /// v12 §51.2: 「Shift+W で 自動選択↔選択ブラシ を巡回」。
+    /// `cycle_marquee_tool`/`cycle_fill_tool` と同じ設計。
+    fn cycle_wand_tool(&mut self) {
+        let current = if matches!(self.tool, ToolKind::MagicWand | ToolKind::SelectBrush) {
+            self.tool
+        } else {
+            self.last_wand_tool
+        };
+        let next = match current {
+            ToolKind::SelectBrush => ToolKind::MagicWand,
+            _ => ToolKind::SelectBrush,
+        };
+        self.set_tool(next);
+    }
+
     fn cycle_fill_tool(&mut self) {
         let current = if matches!(self.tool, ToolKind::Fill | ToolKind::Gradient) {
             self.tool
@@ -1298,6 +1373,12 @@ impl DaraskApp {
         // 到達するより前に `doc.modified` が正しく立ち、未保存ガード
         // (`request_action`)がリネームだけの変更も正しく検知できる。
         self.commit_pending_layer_rename();
+        // v12 §51.2: 選択ブラシのドラッグ中に別の操作(ツール切替・タブ
+        // 切替・レイヤー操作・undo など)が割り込んだら、他のドラッグ系
+        // ツールと同じく**直近の位置で確定**する(捨てない)。
+        if let Some(stroke) = self.select_brush_stroke.take() {
+            self.finish_select_brush_stroke(stroke);
+        }
         // v3 §18: 移動(V)も選択と同じ `Selection`/`Floating` 浮動化パスを
         // 使う(`move_down`/`handle_move_event` 参照)ため、ここでも浮動片の
         // 確定を経由させる必要がある。そうしないと、移動ツールでドラッグ中に
@@ -1407,6 +1488,10 @@ impl DaraskApp {
             // 早期リターン済み(ここには来ない)。
             | ToolKind::EllipseSelect
             | ToolKind::MagicWand
+            // v12 §51.2: 選択ブラシは `Selection` だけを触るツールで、
+            // 進行中ストローク(History)を持たない(`commit_open_gesture`
+            // の分岐で `select_brush_stroke` を確定する)。
+            | ToolKind::SelectBrush
             | ToolKind::Lasso => {}
         }
         for color in used_colors {
@@ -1435,6 +1520,9 @@ impl DaraskApp {
             // クロスヘア(ドラッグ中の意匠は `draw_selection_overlay` 側の
             // プレビュー描画に任せる)。
             ToolKind::Lasso | ToolKind::MagicWand => egui::CursorIcon::Crosshair,
+            // v12 §51.2: 選択ブラシはブラシ系と同じ「塗る」操作なので、
+            // ブラシ/消しゴムと同じカーソル規則(サイズに応じた十字/精密)。
+            ToolKind::SelectBrush => self.brush_cursor_icon(),
             // SPEC §18: 「カーソルは虫眼鏡」。ARCHITECTURE.md §15.2 は
             // ZoomIn/ZoomOut を明示する。
             ToolKind::Zoom => {
@@ -1536,7 +1624,10 @@ impl DaraskApp {
                 // v3 §18: ズームツールは Alt+クリックに「縮小」という独自の
                 // 意味を持つ(SPEC §18)ため、他ツール共通の一時スポイト
                 // 横取りから除外する。
-                if mods.alt && self.tool != ToolKind::Zoom {
+                // v12 §51.2: 選択ブラシは Alt に「消去」という独自の意味を
+                // 持つ(SPEC §51.2)ため、ズームと同じく一時スポイトの
+                // 横取りから除外する。
+                if mods.alt && self.tool != ToolKind::Zoom && self.tool != ToolKind::SelectBrush {
                     self.sample_eyedropper_color(img, button);
                     self.alt_eyedropper_active = true;
                     continue;
@@ -1581,6 +1672,13 @@ impl DaraskApp {
             // `self.lasso_mode` を見て `handle_lasso_event` 内で分岐する。
             if self.tool == ToolKind::Lasso {
                 self.handle_lasso_event(ev);
+                continue;
+            }
+
+            // v12 §51.2: 選択ブラシ。ドラッグで選択マスクを蓄積編集する
+            // (他の選択ツールと違い「置き換え」ではない)。
+            if self.tool == ToolKind::SelectBrush {
+                self.handle_select_brush_event(ev);
                 continue;
             }
 
@@ -1670,6 +1768,7 @@ impl DaraskApp {
                 | ToolKind::Zoom
                 | ToolKind::Text
                 | ToolKind::EllipseSelect
+                | ToolKind::SelectBrush
                 | ToolKind::Lasso
                 | ToolKind::MagicWand => {}
             }
@@ -1873,6 +1972,73 @@ impl DaraskApp {
     /// SPEC §22: 「クリック画素から許容値の連結領域をマスク選択(flood fill
     /// と同じ判定、アクティブレイヤー基準)」。塗りつぶしと同じ 1 ショットの
     /// クリック操作。新規選択は既存の選択/浮動片を置き換える。
+    /// SPEC §51.2: 選択ブラシ。ドラッグ中はスタンプ中心を貯めるだけ
+    /// (プレビューは `draw_selection_overlay` が円で描く)、`Up` で
+    /// `select::apply_select_brush_stroke` により選択マスクへ合成する。
+    ///
+    /// 他の選択ツール(常に「置き換え」— SPEC §22)と違い、**既存の選択を
+    /// 保ったまま**追加・消去する。浮動片があるときは先に確定する
+    /// (`flush_floating_keep_selection`: 選択自体は残す — 残さないと
+    /// 「浮動片がある状態でブラシを足す」たびに選択が消えてしまう)。
+    fn handle_select_brush_event(&mut self, ev: ToolEvent) {
+        match ev {
+            ToolEvent::Down { img, mods, .. } => {
+                self.flush_floating_keep_selection();
+                self.select_drag = None;
+                self.select_brush_stroke = Some(SelectBrushStroke {
+                    points: vec![img],
+                    radius: crate::tools::brush_radius(self.brush_size),
+                    erase: mods.alt,
+                });
+            }
+            ToolEvent::Drag { img, .. } => {
+                if let Some(stroke) = self.select_brush_stroke.as_mut() {
+                    // スタンプ間隔はブラシと同じ方針(半径の 1/2、最低 1px)で
+                    // 間引く(点が増えすぎるとプレビューの円が増え続けるため)。
+                    let step = (stroke.radius / 2.0).max(1.0);
+                    let far_enough = stroke
+                        .points
+                        .last()
+                        .is_none_or(|last| last.distance(img) >= step);
+                    if far_enough {
+                        stroke.points.push(img);
+                    }
+                }
+            }
+            ToolEvent::Up { img, .. } => {
+                let Some(mut stroke) = self.select_brush_stroke.take() else {
+                    return;
+                };
+                // 離した位置まで必ず届かせる(ブラシの `Up` と同じ規則)。
+                if stroke.points.last().is_none_or(|last| *last != img) {
+                    stroke.points.push(img);
+                }
+                self.finish_select_brush_stroke(stroke);
+            }
+            ToolEvent::Hover { .. } => {}
+        }
+    }
+
+    /// 選択ブラシ 1 ストロークの確定(SPEC §51.2: 「Up ごとに選択境界を
+    /// 再計算・マスクが空になったら選択解除」)。
+    fn finish_select_brush_stroke(&mut self, stroke: SelectBrushStroke) {
+        let (width, height) = {
+            let doc = &self.active_tab().doc;
+            (doc.width, doc.height)
+        };
+        let current = self.active_tab().selection.as_ref().map(|s| &s.mask);
+        let next = select::apply_select_brush_stroke(
+            current,
+            &stroke.points,
+            stroke.radius,
+            stroke.erase,
+            width,
+            height,
+        );
+        // 境界線の再計算はここ(1 ストロークにつき 1 回)だけ。
+        self.active_tab_mut().selection = next.map(Selection::new);
+    }
+
     fn magic_wand_select(&mut self, img: Pos2) {
         self.commit_selection();
         let x = img.x.floor() as i32;
@@ -2871,6 +3037,21 @@ impl DaraskApp {
             self.active_tab().view.draw_selection_outline(painter, rect);
             return;
         }
+        // v12 §51.2: 選択ブラシの進行中スタンプ(確定前のプレビュー)。
+        // 既存の選択枠は下で通常どおり描かれるので、ここでは「これから
+        // 追加/消去される範囲」だけを塗る。
+        if let Some(stroke) = self.select_brush_stroke.as_ref() {
+            // 追いレビュー①: 確定時と**同じ補間点**を描く(記録点だけを描くと
+            // 高速ドラッグでプレビューが数珠状になり、実際に選択される範囲と
+            // 食い違う)。
+            let stamps = select::select_brush_stamp_points(&stroke.points, stroke.radius);
+            self.active_tab().view.draw_select_brush_preview(
+                painter,
+                &stamps,
+                stroke.radius,
+                stroke.erase,
+            );
+        }
         // v4 §22: なげなわの進行中の軌跡/頂点列(確定前のプレビュー)。
         if self.tool == ToolKind::Lasso {
             if !self.lasso_freehand_points.is_empty() {
@@ -3410,6 +3591,8 @@ impl DaraskApp {
         // 古いドキュメント座標のまま残ってしまわないようにする。
         self.lasso_freehand_points.clear();
         self.lasso_polygon = None;
+        // v12 §51.2: 選択ブラシの進行中ストロークも旧座標のまま持ち越さない。
+        self.select_brush_stroke = None;
     }
 
     /// SPEC §30: 「開こうとしたファイルが既に開いているタブがあれば(パスを
@@ -4421,10 +4604,20 @@ impl DaraskApp {
     /// または選択の浮動片)を種類を問わず確定してから対象領域を退避する
     /// (選択自体は残す、SPEC §21)。
     fn begin_tone_adjust_stroke(&mut self) -> crate::document::IRect {
+        let target = self.tone_adjust_target_rect();
+        self.begin_tone_adjust_stroke_for(target)
+    }
+
+    /// `begin_tone_adjust_stroke` の領域指定版(v12 §51.1 のモザイクは
+    /// 「選択 bbox を格子境界へ外側拡張した矩形」を退避する必要があるため、
+    /// 対象領域だけを差し替えられるようにした)。commit-first と
+    /// `begin_stroke`/`ensure_tiles_saved` の手順は共通。
+    fn begin_tone_adjust_stroke_for(
+        &mut self,
+        rect: crate::document::IRect,
+    ) -> crate::document::IRect {
         self.commit_open_gesture();
-        let bounds = self
-            .tone_adjust_target_rect()
-            .clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        let bounds = rect.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
         let tab = &mut self.tabs[self.active_tab];
         tab.history.begin_stroke(tab.doc.active);
         if !bounds.is_empty() {
@@ -4441,6 +4634,67 @@ impl DaraskApp {
             contrast: 0,
             rect,
         });
+    }
+
+    /// SPEC §51.1: 「モザイク…」モーダルを開く。
+    ///
+    /// 対象は §24 と同じ規則(アクティブレイヤー / 選択があれば選択内 /
+    /// なければ全面)だが、**スナップショット領域は選択 bbox を格子境界へ
+    /// 外側拡張した矩形**にする(格子平均が bbox 外の画素を含むため。
+    /// ARCHITECTURE.md §22.2)。ブロックサイズはモーダル内で変えられるので、
+    /// 拡張には既定(自動)の値を使う — 書き込みは常に選択マスク内
+    /// (= bbox の内側)に限られるので、後からブロックを大きくしても
+    /// 「退避していない画素を書き換える」ことは起きない。
+    fn open_mosaic_modal(&mut self) {
+        let (width, height) = {
+            let doc = &self.active_tab().doc;
+            (doc.width, doc.height)
+        };
+        let auto_block = raster::auto_block_size(width, height);
+        let target = self.tone_adjust_target_rect();
+        let rect = raster::mosaic_grid_aligned_rect(target, auto_block, width, height);
+        let rect = self.begin_tone_adjust_stroke_for(rect);
+        self.modal = Some(ModalState::Mosaic {
+            auto: true,
+            block: auto_block,
+            rect,
+        });
+    }
+
+    /// SPEC §51.1: 実際に使うブロックサイズ(自動なら画像の長辺から決まる値)。
+    fn mosaic_effective_block(&self, auto: bool, block: u32) -> u32 {
+        if auto {
+            let doc = &self.active_tab().doc;
+            raster::auto_block_size(doc.width, doc.height)
+        } else {
+            block.clamp(2, 100)
+        }
+    }
+
+    /// モザイクのライブプレビュー再計算(値が変わったフレームだけ呼ぶ)。
+    ///
+    /// 色調補正(`reapply_tone_preview`)は画素ごとの純関数なので
+    /// `OriginalPixelCursor` から 1 画素ずつ読めるが、モザイクは
+    /// **ブロック単位**の平均が必要なため、同じ「累積適用しない」性質を
+    /// 「開始時スナップショットを復元してから 1 回だけかける」方法で満たす
+    /// (`History::restore_stroke_region` はモーダルのキャンセルでも使う
+    /// 既存の機構で、退避タイルを消費しないので何度でも呼べる)。
+    fn reapply_mosaic_preview(&mut self, rect: crate::document::IRect, block: u32) {
+        let bounds = rect.clamp_to(self.active_tab().doc.width, self.active_tab().doc.height);
+        if bounds.is_empty() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active_tab];
+        // ① 開始時の画素へ戻す(前回のプレビューを打ち消す)。
+        tab.history.restore_stroke_region(&mut tab.doc, bounds);
+        // ② その上から 1 回だけモザイクをかける(選択クリップ・アルファ
+        //    ロックは `Surface` が見る)。
+        let clip = tab.selection.as_ref().map(|s| &s.mask);
+        {
+            let mut surface = tab.doc.active_surface_mut(clip);
+            raster::apply_mosaic(&mut surface, bounds, block);
+        }
+        tab.doc.mark_dirty(bounds);
     }
 
     /// SPEC §24: 「色相・彩度・明度… (Ctrl+U)」モーダルを開く。
@@ -4952,6 +5206,8 @@ impl DaraskApp {
             MenuAction::RotateCw => self.apply_rotate_cw(),
             MenuAction::RotateCcw => self.apply_rotate_ccw(),
             MenuAction::BrightnessContrast => self.open_brightness_contrast_modal(),
+            // v12 §51.1: 「モザイク…」(色調補正グループ)。
+            MenuAction::Mosaic => self.open_mosaic_modal(),
             MenuAction::HueSaturation => self.open_hue_saturation_modal(),
             MenuAction::Invert => self.apply_invert(),
             MenuAction::Grayscale => self.apply_grayscale(),
@@ -5124,6 +5380,39 @@ impl DaraskApp {
                         let tab = self.active_tab_mut();
                         tab.history.restore_stroke_region(&mut tab.doc, rect);
                         tab.history.cancel_stroke();
+                        keep_open = false;
+                    }
+                    DialogOutcome::Pending => {}
+                }
+            }
+            ModalState::Mosaic { auto, block, rect } => {
+                let rect = *rect;
+                let auto_block = {
+                    let doc = &self.active_tab().doc;
+                    raster::auto_block_size(doc.width, doc.height)
+                };
+                let (outcome, changed) = dialogs::show_mosaic(ctx, auto, block, auto_block);
+                // 開いた直後の 1 フレーム目にも 1 回だけかける(既定値の
+                // プレビューが出ていないと「何も起きていない」ように見える)。
+                let first_frame = !self.mosaic_preview_applied;
+                if changed || first_frame {
+                    let effective = self.mosaic_effective_block(*auto, *block);
+                    self.reapply_mosaic_preview(rect, effective);
+                    self.mosaic_preview_applied = true;
+                }
+                match outcome {
+                    DialogOutcome::Confirmed => {
+                        let tab = self.active_tab_mut();
+                        // ARCHITECTURE.md §18.3 の対応表に倣うラベル。
+                        tab.history.commit_stroke(&mut tab.doc, "モザイク");
+                        self.mosaic_preview_applied = false;
+                        keep_open = false;
+                    }
+                    DialogOutcome::Cancelled => {
+                        let tab = self.active_tab_mut();
+                        tab.history.restore_stroke_region(&mut tab.doc, rect);
+                        tab.history.cancel_stroke();
+                        self.mosaic_preview_applied = false;
                         keep_open = false;
                     }
                     DialogOutcome::Pending => {}
@@ -5420,6 +5709,14 @@ impl eframe::App for DaraskApp {
         }
 
         {
+            // v12 §51.2: 選択ブラシのモード表示。追いレビュー③: ストローク中は
+            // Down 時に確定した実際のモード(`stroke.erase`)を出す — 毎フレーム
+            // の Alt を見ると、Alt を離した瞬間に表示だけ「追加」へ変わり、
+            // 赤い消去プレビューと食い違う。非ドラッグ時だけ現在の Alt を見る。
+            let alt_held_for_options = match self.select_brush_stroke.as_ref() {
+                Some(stroke) => stroke.erase,
+                None => ui.ctx().input(|i| i.modifiers.alt),
+            };
             // SPEC §3: オプションバーの「ツール固有」は矩形/楕円のときだけ
             // モード選択(枠線のみ/塗りつぶし/両方)を出す。
             let shape_mode = match self.tool {
@@ -5444,6 +5741,8 @@ impl eframe::App for DaraskApp {
                     lasso_mode: self.lasso_mode,
                     magic_wand_tolerance: &mut self.magic_wand_tolerance,
                     transparent_selection: &mut self.transparent_selection,
+                    // v12 §51.2: Alt 押下中は「消去」モードになる。
+                    select_brush_erase: alt_held_for_options,
                 },
             );
         }
@@ -5523,6 +5822,9 @@ impl eframe::App for DaraskApp {
                     | ToolKind::Text
                     | ToolKind::EllipseSelect
                     | ToolKind::Lasso
+                    // v12 §51.2: 選択ブラシのプレビュー(進行中スタンプ)は
+                    // `draw_selection_overlay` が選択枠と一緒に描く。
+                    | ToolKind::SelectBrush
                     | ToolKind::MagicWand => {}
                 }
                 // SPEC §17: ブラシ/消しゴム使用中は OS カーソルの代わりに
@@ -5534,8 +5836,12 @@ impl eframe::App for DaraskApp {
                 // `effective_cursor`)のと二重表示になっていた。パン中は
                 // 円を出さない(SPEC §17「円表示時は OS カーソル非表示」の
                 // 排他が崩れないようにする)。
-                if matches!(self.tool, ToolKind::Pen | ToolKind::Eraser)
-                    && !self.active_tab().view.is_panning()
+                // v12 §51.2: 選択ブラシも円ブラシなので同じ円アウトラインを
+                // 出す(塗る範囲がサイズに依存するため)。
+                if matches!(
+                    self.tool,
+                    ToolKind::Pen | ToolKind::Eraser | ToolKind::SelectBrush
+                ) && !self.active_tab().view.is_panning()
                 {
                     if let Some(hover) = self.active_tab().view.hover_img() {
                         self.draw_brush_cursor(&output.painter, hover);
@@ -5721,6 +6027,7 @@ mod tests {
             last_shape_tool: ToolKind::Line,
             last_marquee_tool: ToolKind::Select,
             last_fill_tool: ToolKind::Fill,
+            last_wand_tool: ToolKind::MagicWand,
             pen: PenTool::new(),
             eraser: EraserTool::new(),
             line: ShapeTool::new_line(),
@@ -5731,6 +6038,8 @@ mod tests {
             gradient: GradientTool::new(),
             lasso_mode: LassoMode::Freehand,
             lasso_freehand_points: Vec::new(),
+            select_brush_stroke: None,
+            mosaic_preview_applied: false,
             lasso_polygon: None,
             magic_wand_tolerance: 0,
             transparent_selection: false,
@@ -10647,6 +10956,553 @@ mod tests {
             "shift-drag must produce a square selection, got {bbox:?}"
         );
         assert_eq!(bbox.width(), 20);
+    }
+
+    // -- v12 §51: モザイク・選択ブラシ ------------------------------------
+
+    /// SPEC §51.2: `Shift+W` は自動選択↔選択ブラシを巡回し、`W` は直前に
+    /// 使った方へ戻る(M/Shift+M と同じ設計)。
+    #[test]
+    fn cycle_wand_tool_toggles_magic_wand_and_select_brush() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::MagicWand);
+
+        app.cycle_wand_tool();
+        assert_eq!(app.tool, ToolKind::SelectBrush);
+        app.cycle_wand_tool();
+        assert_eq!(app.tool, ToolKind::MagicWand);
+    }
+
+    #[test]
+    fn cycle_wand_tool_from_another_tool_starts_from_last_wand_tool() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        assert_eq!(app.last_wand_tool, ToolKind::SelectBrush);
+        app.set_tool(ToolKind::Pen);
+
+        app.cycle_wand_tool();
+        assert_eq!(app.tool, ToolKind::MagicWand);
+
+        // `W` は直前に使った方(いまは自動選択)へ戻る。
+        app.set_tool(ToolKind::Pen);
+        app.set_tool(app.last_wand_tool);
+        assert_eq!(app.tool, ToolKind::MagicWand);
+    }
+
+    /// SPEC §51.2: ドラッグで選択へ追加、Alt ドラッグで消去、空になったら解除。
+    #[test]
+    fn select_brush_drag_adds_then_alt_drag_erases_the_selection() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 6.0;
+
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(5.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Drag {
+                img: pos2(9.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(9.0, 5.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        let selection = app
+            .active_tab()
+            .selection
+            .as_ref()
+            .expect("ドラッグで選択が作られる");
+        assert!(selection.mask.contains(5, 5));
+        assert!(selection.mask.contains(9, 5));
+        assert!(!selection.boundary.is_empty(), "境界線が再計算されている");
+        assert!(app.select_brush_stroke.is_none(), "Up でストロークは終わる");
+
+        // Alt ドラッグ(消去)。同じ場所を大きめのブラシで消すと空になる。
+        app.brush_size = 30.0;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(7.0, 5.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::ALT,
+            },
+            ToolEvent::Up {
+                img: pos2(7.0, 5.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert!(
+            app.active_tab().selection.is_none(),
+            "空になった選択は解除される(SPEC §51.2)"
+        );
+    }
+
+    /// Alt+ドラッグは選択ブラシでは「消去」であり、一時スポイト(SPEC §4)に
+    /// 横取りされてはいけない(色も変わらない)。
+    #[test]
+    fn alt_drag_with_the_select_brush_erases_instead_of_picking_a_color() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.primary = Color32::from_rgb(1, 2, 3);
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 8.0;
+        // まず追加。
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(10.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(10.0, 10.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert!(app.active_tab().selection.is_some());
+
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(10.0, 10.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::ALT,
+        }]);
+        assert!(
+            app.select_brush_stroke.is_some(),
+            "Alt+Down は消去ストロークの開始(一時スポイトではない)"
+        );
+        assert_eq!(
+            app.primary,
+            Color32::from_rgb(1, 2, 3),
+            "スポイトが走っていないのでプライマリ色は変わらない"
+        );
+        assert!(!app.alt_eyedropper_active);
+    }
+
+    /// 選択ブラシのドラッグ中に割り込み(ツール切替)が起きたら、他のドラッグ
+    /// 系ツールと同じく直近の位置で確定する(捨てない)。
+    #[test]
+    fn switching_tool_mid_select_brush_drag_commits_the_stroke() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 6.0;
+        app.dispatch_canvas_events(vec![ToolEvent::Down {
+            img: pos2(6.0, 6.0),
+            button: PointerButton::Primary,
+            mods: Modifiers::NONE,
+        }]);
+        assert!(app.select_brush_stroke.is_some());
+
+        app.set_tool(ToolKind::Pen);
+
+        assert!(app.select_brush_stroke.is_none());
+        assert!(
+            app.active_tab()
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.mask.contains(6, 6)),
+            "確定済みの選択が残る"
+        );
+    }
+
+    /// SPEC §51.2: 選択ブラシで作った選択は、以後「既存のマスク選択」と
+    /// 完全に同じ扱いになる(描画クリップに使われる)。
+    #[test]
+    fn a_selection_painted_with_the_select_brush_clips_drawing_like_any_other() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 6.0;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(4.0, 4.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(4.0, 4.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert!(app.active_tab().selection.is_some());
+
+        app.set_tool(ToolKind::Pen);
+        app.primary = Color32::from_rgb(255, 0, 0);
+        app.brush_size = 40.0;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(4.0, 4.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(4.0, 4.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        let inside = app.active_tab().doc.get_pixel(4, 4).expect("in-bounds");
+        let outside = app.active_tab().doc.get_pixel(18, 18).expect("in-bounds");
+        assert_ne!(inside, [255, 255, 255, 255], "選択内は塗られる");
+        assert_eq!(
+            outside,
+            [255, 255, 255, 255],
+            "選択外はクリップされて塗られない"
+        );
+    }
+
+    /// SPEC §51.1: モザイクは 1 undo 単位で、キャンセルすると完全復元される。
+    #[test]
+    fn mosaic_modal_applies_a_live_preview_and_commits_one_undo_step() {
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        // 市松状に色を置いて、平均で必ず変化が出るようにする。
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                app.active_tab_mut().doc.set_pixel(x, y, [v, v, v, 255]);
+            }
+        }
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+
+        app.open_mosaic_modal();
+        let Some(ModalState::Mosaic { rect, .. }) = app.modal else {
+            panic!("モザイクモーダルが開いていない");
+        };
+        // プレビュー(値が変わったフレーム相当)。
+        app.reapply_mosaic_preview(rect, 4);
+        assert_ne!(
+            app.active_tab().doc.active_pixels(),
+            before,
+            "プレビューで画素が変わる"
+        );
+        // 再適用しても累積しない(毎回スナップショットから計算する)。
+        let once = app.active_tab().doc.active_pixels().to_vec();
+        app.reapply_mosaic_preview(rect, 4);
+        assert_eq!(app.active_tab().doc.active_pixels(), once, "累積適用しない");
+
+        // OK 相当(確定)。
+        {
+            let tab = app.active_tab_mut();
+            tab.history.commit_stroke(&mut tab.doc, "モザイク");
+        }
+        assert_eq!(app.active_tab().history.undo_len(), undo_before + 1);
+
+        // undo で完全復元。
+        {
+            let tab = app.active_tab_mut();
+            assert!(tab.history.undo(&mut tab.doc));
+        }
+        assert_eq!(app.active_tab().doc.active_pixels(), before);
+    }
+
+    #[test]
+    fn mosaic_modal_cancel_restores_the_original_pixels() {
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                app.active_tab_mut().doc.set_pixel(x, y, [v, v, v, 255]);
+            }
+        }
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        let undo_before = app.active_tab().history.undo_len();
+
+        app.open_mosaic_modal();
+        let Some(ModalState::Mosaic { rect, .. }) = app.modal else {
+            panic!("モザイクモーダルが開いていない");
+        };
+        app.reapply_mosaic_preview(rect, 4);
+        // キャンセル相当。
+        {
+            let tab = app.active_tab_mut();
+            tab.history.restore_stroke_region(&mut tab.doc, rect);
+            tab.history.cancel_stroke();
+        }
+        assert_eq!(app.active_tab().doc.active_pixels(), before);
+        assert_eq!(
+            app.active_tab().history.undo_len(),
+            undo_before,
+            "キャンセルは履歴に何も積まない"
+        );
+    }
+
+    /// SPEC §51.1: 対象は選択内のみ(選択外は 1 バイトも変わらない)。
+    /// スナップショット領域は格子境界へ外側拡張される。
+    #[test]
+    fn mosaic_targets_only_the_selection_and_snapshots_the_grid_aligned_rect() {
+        let mut app = new_for_test(Document::new(40, 40, Background::White));
+        for y in 0..40 {
+            for x in 0..40 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                app.active_tab_mut().doc.set_pixel(x, y, [v, v, v, 255]);
+            }
+        }
+        let before = app.active_tab().doc.active_pixels().to_vec();
+        app.active_tab_mut().selection = Some(Selection::new(select::rect_mask(IRect {
+            x0: 11,
+            y0: 11,
+            x1: 21,
+            y1: 21,
+        })));
+
+        app.open_mosaic_modal();
+        let Some(ModalState::Mosaic { rect, block, auto }) = app.modal else {
+            panic!("モザイクモーダルが開いていない");
+        };
+        assert!(auto, "自動チェックは既定 ON(SPEC §51.1)");
+        assert_eq!(block, raster::auto_block_size(40, 40));
+        // 選択 bbox(11..21)が格子(block=4)境界へ外側拡張されている。
+        assert_eq!(
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+            (8, 8, 24, 24),
+            "スナップショット領域は格子境界へ拡張される"
+        );
+
+        app.reapply_mosaic_preview(rect, block);
+        let after = app.active_tab().doc.active_pixels().to_vec();
+        let px = |buf: &[u8], x: usize, y: usize| {
+            let i = (y * 40 + x) * 4;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+        assert_ne!(px(&after, 15, 15), px(&before, 15, 15), "選択内は変わる");
+        assert_eq!(px(&after, 5, 5), px(&before, 5, 5), "選択外は不変");
+        assert_eq!(
+            px(&after, 9, 9),
+            px(&before, 9, 9),
+            "拡張領域でも選択外なら不変(平均にだけ使われる)"
+        );
+    }
+
+    /// v12 §51.2(追いレビュー②): 選択ブラシで作った選択も Esc で解除できる
+    /// (SPEC §51.2「以後の選択の使われ方は既存マスク選択と同一」)。
+    #[test]
+    fn escape_deselects_a_selection_painted_with_the_select_brush() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 8.0;
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(10.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(10.0, 10.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        assert!(app.active_tab().selection.is_some());
+
+        let ctx = ctx_with_key_event(Key::Escape, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            app.active_tab().selection.is_none(),
+            "Esc で選択が解除される"
+        );
+    }
+
+    /// v12 §51.2(追いレビュー④): `Shift+W` の巡回・`W` の復帰を
+    /// `handle_shortcuts` 経由(= 実際のキー入力経路)で検証する。
+    #[test]
+    fn shift_w_cycles_wand_tools_and_w_returns_to_the_last_one() {
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        app.set_tool(ToolKind::MagicWand);
+
+        let ctx = ctx_with_key_event(Key::W, Modifiers::SHIFT);
+        app.handle_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert_eq!(app.tool, ToolKind::SelectBrush, "Shift+W で巡回する");
+
+        // 別ツールへ移ってから W を押すと、直前に使った選択ブラシへ戻る。
+        app.set_tool(ToolKind::Pen);
+        let ctx = ctx_with_key_event(Key::W, Modifiers::NONE);
+        app.handle_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert_eq!(app.tool, ToolKind::SelectBrush, "W は直前に使った方へ戻る");
+
+        // もう一度 Shift+W で自動選択へ。
+        let ctx = ctx_with_key_event(Key::W, Modifiers::SHIFT);
+        app.handle_shortcuts(&ctx);
+        let _ = ctx.end_pass();
+        assert_eq!(app.tool, ToolKind::MagicWand);
+    }
+
+    /// 追いレビュー①の統合確認: 疎な Drag イベント(補間なしなら中央が空く)
+    /// でも、確定後の選択は途切れない。
+    #[test]
+    fn select_brush_drag_with_sparse_events_selects_a_continuous_band() {
+        let mut app = new_for_test(Document::new(24, 24, Background::White));
+        app.set_tool(ToolKind::SelectBrush);
+        app.brush_size = 4.0; // 半径 2px。
+        app.dispatch_canvas_events(vec![
+            ToolEvent::Down {
+                img: pos2(2.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Drag {
+                img: pos2(18.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            },
+            ToolEvent::Up {
+                img: pos2(18.0, 10.0),
+                button: PointerButton::Primary,
+            },
+        ]);
+        let selection = app.active_tab().selection.as_ref().expect("選択ができる");
+        for x in 2..=18 {
+            assert!(selection.mask.contains(x, 10), "x={x} が途切れている");
+        }
+    }
+
+    /// ドラッグ中に割り込む操作(undo / モーダル / Shift+W 切替)でも状態が
+    /// 壊れない(進行中ストロークは確定され、以後の操作が正常に続く)。
+    #[test]
+    fn interrupting_a_select_brush_drag_commits_it_and_keeps_the_app_consistent() {
+        let start_drag = |app: &mut DaraskApp| {
+            app.set_tool(ToolKind::SelectBrush);
+            app.brush_size = 8.0;
+            app.dispatch_canvas_events(vec![ToolEvent::Down {
+                img: pos2(10.0, 10.0),
+                button: PointerButton::Primary,
+                mods: Modifiers::NONE,
+            }]);
+            assert!(app.select_brush_stroke.is_some());
+        };
+
+        // ① undo(履歴操作)。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        start_drag(&mut app);
+        app.handle_menu_action(MenuAction::Undo);
+        assert!(app.select_brush_stroke.is_none());
+        assert!(app.active_tab().selection.is_some(), "確定済みの選択は残る");
+
+        // ② モーダル(モザイク)を開く。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        start_drag(&mut app);
+        app.open_mosaic_modal();
+        assert!(app.select_brush_stroke.is_none());
+        assert!(matches!(app.modal, Some(ModalState::Mosaic { .. })));
+        assert!(app.active_tab().selection.is_some());
+
+        // ③ Shift+W でツール切替。
+        let mut app = new_for_test(Document::new(20, 20, Background::White));
+        start_drag(&mut app);
+        app.cycle_wand_tool();
+        assert_eq!(app.tool, ToolKind::MagicWand);
+        assert!(app.select_brush_stroke.is_none());
+        assert!(app.active_tab().selection.is_some());
+    }
+
+    /// SPEC §51.1: 選択 bbox が四辺すべて画像外にはみ出していても、
+    /// クランプされて全面が対象になり、パニックしない。
+    #[test]
+    fn mosaic_with_a_selection_bbox_outside_the_image_clamps_to_the_document() {
+        let mut app = new_for_test(Document::new(16, 16, Background::White));
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                app.active_tab_mut().doc.set_pixel(x, y, [v, v, v, 255]);
+            }
+        }
+        // 四辺とも画像外へはみ出す選択(clamp_to で全面になる)。
+        let mask = select::rect_mask(IRect {
+            x0: -50,
+            y0: -50,
+            x1: 100,
+            y1: 100,
+        })
+        .clamp_to(16, 16);
+        app.active_tab_mut().selection = Some(Selection::new(mask));
+
+        app.open_mosaic_modal();
+        let Some(ModalState::Mosaic { rect, block, .. }) = app.modal else {
+            panic!("モザイクモーダルが開いていない");
+        };
+        assert_eq!(
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+            (0, 0, 16, 16),
+            "対象はドキュメント全面へクランプされる"
+        );
+        app.reapply_mosaic_preview(rect, block);
+        // 全面が平均で塗り替わる(市松なので必ず変化する)。
+        assert_ne!(
+            app.active_tab().doc.get_pixel(0, 0),
+            Some([0, 0, 0, 255]),
+            "全面にモザイクがかかる"
+        );
+    }
+
+    /// SPEC §51.1: 手動ブロックサイズの端(2 と 100)でも、プレビュー変更・
+    /// キャンセル・undo が一貫して動く。
+    #[test]
+    fn mosaic_manual_block_extremes_preview_cancel_and_undo() {
+        for block in [2u32, 100] {
+            let mut app = new_for_test(Document::new(50, 50, Background::White));
+            for y in 0..50 {
+                for x in 0..50 {
+                    let v = ((x * 5 + y * 3) % 256) as u8;
+                    app.active_tab_mut().doc.set_pixel(x, y, [v, v, v, 255]);
+                }
+            }
+            let before = app.active_tab().doc.active_pixels().to_vec();
+            let undo_before = app.active_tab().history.undo_len();
+
+            app.open_mosaic_modal();
+            let Some(ModalState::Mosaic { rect, .. }) = app.modal else {
+                panic!("モザイクモーダルが開いていない");
+            };
+
+            // 手動値でプレビュー → 値を変えて再プレビュー(累積しない)。
+            app.reapply_mosaic_preview(rect, block);
+            let first = app.active_tab().doc.active_pixels().to_vec();
+            assert_ne!(first, before, "block={block} でも画素が変わる");
+            app.reapply_mosaic_preview(rect, block);
+            assert_eq!(
+                app.active_tab().doc.active_pixels(),
+                first,
+                "block={block}: 同じ値の再適用は同じ結果"
+            );
+            app.reapply_mosaic_preview(rect, if block == 2 { 100 } else { 2 });
+            assert_ne!(
+                app.active_tab().doc.active_pixels(),
+                first,
+                "block={block}: 値を変えれば結果も変わる"
+            );
+
+            // キャンセルで完全復元・履歴は増えない。
+            {
+                let tab = app.active_tab_mut();
+                tab.history.restore_stroke_region(&mut tab.doc, rect);
+                tab.history.cancel_stroke();
+            }
+            assert_eq!(app.active_tab().doc.active_pixels(), before);
+            assert_eq!(app.active_tab().history.undo_len(), undo_before);
+
+            // もう一度かけて OK → undo で戻る。
+            app.open_mosaic_modal();
+            let Some(ModalState::Mosaic { rect, .. }) = app.modal else {
+                panic!("モザイクモーダルが開いていない");
+            };
+            app.reapply_mosaic_preview(rect, block);
+            {
+                let tab = app.active_tab_mut();
+                tab.history.commit_stroke(&mut tab.doc, "モザイク");
+            }
+            assert_eq!(app.active_tab().history.undo_len(), undo_before + 1);
+            {
+                let tab = app.active_tab_mut();
+                assert!(tab.history.undo(&mut tab.doc));
+            }
+            assert_eq!(
+                app.active_tab().doc.active_pixels(),
+                before,
+                "block={block}: undo で完全復元"
+            );
+        }
     }
 
     #[test]

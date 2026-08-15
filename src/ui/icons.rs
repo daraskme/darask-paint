@@ -108,6 +108,7 @@ pub fn paint_tool_icon(kind: ToolKind, painter: &Painter, rect: Rect, color: Col
         ToolKind::EllipseSelect => ellipse_select_icon(painter, rect, color),
         ToolKind::Lasso => lasso_icon(painter, rect, color),
         ToolKind::MagicWand => magic_wand_icon(painter, rect, color),
+        ToolKind::SelectBrush => select_brush_icon(painter, rect, color),
     }
 }
 
@@ -320,6 +321,34 @@ fn magic_wand_icon(painter: &Painter, rect: Rect, color: Color32) {
 fn sparkle_cross(painter: &Painter, center: Pos2, size: f32, stroke: Stroke) {
     painter.line_segment([center - vec2(size, 0.0), center + vec2(size, 0.0)], stroke);
     painter.line_segment([center - vec2(0.0, size), center + vec2(0.0, size)], stroke);
+}
+
+/// v12 §51.2: 選択ブラシ = 破線の選択枠の内側をブラシで塗る意匠
+/// (「マスクを筆で塗る」= クイックマスク簡易版であることを示す)。
+fn select_brush_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let st = line_stroke(rect, color);
+    // 破線の選択枠(`select_icon` と同じ意匠を小さめに)。
+    let frame = Rect::from_min_max(p(rect, 0.10, 0.10), p(rect, 0.90, 0.90));
+    let dash = rect.width() * 0.12;
+    let mut x = frame.min.x;
+    while x < frame.max.x {
+        let x1 = (x + dash * 0.6).min(frame.max.x);
+        painter.line_segment([pos2(x, frame.min.y), pos2(x1, frame.min.y)], st);
+        painter.line_segment([pos2(x, frame.max.y), pos2(x1, frame.max.y)], st);
+        x += dash;
+    }
+    let mut y = frame.min.y;
+    while y < frame.max.y {
+        let y1 = (y + dash * 0.6).min(frame.max.y);
+        painter.line_segment([pos2(frame.min.x, y), pos2(frame.min.x, y1)], st);
+        painter.line_segment([pos2(frame.max.x, y), pos2(frame.max.x, y1)], st);
+        y += dash;
+    }
+    // 内側を塗る筆(斜めの軸 + 穂先の塗り)。
+    let tail = p(rect, 0.72, 0.24);
+    let tip = p(rect, 0.34, 0.66);
+    painter.line_segment([tail, tip], st);
+    painter.circle_filled(tip, rect.width() * 0.13, color);
 }
 
 /// 手のひら = 十字矢印(SPEC §15、「手」の代替表現)。
@@ -997,6 +1026,45 @@ pub fn paint_invert_icon(painter: &Painter, rect: Rect, color: Color32) {
         half.push(center + vec2(angle.cos(), angle.sin()) * radius);
     }
     painter.add(Shape::convex_polygon(half, color, Stroke::NONE));
+}
+
+/// v12 §51.1: 画像 = モザイク(格子ごとにブロック平均で塗り潰した見た目)。
+pub fn paint_mosaic_icon(painter: &Painter, rect: Rect, color: Color32) {
+    // v12 §51.1: モザイク = 濃淡の違う 3x3 のブロック(格子平均の見た目)。
+    let box_rect = Rect::from_min_max(p(rect, 0.14, 0.14), p(rect, 0.86, 0.86));
+    const CELLS: i32 = 3;
+    // 市松ではなく「ブロックごとに濃さが違う」ことを示す固定パターン。
+    const LEVELS: [[u8; 3]; 3] = [[220, 90, 160], [110, 200, 60], [170, 60, 230]];
+    for row in 0..CELLS {
+        for col in 0..CELLS {
+            let t0x = col as f32 / CELLS as f32;
+            let t1x = (col + 1) as f32 / CELLS as f32;
+            let t0y = row as f32 / CELLS as f32;
+            let t1y = (row + 1) as f32 / CELLS as f32;
+            let cell = Rect::from_min_max(
+                pos2(
+                    box_rect.min.x + t0x * box_rect.width(),
+                    box_rect.min.y + t0y * box_rect.height(),
+                ),
+                pos2(
+                    box_rect.min.x + t1x * box_rect.width(),
+                    box_rect.min.y + t1y * box_rect.height(),
+                ),
+            );
+            let alpha = LEVELS[row as usize][col as usize];
+            painter.rect_filled(
+                cell.shrink(rect.width() * 0.01),
+                0.0,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+            );
+        }
+    }
+    painter.rect_stroke(
+        box_rect,
+        1.0,
+        line_stroke(rect, color),
+        egui::StrokeKind::Middle,
+    );
 }
 
 /// 画像 = グレースケール化: 濃淡が変化する 4 枚のタイル(SPEC §33)。

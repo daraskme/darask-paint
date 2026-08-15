@@ -357,6 +357,118 @@ pub fn floating_target_rect(floating: &Floating) -> IRect {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v12 §51.2: 選択ブラシ(クイックマスク簡易版)
+// ---------------------------------------------------------------------------
+
+/// SPEC §51.2: 選択ブラシ 1 ストロークぶんを既存の選択マスクへ反映した結果。
+///
+/// - `current`: 現在の選択マスク(無ければ `None` = 空から開始)。
+/// - `points`: ストローク中に記録したスタンプ中心(画像座標)。
+/// - `radius`: ブラシ半径(px)。2 値スタンプ(硬さの概念なし)で、
+///   幾何は鉛筆モードのスタンプ(`raster::stamp_pencil_coverage`)と共有する
+///   ため、1px ブラシでも必ず 1 画素は塗れる。
+/// - `erase`: `true`(Alt ドラッグ)なら**消去**、`false` なら**追加**。
+///
+/// 戻り値が `None` なら「選択が空になった」= 呼び出し側は選択を解除する。
+/// マスクの bbox は常に非ゼロ画素へ切り詰める(`tighten_mask`)ので、
+/// 消去で穴が空いても bbox が肥大化したまま残らない。
+///
+/// 純関数(`Document` も egui も見ない)なのでテストしやすい。範囲外の点・
+/// 巨大な半径・空の `points` でもパニックしない(すべて文書境界でクリップ)。
+pub fn apply_select_brush_stroke(
+    current: Option<&SelMask>,
+    points: &[Pos2],
+    radius: f32,
+    erase: bool,
+    doc_width: u32,
+    doc_height: u32,
+) -> Option<SelMask> {
+    // 追いレビュー①: 記録点(ポインタイベント)の間隔はフレームレートと
+    // ポインタ速度次第でいくらでも開くため、**必ず補間してから**スタンプする
+    // (`raster::stroke_segment` がブラシで解決しているのと同じ問題)。
+    let points = &select_brush_stamp_points(points, radius);
+    // ストロークが触れうる矩形(文書内へクリップ)。
+    let mut stroke_rect: Option<IRect> = None;
+    for p in points {
+        let bounds = raster::stamp_bounds(p.x, p.y, radius).clamp_to(doc_width, doc_height);
+        if bounds.is_empty() {
+            continue;
+        }
+        stroke_rect = Some(match stroke_rect {
+            Some(r) => r.union(&bounds),
+            None => bounds,
+        });
+    }
+
+    // 追加は「既存 ∪ ストローク」、消去は既存の範囲だけを対象にする。
+    let target = match (current, stroke_rect) {
+        (None, None) => return None,
+        (None, Some(stroke)) => {
+            if erase {
+                // 何も選択されていない状態での消去は何も起こらない。
+                return None;
+            }
+            stroke
+        }
+        (Some(existing), None) => existing.bbox.clamp_to(doc_width, doc_height),
+        (Some(existing), Some(stroke)) => {
+            let existing = existing.bbox.clamp_to(doc_width, doc_height);
+            if erase {
+                existing
+            } else {
+                existing.union(&stroke)
+            }
+        }
+    };
+    let target = target.clamp_to(doc_width, doc_height);
+    if target.is_empty() {
+        return None;
+    }
+
+    // 既存マスクを新しい bbox へ写してから、スタンプを合成する。
+    let w = target.width() as usize;
+    let h = target.height() as usize;
+    let mut mask = vec![0u8; w * h];
+    if let Some(existing) = current {
+        for y in 0..h {
+            for x in 0..w {
+                mask[y * w + x] = existing.get(target.x0 + x as i32, target.y0 + y as i32);
+            }
+        }
+    }
+    let value = if erase { 0 } else { 255 };
+    for p in points {
+        let stamp = raster::stamp_bounds(p.x, p.y, radius).clamp_to(doc_width, doc_height);
+        // `target` との交差(`IRect` に intersect は無いので手で取る)。
+        let bounds = IRect {
+            x0: stamp.x0.max(target.x0),
+            y0: stamp.y0.max(target.y0),
+            x1: stamp.x1.min(target.x1),
+            y1: stamp.y1.min(target.y1),
+        };
+        for y in bounds.y0..bounds.y1 {
+            for x in bounds.x0..bounds.x1 {
+                if raster::stamp_pencil_coverage(p.x, p.y, radius, x, y) == 0 {
+                    continue;
+                }
+                let idx = (y - target.y0) as usize * w + (x - target.x0) as usize;
+                if let Some(slot) = mask.get_mut(idx) {
+                    *slot = value;
+                }
+            }
+        }
+    }
+    // 消去で穴が空いても bbox が肥大化したまま残らないよう正規化し、
+    // 空になったら `None`(= 呼び出し側が選択を解除する)を返す。
+    let tightened = tighten_mask(SelMask { bbox: target, mask });
+    if tightened.is_empty() {
+        None
+    } else {
+        Some(tightened)
+    }
+}
+
 /// `rect`(境界内であること前提だが、呼び出し側が `clamp_to` 済みでなくても
 /// 範囲外は透明として扱いパニックしない)全体を選択済みとみなす
 /// `SelMask`(SPEC §21: 「既存の矩形選択はマスクが全 1 の矩形として同一
@@ -814,6 +926,43 @@ pub fn invert_mask(mask: &SelMask, width: u32, height: u32) -> SelMask {
         bbox: full,
         mask: out,
     })
+}
+
+/// v12 §51.2(追いレビュー①): 記録した点列を、実際にスタンプする中心の列へ
+/// 展開する(前点から新点までを `max(1, radius/2)` px 間隔で補間)。
+///
+/// ポインタイベントは高速ドラッグだと数十 px 飛ぶため、記録点にだけ
+/// スタンプすると軌跡が数珠状に途切れる。ブラシ(`raster::stroke_segment`)と
+/// 同じ間隔ポリシーで補間して連続させる。マスク生成(`apply_select_brush_
+/// stroke`)とドラッグ中のプレビュー(`app.rs`)が**同じ点列**を使うことで、
+/// 「見えている跡」と「実際に選択される範囲」が一致する。
+///
+/// 1 区間あたりの分割数には上限を設ける(キャンバス外へ数万 px ドラッグした
+/// ような入力で点列が際限なく伸びないための防御。上限に達するのは文書の
+/// 対角線を大きく超える区間だけで、その部分は結局クリップされて見えない)。
+pub fn select_brush_stamp_points(points: &[Pos2], radius: f32) -> Vec<Pos2> {
+    /// 1 区間の最大分割数(8192² の対角線 ≈ 11586px を超える長さ用の安全弁)。
+    const MAX_STAMPS_PER_SEGMENT: u32 = 16_384;
+    let step = (radius / 2.0).max(1.0);
+    let mut out: Vec<Pos2> = Vec::with_capacity(points.len());
+    for (i, p) in points.iter().enumerate() {
+        if i == 0 {
+            out.push(*p);
+            continue;
+        }
+        let prev = points[i - 1];
+        let dist = prev.distance(*p);
+        if !dist.is_finite() {
+            out.push(*p);
+            continue;
+        }
+        let steps = ((dist / step).ceil().max(1.0) as u32).min(MAX_STAMPS_PER_SEGMENT);
+        for s in 1..=steps {
+            let t = s as f32 / steps as f32;
+            out.push(prev + (*p - prev) * t);
+        }
+    }
+    out
 }
 
 /// 非ゼロ画素を含む最小の bbox へ詰め直す(全ゼロなら `SelMask::empty()`)。
@@ -2460,5 +2609,179 @@ mod tests {
         let m = polygon_mask(&points);
         // 面積 0 なので何も選択されなくてよいが、パニックしないことが主眼。
         let _ = m.mask.iter().any(|&v| v != 0);
+    }
+    // -- v12 §51.2: 選択ブラシ -------------------------------------------
+
+    fn brush_mask(points: &[Pos2], radius: f32) -> SelMask {
+        apply_select_brush_stroke(None, points, radius, false, 20, 20).expect("非空のストローク")
+    }
+
+    #[test]
+    fn select_brush_adds_a_round_stamp_to_an_empty_selection() {
+        let mask = brush_mask(&[pos2(10.0, 10.0)], 3.0);
+        // 中心は選択され、半径の外は選択されない(2 値の円ブラシ)。
+        assert!(mask.contains(10, 10));
+        assert!(mask.contains(11, 10));
+        assert!(!mask.contains(15, 10));
+        // bbox は非ゼロ画素へタイトに詰められている。
+        assert!(mask.bbox.width() <= 8 && mask.bbox.height() <= 8);
+        assert!(mask.bbox.x0 >= 7 && mask.bbox.x1 <= 14);
+    }
+
+    #[test]
+    fn select_brush_accumulates_across_strokes_instead_of_replacing() {
+        // SPEC §51.2: 既存の選択へ**追加**する(他の選択ツールの「置き換え」
+        // 原則はこのツールにだけ適用されない)。
+        let first = brush_mask(&[pos2(4.0, 4.0)], 2.0);
+        let second =
+            apply_select_brush_stroke(Some(&first), &[pos2(14.0, 14.0)], 2.0, false, 20, 20)
+                .expect("非空");
+        assert!(second.contains(4, 4), "最初のストロークが残っている");
+        assert!(second.contains(14, 14), "2 本目も選択されている");
+        // bbox は両方を覆う。
+        assert!(second.bbox.x0 <= 4 && second.bbox.x1 >= 15);
+    }
+
+    #[test]
+    fn select_brush_erase_removes_from_the_existing_selection() {
+        let base = rect_mask(IRect {
+            x0: 0,
+            y0: 0,
+            x1: 20,
+            y1: 20,
+        });
+        let after = apply_select_brush_stroke(Some(&base), &[pos2(10.0, 10.0)], 3.0, true, 20, 20)
+            .expect("まだ残っている");
+        assert!(!after.contains(10, 10), "消去した中心は選択から外れる");
+        assert!(after.contains(0, 0), "触っていない場所は残る");
+    }
+
+    #[test]
+    fn select_brush_erase_that_empties_the_mask_returns_none() {
+        // SPEC §51.2: 「マスクが空になったら選択解除」。
+        let base = rect_mask(IRect {
+            x0: 5,
+            y0: 5,
+            x1: 8,
+            y1: 8,
+        });
+        let after = apply_select_brush_stroke(Some(&base), &[pos2(6.5, 6.5)], 8.0, true, 20, 20);
+        assert!(after.is_none(), "空になったら None(= 選択解除)");
+    }
+
+    #[test]
+    fn select_brush_erase_tightens_the_bounding_box() {
+        // 横長の帯の右半分を消すと bbox も縮む(肥大化したまま残らない)。
+        let base = rect_mask(IRect {
+            x0: 0,
+            y0: 9,
+            x1: 20,
+            y1: 11,
+        });
+        let mut points = Vec::new();
+        for x in 10..=20 {
+            points.push(pos2(x as f32 + 0.5, 10.0));
+        }
+        let after = apply_select_brush_stroke(Some(&base), &points, 3.0, true, 20, 20)
+            .expect("左半分が残る");
+        assert!(after.bbox.x1 <= 10, "bbox が縮んでいる: {:?}", after.bbox);
+        assert!(after.contains(0, 9));
+    }
+
+    #[test]
+    fn select_brush_erase_without_any_selection_is_a_no_op() {
+        assert!(apply_select_brush_stroke(None, &[pos2(5.0, 5.0)], 4.0, true, 20, 20).is_none());
+    }
+
+    #[test]
+    fn select_brush_clips_to_the_document_and_does_not_panic() {
+        // 画像外へはみ出す点・巨大な半径・空の点列。
+        let outside = apply_select_brush_stroke(None, &[pos2(-50.0, -50.0)], 2.0, false, 20, 20);
+        assert!(outside.is_none(), "文書外だけのストロークは何も選択しない");
+
+        let huge = apply_select_brush_stroke(None, &[pos2(10.0, 10.0)], 10_000.0, false, 20, 20)
+            .expect("全面が選択される");
+        assert_eq!(
+            (huge.bbox.x0, huge.bbox.y0, huge.bbox.x1, huge.bbox.y1),
+            (0, 0, 20, 20)
+        );
+        assert!(apply_select_brush_stroke(None, &[], 4.0, false, 20, 20).is_none());
+        // 0×0 文書。
+        assert!(apply_select_brush_stroke(None, &[pos2(0.0, 0.0)], 4.0, false, 0, 0).is_none());
+    }
+
+    /// v12 §51.2(追いレビュー①): ポインタイベントが疎でも軌跡は途切れない
+    /// (記録点の間を `radius/2` 間隔で補間する)。
+    #[test]
+    fn select_brush_interpolates_between_sparse_drag_points() {
+        // 半径 2px・(2,10) → (18,10) の 1 区間だけ(補間が無いと中央が空く)。
+        let mask = brush_mask(&[pos2(2.0, 10.0), pos2(18.0, 10.0)], 2.0);
+        for x in 2..=18 {
+            assert!(mask.contains(x, 10), "x={x} が途切れている");
+        }
+    }
+
+    #[test]
+    fn select_brush_stamp_points_expand_and_stay_bounded() {
+        // 記録点間を max(1, radius/2) 間隔で分割する。
+        let expanded = select_brush_stamp_points(&[pos2(0.0, 0.0), pos2(10.0, 0.0)], 4.0);
+        assert_eq!(expanded.len(), 1 + 5, "10px を 2px 間隔 → 5 分割 + 始点");
+        assert_eq!(expanded[0], pos2(0.0, 0.0));
+        assert_eq!(*expanded.last().expect("非空"), pos2(10.0, 0.0));
+
+        // 単独の点はそのまま(補間しようがない)。
+        assert_eq!(select_brush_stamp_points(&[pos2(3.0, 4.0)], 2.0).len(), 1);
+        assert!(select_brush_stamp_points(&[], 2.0).is_empty());
+
+        // キャンバス外への極端なドラッグでも点列は上限で頭打ちになる。
+        let huge = select_brush_stamp_points(&[pos2(0.0, 0.0), pos2(10_000_000.0, 0.0)], 0.5);
+        assert!(
+            huge.len() <= 16_385,
+            "点列が無制限に伸びている: {}",
+            huge.len()
+        );
+    }
+
+    /// 文書外から文書内へ横切るストローク(補間点の大半がクリップされる)。
+    #[test]
+    fn select_brush_stroke_crossing_into_the_document_selects_only_inside_pixels() {
+        let mask = apply_select_brush_stroke(
+            None,
+            &[pos2(-30.0, 10.0), pos2(10.0, 10.0)],
+            2.0,
+            false,
+            20,
+            20,
+        )
+        .expect("文書内に入った分だけ選択される");
+        assert!(
+            mask.bbox.x0 >= 0,
+            "bbox が文書外へ出ていない: {:?}",
+            mask.bbox
+        );
+        assert!(mask.contains(0, 10));
+        assert!(mask.contains(10, 10));
+        assert!(!mask.contains(15, 10), "終点より先は選択されない");
+    }
+
+    /// 巨大半径のストロークでも文書全体で頭打ちになり、消去なら全解除になる。
+    #[test]
+    fn select_brush_with_a_huge_radius_covers_and_clears_the_whole_document() {
+        let all = apply_select_brush_stroke(None, &[pos2(10.0, 10.0)], 5_000.0, false, 20, 20)
+            .expect("全面");
+        assert_eq!((all.bbox.x1, all.bbox.y1), (20, 20));
+        let cleared =
+            apply_select_brush_stroke(Some(&all), &[pos2(10.0, 10.0)], 5_000.0, true, 20, 20);
+        assert!(cleared.is_none(), "全面消去で選択解除になる");
+    }
+
+    #[test]
+    fn select_brush_stroke_is_continuous_along_the_recorded_points() {
+        // 連続した点列(app.rs が半径/2 間隔で記録する)で切れ目なく塗れる。
+        let points: Vec<Pos2> = (0..10).map(|i| pos2(2.0 + i as f32, 10.0)).collect();
+        let mask = brush_mask(&points, 2.0);
+        for x in 2..=11 {
+            assert!(mask.contains(x, 10), "x={x} が塗れていない");
+        }
     }
 }
