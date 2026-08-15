@@ -462,6 +462,16 @@ SPEC.md「v4 拡張仕様」(§21〜§29)に対応。実装順は **性能基盤
   `total_ms` の 1 行目(後方互換)+ `phase\tms` 行に拡張する。
 - 最適化は計測結果に従う。候補: 設定/フォント読込の直列化解消(フォント読込 ~10MB を `std::thread::spawn` で window 作成と並行にし `App::new` で join)、初期 composite の二重計算排除、`lto = "fat"` の実測比較(改善しなければ thin のまま)。**目標: 中央値 160ms、必須 300ms**。効果がない最適化は入れない(計測値を deviations で報告)。
 
+### 16.2.1 v12 Phase 7 起動オプション再計測(2026-08-15、Windows)
+
+- 直近 release exe の初期 6 回は `settings 0ms`、`window/font 240〜270ms`、`app_new 257〜288ms`、`first_frame 266〜297ms`、`second_frame 280〜316ms`。フォント完了時刻は window と同値で、既存の並行読込に追加待ちはない。測定を重ねると GL/OS キャッシュとマシン負荷で control 自体が `window 163〜172ms`、`first_frame 190〜203ms` まで変動したため、候補ごとに release exe を固定し、control/candidate の順序を反転しながら交互実行して判定した。
+- **NativeOptions の MSAA/depth/stencil**: eframe 0.35.0 の既定値がすでに `multisampling=0`、`depth_buffer=0`、`stencil_buffer=0`。明示指定しても glutin へ渡る値が同一なので変更なし。
+- **`glow_options.vsync=false`**(各 n=8): control `window 163〜172ms`(中央値165)、`first_frame 190〜203ms`(192.5)に対し、candidate `window 162〜168ms`(165)、`first_frame 188〜198ms`(191)。支配的な window 中央値が同一で、初フレーム差 1.5ms は実行間の揺れ幅内のため不採用。
+- **`HardwareAcceleration::Required`**(各 n=8): 同じ control に対し、candidate `window 165〜169ms`(165.5)、`first_frame 191〜198ms`(192.5)。改善なしに加え、ソフトウェア fallback を失うため不採用。
+- **`run_and_return=false`**(各 n=12): control `window 164〜170ms`(166)、`first_frame 191〜200ms`(192.5)に対し、candidate `window 164〜172ms`(166)、`first_frame 189〜197ms`(193.5)。イベントループ方式を変えても改善しないため不採用。
+- **`default_fonts` 無効化**(各 n=12): control `window 163〜171ms`(165.5)、`app_new 181〜190ms`(183.5)、`first_frame 190〜199ms`(192.5)に対し、candidate `window 163〜176ms`(166.5)、`app_new 181〜194ms`(185)、`first_frame 190〜204ms`(193.5)。exe は 7,980,032 bytes から 6,561,280 bytes に縮小したが起動は改善せず、システム日本語フォント読込失敗時の fallback も失うため不採用。試行ビルドの `PrintWindow` は OpenGL クライアント領域を白く返し、`CopyFromScreen` も実行環境で失敗したため tofu の自動画像判定は未成立。feature は変更していない。
+- lock 済み描画スタックは `eframe/egui/egui_glow 0.35.0`、`glow 0.17.0`、`glutin 0.32.3`、`winit 0.30.13`。依存更新・追加は禁止条件のため変更せず、今回の計測では採用できる window フェーズ短縮策なし。production code の変更は行わず、この deviations 記録のみ残す。
+
 ## 16.3 マスク選択(§21〜22)
 
 ```rust
