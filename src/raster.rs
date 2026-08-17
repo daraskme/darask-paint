@@ -1300,12 +1300,110 @@ pub fn blit_rgba(
 }
 
 /// ソースを宛先の中央に置くための左上オフセット(大きい画像は負になり、
-/// `blit_rgba` がはみ出しをクリップする)。
+/// `blit_rgba` がはみ出しをクリップする)。ドロップ画像をクリップしたくない
+/// ときは先に `canvas_size_to_fit` で宛先を広げてから使う。
 pub fn centered_blit_offset(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (i32, i32) {
     (
         (dst_w as i32 - src_w as i32) / 2,
         (dst_h as i32 - src_h as i32) / 2,
     )
+}
+
+/// ソース画像をクリップせず載せるために必要なキャンバス寸法。
+pub fn canvas_size_to_fit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+    (dst_w.max(src_w), dst_h.max(src_h))
+}
+
+/// `origin` に置いたソースがキャンバスからはみ出すか。
+pub fn rect_overflows_canvas(
+    dst_w: u32,
+    dst_h: u32,
+    src_w: u32,
+    src_h: u32,
+    origin_x: i32,
+    origin_y: i32,
+) -> bool {
+    origin_x < 0
+        || origin_y < 0
+        || origin_x.saturating_add_unsigned(src_w) > dst_w as i32
+        || origin_y.saturating_add_unsigned(src_h) > dst_h as i32
+}
+
+/// キャンバスを広げたとき、旧キャンバスの外だけソースを戻す。
+/// 既に見えていた領域(左上の旧寸法)は描き直さない。
+pub fn reveal_extent_outside_old_canvas(
+    dst: &mut [u8],
+    dst_size: (u32, u32),
+    old_size: (u32, u32),
+    src: &[u8],
+    src_size: (u32, u32),
+    origin: (i32, i32),
+) {
+    let (dst_w, dst_h) = dst_size;
+    let (old_w, old_h) = old_size;
+    if dst_w > old_w {
+        copy_extent_rect(dst, dst_size, src, src_size, origin, old_w, 0, dst_w, dst_h);
+    }
+    if dst_h > old_h {
+        copy_extent_rect(
+            dst,
+            dst_size,
+            src,
+            src_size,
+            origin,
+            0,
+            old_h,
+            old_w.min(dst_w),
+            dst_h,
+        );
+    }
+}
+
+fn copy_extent_rect(
+    dst: &mut [u8],
+    dst_size: (u32, u32),
+    src: &[u8],
+    src_size: (u32, u32),
+    origin: (i32, i32),
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+) {
+    let (dst_w, dst_h) = dst_size;
+    let (src_w, src_h) = src_size;
+    let (ox, oy) = origin;
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 || x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let dst_len = (dst_w as usize)
+        .saturating_mul(dst_h as usize)
+        .saturating_mul(4);
+    let src_len = (src_w as usize)
+        .saturating_mul(src_h as usize)
+        .saturating_mul(4);
+    if dst.len() < dst_len || src.len() < src_len {
+        return;
+    }
+    let x0 = x0.min(dst_w);
+    let y0 = y0.min(dst_h);
+    let x1 = x1.min(dst_w);
+    let y1 = y1.min(dst_h);
+    for y in y0..y1 {
+        let sy = y as i32 - oy;
+        if sy < 0 || sy >= src_h as i32 {
+            continue;
+        }
+        for x in x0..x1 {
+            let sx = x as i32 - ox;
+            if sx < 0 || sx >= src_w as i32 {
+                continue;
+            }
+            let di = (y as usize * dst_w as usize + x as usize) * 4;
+            let si = (sy as usize * src_w as usize + sx as usize) * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3381,6 +3479,26 @@ mod tests {
         blit_rgba(&mut [], (1, 1), &[1, 2, 3, 4], (1, 1), (0, 0));
         assert_eq!(centered_blit_offset(8, 6, 4, 2), (2, 2));
         assert_eq!(centered_blit_offset(4, 4, 8, 6), (-2, -1));
+        assert_eq!(canvas_size_to_fit(4, 4, 8, 6), (8, 6));
+        assert_eq!(canvas_size_to_fit(8, 6, 4, 2), (8, 6));
+        assert!(rect_overflows_canvas(2, 2, 4, 2, -1, 0));
+        assert!(!rect_overflows_canvas(4, 4, 2, 2, 1, 1));
+    }
+
+    #[test]
+    fn reveal_extent_fills_only_the_new_canvas_margin() {
+        let src = [
+            10u8, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255, 50, 0, 0, 255, 60, 0, 0,
+            255, 70, 0, 0, 255, 80, 0, 0, 255,
+        ];
+        let mut dst = vec![9u8; 4 * 2 * 4];
+        for px in dst.chunks_exact_mut(4).take(2) {
+            px.copy_from_slice(&[8, 8, 8, 255]);
+        }
+        reveal_extent_outside_old_canvas(&mut dst, (4, 2), (2, 2), &src, (4, 2), (-1, 0));
+        assert_eq!(&dst[0..4], &[8, 8, 8, 255]);
+        assert_eq!(&dst[2 * 4..3 * 4], &[40, 0, 0, 255]);
+        assert_eq!(&dst[6 * 4..7 * 4], &[80, 0, 0, 255]);
     }
 
     #[test]

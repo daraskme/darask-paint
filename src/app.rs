@@ -4053,7 +4053,8 @@ impl DaraskApp {
     }
 
     /// ドロップした画像を、キャンバス中央に置いた新規レイヤーとして追加する
-    /// (1 undo 単位。はみ出しはクリップ。上限到達はトースト)。
+    /// (1 undo 単位。キャンバスは広げない。はみ出しは見えないがレイヤーに
+    /// 残し、あとからキャンバスを広げると現れる。上限到達はトースト)。
     fn add_image_file_as_layer(&mut self, path: PathBuf) {
         self.commit_open_gesture();
         if self.active_tab().doc.layers.len() >= MAX_LAYERS {
@@ -4106,10 +4107,19 @@ impl DaraskApp {
             (src_w, src_h),
             (ox, oy),
         );
+        let mut layer = Layer::from_pixels(name, pixels);
+        if raster::rect_overflows_canvas(dst_w, dst_h, src_w, src_h, ox, oy) {
+            layer.extent = Some(Box::new(crate::document::LayerExtent {
+                pixels: src_pixels,
+                width: src_w,
+                height: src_h,
+                x: ox,
+                y: oy,
+            }));
+        }
 
         let before_active = self.active_tab().doc.active_index();
         let insert_at = before_active + 1;
-        let layer = Layer::from_pixels(name, pixels);
         self.active_tab_mut().doc.layers.insert(insert_at, layer);
         self.active_tab_mut().doc.active = insert_at;
         self.active_tab_mut().doc.bump_content_gen();
@@ -5470,6 +5480,7 @@ impl DaraskApp {
                     blend: src.blend,
                     alpha_lock: src.alpha_lock,
                     pixels,
+                    extent: None,
                 });
             }
             tab.doc.active = saved_active;
@@ -9996,6 +10007,61 @@ mod tests {
         assert_eq!(
             &app.active_tab().doc.layers[1].pixels[(1 + 4) * 4..(2 + 4) * 4],
             &[255, 0, 0, 255]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_a_larger_raster_image_keeps_overflow_without_expanding_the_canvas() {
+        let dir = temp_dir_for_app_test("drop_keep_overflow");
+        let path = dir.join("wide.png");
+        let mut stamp = Document::new(4, 2, Background::Transparent);
+        stamp.layers[0].pixels = [
+            10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255, 50, 0, 0, 255, 60, 0, 0,
+            255, 70, 0, 0, 255, 80, 0, 0, 255,
+        ]
+        .to_vec();
+        stamp.mark_all_dirty();
+        io::save_image(&mut stamp, &path, SaveFormat::Png).expect("seed");
+
+        let mut app = new_for_test(Document::new(2, 2, Background::White));
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(path),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.handle_dropped_files(&ctx);
+        let _ = ctx.end_pass();
+
+        assert_eq!(app.active_tab().doc.width, 2);
+        assert_eq!(app.active_tab().doc.height, 2);
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        // 4×2 を 2×2 の中央へ置くと左上オフセットは (-1, 0)。見えるのは中央 2 列。
+        assert_eq!(
+            &app.active_tab().doc.layers[1].pixels[0..4],
+            &[20, 0, 0, 255]
+        );
+        assert_eq!(
+            &app.active_tab().doc.layers[1].pixels[1 * 4..2 * 4],
+            &[30, 0, 0, 255]
+        );
+        assert!(app.active_tab().doc.layers[1].extent.is_some());
+
+        app.confirm_canvas_resize(4, 2);
+        assert_eq!(app.active_tab().doc.width, 4);
+        assert_eq!(app.active_tab().doc.height, 2);
+        // 右へ広げた分だけ、残していた右端が見える。左のはみ出しは
+        // キャンバス原点が左上固定のため、まだキャンバス外。
+        assert_eq!(
+            &app.active_tab().doc.layers[1].pixels[2 * 4..3 * 4],
+            &[40, 0, 0, 255]
+        );
+        assert_eq!(
+            &app.active_tab().doc.layers[1].pixels[6 * 4..7 * 4],
+            &[80, 0, 0, 255]
         );
         let _ = std::fs::remove_dir_all(dir);
     }

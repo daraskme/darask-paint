@@ -32,12 +32,28 @@ fn main() {
             .unwrap_or_else(|e| panic!("{} の作成に失敗しました: {e}", dir.display()));
     }
 
-    let frames: Vec<IcoFrame<'static>> = SIZES
+    let images: Vec<(u32, Vec<u8>)> = SIZES
         .iter()
-        .map(|&size| {
-            let rgba = icon::generate_icon_rgba(size);
-            IcoFrame::as_png(&rgba, size, size, ExtendedColorType::Rgba8)
-                .unwrap_or_else(|e| panic!("{size}px フレームの PNG エンコードに失敗しました: {e}"))
+        .map(|&size| (size, icon::generate_icon_rgba(size)))
+        .collect();
+    let frames: Vec<IcoFrame<'_>> = images
+        .iter()
+        .map(|(size, rgba)| {
+            // 16〜48px は ICO 用 BMP。Explorer のファイルアイコンが
+            // PNG-only ICO を拾い損ねることがある。
+            if *size <= 48 {
+                IcoFrame::with_encoded(
+                    encode_ico_bmp_bgra(rgba, *size),
+                    *size,
+                    *size,
+                    ExtendedColorType::Rgba8,
+                )
+                .unwrap_or_else(|e| panic!("{size}px フレームの BMP 化に失敗しました: {e}"))
+            } else {
+                IcoFrame::as_png(rgba, *size, *size, ExtendedColorType::Rgba8).unwrap_or_else(|e| {
+                    panic!("{size}px フレームの PNG エンコードに失敗しました: {e}")
+                })
+            }
         })
         .collect();
 
@@ -52,4 +68,33 @@ fn main() {
         out_path.display(),
         SIZES.len()
     );
+}
+
+/// ICO 内の 32bpp BMP(BITMAPINFOHEADER + 下から上の BGRA + AND マスク)。
+fn encode_ico_bmp_bgra(rgba: &[u8], size: u32) -> Vec<u8> {
+    let xor_len = (size as usize)
+        .saturating_mul(size as usize)
+        .saturating_mul(4);
+    let and_row = ((size + 31) / 32) * 4;
+    let and_len = (and_row as usize).saturating_mul(size as usize);
+    let mut out = Vec::with_capacity(40 + xor_len + and_len);
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(size as i32).to_le_bytes());
+    out.extend_from_slice(&((size * 2) as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(xor_len as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    for y in (0..size).rev() {
+        for x in 0..size {
+            let i = ((y * size + x) * 4) as usize;
+            out.push(rgba[i + 2]);
+            out.push(rgba[i + 1]);
+            out.push(rgba[i]);
+            out.push(rgba[i + 3]);
+        }
+    }
+    out.resize(out.len() + and_len, 0);
+    out
 }

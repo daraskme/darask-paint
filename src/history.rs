@@ -930,6 +930,7 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
                     blend: *blend,
                     alpha_lock: *alpha_lock,
                     pixels: vec![0u8; width as usize * height as usize * 4],
+                    extent: None,
                 },
             );
             doc.active = idx;
@@ -984,6 +985,7 @@ fn apply_after(doc: &mut Document, op: &HistoryOp) {
                     blend: *merged_blend,
                     alpha_lock: *merged_alpha_lock,
                     pixels: merged,
+                    extent: None,
                 };
             }
             if *index < doc.layers.len() {

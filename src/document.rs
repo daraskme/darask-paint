@@ -426,6 +426,19 @@ pub struct Layer {
     pub alpha_lock: bool,
     /// `len() == width as usize * height as usize * 4`
     pub pixels: Vec<u8>,
+    /// キャンバスより大きい内容(ドロップ画像など)。キャンバスとの交差だけ
+    /// `pixels` に見え、キャンバスを広げたときに残りを戻す。
+    pub extent: Option<Box<LayerExtent>>,
+}
+
+/// キャンバス外にはみ出したレイヤー内容。原点はドキュメント座標。
+#[derive(Clone)]
+pub struct LayerExtent {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
 }
 
 impl Layer {
@@ -445,6 +458,7 @@ impl Layer {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels,
+            extent: None,
         }
     }
 
@@ -460,6 +474,7 @@ impl Layer {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels,
+            extent: None,
         }
     }
 }
@@ -828,6 +843,7 @@ impl Document {
         let w = self.width;
         for layer in &mut self.layers {
             flip_horizontal_buffer(&mut layer.pixels, w);
+            layer.extent = None;
         }
         self.mark_all_dirty();
         self.bump_content_gen();
@@ -838,6 +854,7 @@ impl Document {
         let (w, h) = (self.width, self.height);
         for layer in &mut self.layers {
             flip_vertical_buffer(&mut layer.pixels, w, h);
+            layer.extent = None;
         }
         self.mark_all_dirty();
         self.bump_content_gen();
@@ -848,6 +865,7 @@ impl Document {
         let (w, h) = (self.width, self.height);
         for layer in &mut self.layers {
             layer.pixels = rotate_cw_buffer(w, h, &layer.pixels);
+            layer.extent = None;
         }
         self.width = h;
         self.height = w;
@@ -861,6 +879,7 @@ impl Document {
         let (w, h) = (self.width, self.height);
         for layer in &mut self.layers {
             layer.pixels = rotate_ccw_buffer(w, h, &layer.pixels);
+            layer.extent = None;
         }
         self.width = h;
         self.height = w;
@@ -874,6 +893,7 @@ impl Document {
         let (w, h) = (self.width, self.height);
         for layer in &mut self.layers {
             layer.pixels = resize_buffer(w, h, &layer.pixels, new_width, new_height, interp);
+            layer.extent = None;
         }
         self.width = new_width;
         self.height = new_height;
@@ -888,6 +908,16 @@ impl Document {
         let (w, h) = (self.width, self.height);
         for layer in &mut self.layers {
             layer.pixels = resize_canvas_buffer(w, h, &layer.pixels, new_width, new_height);
+            if let Some(ext) = layer.extent.as_ref() {
+                raster::reveal_extent_outside_old_canvas(
+                    &mut layer.pixels,
+                    (new_width, new_height),
+                    (w, h),
+                    &ext.pixels,
+                    (ext.width, ext.height),
+                    (ext.x, ext.y),
+                );
+            }
         }
         self.width = new_width;
         self.height = new_height;
@@ -905,6 +935,10 @@ impl Document {
         let new_h = rect.height() as u32;
         for layer in &mut self.layers {
             layer.pixels = crop_buffer(w, h, &layer.pixels, rect);
+            if let Some(ext) = layer.extent.as_mut() {
+                ext.x -= rect.x0;
+                ext.y -= rect.y0;
+            }
         }
         self.width = new_w;
         self.height = new_h;
@@ -1670,6 +1704,7 @@ mod tests {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels: vec![10, 20, 30, 255],
+            extent: None,
         };
         let top = Layer {
             uid: next_layer_uid(),
@@ -1679,6 +1714,7 @@ mod tests {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels: vec![200, 210, 220, 255],
+            extent: None,
         };
         let doc = Document::try_from_snapshot_owned(
             DocSnapshot {
@@ -2351,6 +2387,28 @@ mod tests {
         let mut doc = Document::new(0, 0, Background::Transparent);
         doc.resize(4, 4, Interpolation::Bilinear);
         assert_eq!(doc.active_pixels().len(), 4 * 4 * 4);
+    }
+
+    #[test]
+    fn resize_canvas_reveals_kept_layer_extent_in_the_new_margin() {
+        let mut doc = Document::new(2, 2, Background::Transparent);
+        doc.layers[0].pixels =
+            [20, 0, 0, 255, 30, 0, 0, 255, 60, 0, 0, 255, 70, 0, 0, 255].to_vec();
+        doc.layers[0].extent = Some(Box::new(LayerExtent {
+            pixels: [
+                10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255, 50, 0, 0, 255, 60, 0,
+                0, 255, 70, 0, 0, 255, 80, 0, 0, 255,
+            ]
+            .to_vec(),
+            width: 4,
+            height: 2,
+            x: -1,
+            y: 0,
+        }));
+        doc.resize_canvas(4, 2);
+        assert_eq!(doc.layers[0].pixels[0..4], [20, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels[2 * 4..3 * 4], [40, 0, 0, 255]);
+        assert_eq!(doc.layers[0].pixels[6 * 4..7 * 4], [80, 0, 0, 255]);
     }
 
     #[test]

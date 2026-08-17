@@ -154,7 +154,7 @@ pub struct Floating {
 - `.dpaint` は `project.rs` が現在レイヤー+全 `HistoryEntry` を保存する。画像形式はflatten exportのまま。
 - ダイアログ: `rfd::FileDialog`(ブロッキングで良い。ネイティブモーダルなので UI スレッドで可)。フィルタ設定必須。
 - クリップボード: `arboard::Clipboard`、`get_image`/`set_image`(RGBA)。失敗はトーストで通知。
-- D&D: `ctx.input(|i| i.raw.dropped_files)` → 画像は新規レイヤー、`.dpaint` は新規タブ、フォルダはページ集。
+- D&D: `ctx.input(|i| i.raw.dropped_files)` → 画像は新規レイヤー(キャンバスは広げず、はみ出しはレイヤーに保持)、`.dpaint` は新規タブ、フォルダはページ集。
 - 未保存ガードは app.rs の `pending_action: Option<PendingAction>`(New/Open(path?)/Close)+確認モーダルの状態機械で一元化。
 
 ## 9. フォント(日本語表示の必須要件)

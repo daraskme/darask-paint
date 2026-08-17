@@ -1123,6 +1123,7 @@ fn decode_layer(
             blend,
             alpha_lock,
             pixels,
+            extent: None,
         },
         width,
         height,
@@ -2449,6 +2450,7 @@ mod tests {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels: vec![0; 4 * 3 * 4],
+            extent: None,
         });
         doc.active = 1;
         let baseline = doc.snapshot();
@@ -2639,6 +2641,7 @@ mod tests {
             blend: BlendMode::Normal,
             alpha_lock: false,
             pixels: merged,
+            extent: None,
         };
         doc.layers.remove(1);
         doc.active = 0;
