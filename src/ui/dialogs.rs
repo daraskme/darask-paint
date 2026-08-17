@@ -366,8 +366,8 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
     outcome
 }
 
-/// SPEC §34/ARCHITECTURE.md §18.2: 「設定(環境設定)」ダイアログ。最小構成
-/// として「履歴パネルの表示件数」(1–500、既定 50)の数値入力のみを持つ。
+/// SPEC §34/§55.1: 「設定(環境設定)」ダイアログ。履歴パネルの表示件数
+/// (1–500、既定 50)とプラグインポート(IOpaint / AI Diffusion)を持つ。
 /// `New`/`ImageResize` 等と同じ「ドラフト値を `&mut` で受け取り、OK/
 /// キャンセルで呼び出し側(app.rs)が確定/破棄する」パターン(`ModalState::
 /// Preferences` のドラフト値をそのまま渡す)。

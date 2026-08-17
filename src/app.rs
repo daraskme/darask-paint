@@ -4465,6 +4465,23 @@ impl DaraskApp {
         }
     }
 
+    /// 「フォルダをページとして開く」直後の未保存確認キャンセル・書き出し
+    /// 中止・先頭ページ読込失敗でも、ページ集の紐付け自体は残す
+    /// (SPEC §54: 失敗・キャンセル時は現在ページに留まる。紐付けは維持)。
+    /// 内容の置換はしていないので `pages.current` は列挙時の値のまま。
+    fn keep_pending_page_set_on_tab(&mut self, tab_uid: u64) {
+        if let Some((_, pages)) = self
+            .pending_page_set
+            .take()
+            .filter(|(uid, _)| *uid == tab_uid)
+        {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.uid == tab_uid) {
+                tab.pages = Some(pages);
+                self.prune_page_thumbnails();
+            }
+        }
+    }
+
     /// どのタブのページ集にも属さなくなったサムネイルを破棄する
     /// (SPEC §54 のサムネイルキャッシュ。ページ集の張り替え・タブを閉じる・
     /// パスの切り離しで呼ぶ。毎フレームではなく**ページ集が変わったときだけ**
@@ -4496,13 +4513,7 @@ impl DaraskApp {
         let doc = match load_page_document(&path) {
             Ok(doc) => doc,
             Err(error) => {
-                if self
-                    .pending_page_set
-                    .as_ref()
-                    .is_some_and(|(uid, _)| *uid == tab_uid)
-                {
-                    self.pending_page_set = None;
-                }
+                self.keep_pending_page_set_on_tab(tab_uid);
                 self.show_toast(format!("ページを開けませんでした: {error}"));
                 return;
             }
@@ -4902,13 +4913,7 @@ impl DaraskApp {
 
     fn abort_after_save_action(&mut self) {
         if let Some(PendingAction::SwitchPage { tab_uid, .. }) = self.after_save_action.take() {
-            if self
-                .pending_page_set
-                .as_ref()
-                .is_some_and(|(pending_uid, _)| *pending_uid == tab_uid)
-            {
-                self.pending_page_set = None;
-            }
+            self.keep_pending_page_set_on_tab(tab_uid);
         }
     }
 
@@ -4919,8 +4924,8 @@ impl DaraskApp {
     }
 
     fn confirm_unsaved_cancel(&mut self) {
-        if matches!(self.pending_action, Some(PendingAction::SwitchPage { .. })) {
-            self.pending_page_set = None;
+        if let Some(PendingAction::SwitchPage { tab_uid, .. }) = self.pending_action {
+            self.keep_pending_page_set_on_tab(tab_uid);
         }
         self.pending_action = None;
     }
@@ -15686,6 +15691,96 @@ mod tests {
         assert_eq!(
             app.active_tab().pages.as_ref().map(|pages| pages.current),
             Some(0)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_folder_as_pages_keeps_the_set_when_unsaved_switch_is_cancelled() {
+        let dir = temp_dir_for_app_test("pages_open_cancel");
+        let first = dir.join("1.png");
+        let second = dir.join("2.png");
+        for path in [&first, &second] {
+            io::save_image(
+                &mut Document::new(3, 3, Background::White),
+                path,
+                SaveFormat::Png,
+            )
+            .expect("seed page should save");
+        }
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.active_tab_mut().doc.modified = true;
+        app.open_folder_as_pages(dir.clone());
+        assert!(matches!(app.modal, Some(ModalState::ConfirmUnsaved)));
+        assert!(app.pending_page_set.is_some());
+
+        app.confirm_unsaved_cancel();
+
+        assert_eq!(app.active_tab().doc.width, 8);
+        assert!(app.active_tab().doc.modified);
+        assert!(app.pending_page_set.is_none());
+        assert_eq!(
+            app.active_tab()
+                .pages
+                .as_ref()
+                .map(|pages| pages.entries.len()),
+            Some(2),
+            "キャンセルしてもフォルダのページ集はタブに残す"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_folder_as_pages_keeps_the_set_when_first_page_fails_to_load() {
+        let dir = temp_dir_for_app_test("pages_open_bad_first");
+        std::fs::write(dir.join("1.png"), b"not an image").expect("bad page should be written");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &dir.join("2.png"),
+            SaveFormat::Png,
+        )
+        .expect("seed page should save");
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.open_folder_as_pages(dir.clone());
+
+        assert_eq!(
+            app.active_tab().doc.width,
+            8,
+            "読込失敗では内容を置き換えない"
+        );
+        assert!(app.pending_page_set.is_none());
+        assert_eq!(
+            app.active_tab()
+                .pages
+                .as_ref()
+                .map(|pages| pages.entries.len()),
+            Some(2),
+            "先頭ページが壊れてもページ集は残し、他ページへ移れるようにする"
+        );
+        assert!(app.toast.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn abort_after_export_keeps_pending_page_set_on_the_tab() {
+        let dir = temp_dir_for_app_test("pages_open_export_abort");
+        io::save_image(
+            &mut Document::new(3, 3, Background::White),
+            &dir.join("1.png"),
+            SaveFormat::Png,
+        )
+        .expect("seed page should save");
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.active_tab_mut().doc.modified = true;
+        app.open_folder_as_pages(dir.clone());
+        app.confirm_unsaved_save();
+        app.abort_after_save_action();
+
+        assert_eq!(app.active_tab().doc.width, 8);
+        assert!(app.pending_page_set.is_none());
+        assert!(
+            app.active_tab().pages.is_some(),
+            "書き出し中止でもページ集の紐付けは残す"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
