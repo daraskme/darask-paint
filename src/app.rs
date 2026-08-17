@@ -4027,10 +4027,8 @@ impl DaraskApp {
         Some(message.clone())
     }
 
-    /// D&D でファイルが落とされたら新規タブとして開く(SPEC §30: 「ドラッグ
-    /// &ドロップ…からのオープンも同じ規則に従う。複数ファイルを同時ドロップ
-    /// した場合は複数タブを開く」)。新規タブの追加は既存タブを破壊しない
-    /// ため、v1〜v4 と異なり未保存ガードは不要(`open_path_in_new_tab` 参照)。
+    /// D&D: 画像はアクティブタブへ新規レイヤーとして追加し、`.dpaint` は
+    /// 従来どおり新規タブ、フォルダはページ集(SPEC §8 / §30 / §54)。
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if self.modal.is_some() {
@@ -4044,10 +4042,86 @@ impl DaraskApp {
         for path in dropped.into_iter().filter_map(|f| f.path) {
             if path.is_dir() {
                 self.open_folder_as_pages(path);
-            } else {
+            } else if matches!(io::format_for_path(&path), Some(SaveFormat::Project)) {
                 self.open_path_in_new_tab(path);
+            } else if io::is_raster_image_path(&path) {
+                self.add_image_file_as_layer(path);
+            } else {
+                self.show_toast("対応していないファイルです".to_owned());
             }
         }
+    }
+
+    /// ドロップした画像を、キャンバス中央に置いた新規レイヤーとして追加する
+    /// (1 undo 単位。はみ出しはクリップ。上限到達はトースト)。
+    fn add_image_file_as_layer(&mut self, path: PathBuf) {
+        self.commit_open_gesture();
+        if self.active_tab().doc.layers.len() >= MAX_LAYERS {
+            self.show_toast(format!("レイヤーの上限({MAX_LAYERS}枚)に達しています"));
+            return;
+        }
+        match io::load_image(&path) {
+            Ok(src) => {
+                let (src_w, src_h) = (src.width, src.height);
+                let Some(src_layer) = src.layers.into_iter().next() else {
+                    return;
+                };
+                self.insert_raster_as_new_layer(
+                    layer_name_from_path(&path),
+                    src_w,
+                    src_h,
+                    src_layer.pixels,
+                );
+            }
+            Err(e) => self.show_toast(format!("追加できませんでした: {e}")),
+        }
+    }
+
+    fn insert_raster_as_new_layer(
+        &mut self,
+        name: String,
+        src_w: u32,
+        src_h: u32,
+        src_pixels: Vec<u8>,
+    ) {
+        self.commit_open_gesture();
+        if self.active_tab().doc.layers.len() >= MAX_LAYERS {
+            self.show_toast(format!("レイヤーの上限({MAX_LAYERS}枚)に達しています"));
+            return;
+        }
+        let (dst_w, dst_h) = (self.active_tab().doc.width, self.active_tab().doc.height);
+        let Some(pixel_len) = (dst_w as usize)
+            .checked_mul(dst_h as usize)
+            .and_then(|count| count.checked_mul(4))
+        else {
+            self.show_toast("レイヤーを追加できませんでした".to_owned());
+            return;
+        };
+        let mut pixels = vec![0u8; pixel_len];
+        let (ox, oy) = raster::centered_blit_offset(dst_w, dst_h, src_w, src_h);
+        raster::blit_rgba(
+            &mut pixels,
+            (dst_w, dst_h),
+            &src_pixels,
+            (src_w, src_h),
+            (ox, oy),
+        );
+
+        let before_active = self.active_tab().doc.active_index();
+        let insert_at = before_active + 1;
+        let layer = Layer::from_pixels(name, pixels);
+        self.active_tab_mut().doc.layers.insert(insert_at, layer);
+        self.active_tab_mut().doc.active = insert_at;
+        self.active_tab_mut().doc.bump_content_gen();
+        let stored = self.active_tab().doc.layers[insert_at].clone();
+        self.push_layer_history(
+            HistoryOp::DuplicateLayer {
+                index: insert_at,
+                layer: stored,
+                before_active,
+            },
+            "画像をレイヤーに追加",
+        );
     }
 
     /// ウィンドウの閉じる要求(SPEC §8: 未保存変更ガード、v5 §17.4: 「タブ
@@ -7661,6 +7735,20 @@ fn normalize_path_for_compare(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn layer_name_from_path(path: &Path) -> String {
+    match path.file_stem() {
+        Some(stem) => {
+            let name = stem.to_string_lossy();
+            if name.is_empty() {
+                "レイヤー".to_owned()
+            } else {
+                name.into_owned()
+            }
+        }
+        None => "レイヤー".to_owned(),
+    }
+}
+
 fn load_page_document(path: &Path) -> Result<Document, String> {
     if matches!(io::format_for_path(path), Some(SaveFormat::Project)) {
         crate::project::load(path).map(|(doc, _history)| doc)
@@ -9862,6 +9950,102 @@ mod tests {
             .is_some_and(|(message, _)| { message.contains("ダイアログを閉じてから") }));
     }
 
+    #[test]
+    fn dropping_a_raster_image_adds_it_as_a_centered_layer() {
+        let dir = temp_dir_for_app_test("drop_as_layer");
+        let path = dir.join("stamp.png");
+        let mut stamp = Document::new(2, 2, Background::Transparent);
+        stamp.layers[0].pixels = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ]
+        .to_vec();
+        stamp.mark_all_dirty();
+        io::save_image(&mut stamp, &path, SaveFormat::Png).expect("seed");
+
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(path),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.handle_dropped_files(&ctx);
+        let _ = ctx.end_pass();
+
+        assert_eq!(app.tabs.len(), 1, "画像ドロップはタブを増やさない");
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(app.active_tab().doc.layers[1].name, "stamp");
+        assert_eq!(app.active_tab().doc.active, 1);
+        let layer = &app.active_tab().doc.layers[1];
+        // 4×4 の中央 2×2 に載る。
+        assert_eq!(&layer.pixels[(1 + 4) * 4..(2 + 4) * 4], &[255, 0, 0, 255]);
+        assert_eq!(&layer.pixels[0..4], &[0, 0, 0, 0]);
+        assert!(app.active_tab().doc.modified);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.undo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert!({
+            let tab = app.active_tab_mut();
+            tab.history.redo(&mut tab.doc)
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+        assert_eq!(
+            &app.active_tab().doc.layers[1].pixels[(1 + 4) * 4..(2 + 4) * 4],
+            &[255, 0, 0, 255]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_a_project_file_still_opens_a_new_tab() {
+        let dir = temp_dir_for_app_test("drop_project_tab");
+        let path = dir.join("page.dpaint");
+        let doc = Document::new(3, 3, Background::White);
+        crate::project::save(&doc, &History::new(), &path).expect("seed project");
+
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(path.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.handle_dropped_files(&ctx);
+        let _ = ctx.end_pass();
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().doc.path.as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_an_unsupported_file_shows_a_toast_and_does_not_add_a_layer() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(PathBuf::from("notes.txt")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.handle_dropped_files(&ctx);
+        let _ = ctx.end_pass();
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("対応していない")));
+    }
+
     // -- モーダル表示中の閉じる要求が握りつぶされるバグ(修正済み) -----------
 
     #[test]
@@ -11707,8 +11891,8 @@ mod tests {
              precondition)"
         );
 
-        // D&D・「開く」ダイアログ・最近使ったファイルはすべて
-        // `open_path_in_new_tab` を通る(ここで直接駆動する)。
+        // 「開く」ダイアログ・最近使ったファイル・`.dpaint` の D&D は
+        // `open_path_in_new_tab` を通る(画像の D&D は新規レイヤー追加)。
         app.open_path_in_new_tab(path.clone());
 
         assert!(

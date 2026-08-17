@@ -3,9 +3,9 @@
 //!
 //! `cargo run --example gen_icon` で `assets/icon.ico`(16/24/32/48/64/128/256px
 //! を含むマルチサイズ ICO)を再生成し、リポジトリにコミットする。絵は
-//! `src/icon.rs` の `generate_icon_rgba` を `#[path]` でそのまま取り込んで
-//! 使うため、`build.rs`(exe への埋め込み)・`main.rs`(ウィンドウ/タスクバー
-//! アイコン)と完全に同じ見た目になる。
+//! `src/icon.rs` の `generate_icon_rgba`(`assets/icon-256.png` を縮小して
+//! 角丸マスク)を `#[path]` で取り込むため、`build.rs`・`main.rs` と
+//! 同じ見た目になる。
 //!
 //! これは開発者がローカルで手動実行する生成ツールであり、配布される
 //! アプリ本体の実行経路には含まれない。そのため CLAUDE.md「I/O・ユーザー

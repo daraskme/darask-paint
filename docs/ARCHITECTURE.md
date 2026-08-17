@@ -154,7 +154,7 @@ pub struct Floating {
 - `.dpaint` は `project.rs` が現在レイヤー+全 `HistoryEntry` を保存する。画像形式はflatten exportのまま。
 - ダイアログ: `rfd::FileDialog`(ブロッキングで良い。ネイティブモーダルなので UI スレッドで可)。フィルタ設定必須。
 - クリップボード: `arboard::Clipboard`、`get_image`/`set_image`(RGBA)。失敗はトーストで通知。
-- D&D: `ctx.input(|i| i.raw.dropped_files)` → 未保存ガードを通して open。
+- D&D: `ctx.input(|i| i.raw.dropped_files)` → 画像は新規レイヤー、`.dpaint` は新規タブ、フォルダはページ集。
 - 未保存ガードは app.rs の `pending_action: Option<PendingAction>`(New/Open(path?)/Close)+確認モーダルの状態機械で一元化。
 
 ## 9. フォント(日本語表示の必須要件)
@@ -515,7 +515,7 @@ pub struct Floating {
 - `.github/workflows/ci.yml`: `on: [push(main), pull_request]`、`runs-on: windows-latest`、`dtolnay/rust-toolchain@stable`(components: clippy, rustfmt)、`Swatinem/rust-cache@v2`、steps: fmt → clippy(`-D warnings`)→ build --release → test --release。別ジョブ `bench-smoke`(`continue-on-error: true`、DARASK_BENCH=1 で release exe 起動→bench.txt を表示)。
 - `.github/workflows/release.yml`: `on: push: tags: ['v*']`、ビルド → `Compress-Archive` で `darask-paint-v{ver}-windows-x64.zip` → `softprops/action-gh-release@v2` で Release 作成(`generate_release_notes: true`)。
 - **clippy 全解消**を CI 追加前に行う(`cargo clippy --all-targets -- -D warnings` をローカルでグリーンに。無意味な lint は根拠コメント付きで `#[allow]` 可、乱用禁止)。
-- アイコン: `examples/gen_icon.rs`(image crate の ico エンコーダ。Cargo.toml の image に `ico` feature 追加)で 16/24/32/48/64/128/256px を含む `assets/icon.ico` を生成しコミット。デザインは「角丸正方形+筆のストローク」程度のシンプルな図形(コードで描く)。`build.rs` + `[build-dependencies] winresource` で exe に埋め込み、eframe の `viewport.with_icon` にも同じ絵(生成関数を共有)を設定。
+- アイコン: 元絵は `assets/icon-256.png`。`src/icon.rs` が任意サイズへ縮小して角丸マスクをかけ、`examples/gen_icon.rs`(image crate の ico エンコーダ。Cargo.toml の image に `ico` feature 追加)で 16/24/32/48/64/128/256px を含む `assets/icon.ico` を生成しコミット。`build.rs` + `[build-dependencies] winresource` で exe に埋め込み、eframe の `viewport.with_icon` にも同じ絵(生成関数を共有)を設定。
 - `Cargo.toml` version = "0.4.0"。ヘルプ > バージョン情報 モーダル(版数・リポジトリ URL 表示)。
 - CI の YAML はローカル検証できないため、**構文をシンプルに保ち**、push 後の初回実行結果で修正する前提(メインループ側=Fable が監視・修正指示)。
 

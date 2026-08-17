@@ -1249,6 +1249,65 @@ pub fn thumbnail_rgba(
     (tw, th, out)
 }
 
+/// ソース画像を宛先バッファへ上書きコピーする(アルファ合成しない)。
+/// 宛先外にはみ出した画素は捨て、寸法 0 や長さ不足では何もしない
+/// (パニックしない)。
+pub fn blit_rgba(
+    dst: &mut [u8],
+    dst_size: (u32, u32),
+    src: &[u8],
+    src_size: (u32, u32),
+    dest: (i32, i32),
+) {
+    let (dst_w, dst_h) = dst_size;
+    let (src_w, src_h) = src_size;
+    let (dest_x, dest_y) = dest;
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+        return;
+    }
+    let dst_expected = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|count| count.checked_mul(4));
+    let src_expected = (src_w as usize)
+        .checked_mul(src_h as usize)
+        .and_then(|count| count.checked_mul(4));
+    let (Some(dst_len), Some(src_len)) = (dst_expected, src_expected) else {
+        return;
+    };
+    if dst.len() < dst_len || src.len() < src_len {
+        return;
+    }
+
+    let src_x0 = dest_x.max(0);
+    let src_y0 = dest_y.max(0);
+    let src_x1 = dest_x.saturating_add_unsigned(src_w).min(dst_w as i32);
+    let src_y1 = dest_y.saturating_add_unsigned(src_h).min(dst_h as i32);
+    if src_x0 >= src_x1 || src_y0 >= src_y1 {
+        return;
+    }
+
+    for y in src_y0..src_y1 {
+        let sy = (y - dest_y) as u32;
+        let dst_row = y as usize * dst_w as usize;
+        let src_row = sy as usize * src_w as usize;
+        for x in src_x0..src_x1 {
+            let sx = (x - dest_x) as u32;
+            let di = (dst_row + x as usize) * 4;
+            let si = (src_row + sx as usize) * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+}
+
+/// ソースを宛先の中央に置くための左上オフセット(大きい画像は負になり、
+/// `blit_rgba` がはみ出しをクリップする)。
+pub fn centered_blit_offset(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (i32, i32) {
+    (
+        (dst_w as i32 - src_w as i32) / 2,
+        (dst_h as i32 - src_h as i32) / 2,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3294,6 +3353,34 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "4000x4000 のサムネイル 1 枚が {elapsed:?} もかかっている"
         );
+    }
+
+    #[test]
+    fn blit_rgba_copies_pixels_and_clips_to_the_destination() {
+        let src = [10u8, 20, 30, 255, 40, 50, 60, 128];
+        let mut dst = vec![0u8; 3 * 2 * 4];
+        blit_rgba(&mut dst, (3, 2), &src, (2, 1), (1, 1));
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&dst[(1 + 3) * 4..(2 + 3) * 4], &[10, 20, 30, 255]);
+        assert_eq!(&dst[(2 + 3) * 4..(3 + 3) * 4], &[40, 50, 60, 128]);
+    }
+
+    #[test]
+    fn blit_rgba_negative_offset_clips_the_source_origin() {
+        let src = [1u8, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        let mut dst = vec![0u8; 4];
+        blit_rgba(&mut dst, (1, 1), &src, (2, 2), (-1, -1));
+        assert_eq!(dst, [10, 11, 12, 255]);
+    }
+
+    #[test]
+    fn blit_rgba_rejects_degenerate_inputs_without_panicking() {
+        let mut dst = vec![0u8; 4];
+        blit_rgba(&mut dst, (0, 1), &[1, 2, 3, 4], (1, 1), (0, 0));
+        blit_rgba(&mut dst, (1, 1), &[], (1, 1), (0, 0));
+        blit_rgba(&mut [], (1, 1), &[1, 2, 3, 4], (1, 1), (0, 0));
+        assert_eq!(centered_blit_offset(8, 6, 4, 2), (2, 2));
+        assert_eq!(centered_blit_offset(4, 4, 8, 6), (-2, -1));
     }
 
     #[test]

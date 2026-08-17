@@ -50,6 +50,19 @@ pub enum SaveFormat {
 /// 拡張子を補う、`ensure_png_extension` 参照)。JPEG の品質は呼び出し側が
 /// 別途 UI から与えるため、ここでは常に `quality: 90`(デフォルト値、
 /// SPEC §8)を仮で入れておく。
+/// ドラッグ&ドロップで「新規レイヤーとして追加」できる画像拡張子
+/// (SPEC §8。GIF/WebP は読み込み専用なので `format_for_path` には含めない)。
+pub fn is_raster_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp"
+            )
+        })
+}
+
 pub fn format_for_path(path: &Path) -> Option<SaveFormat> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
@@ -318,6 +331,19 @@ mod tests {
             Some(SaveFormat::Jpeg { .. })
         ));
         assert_eq!(format_for_path(Path::new("a.bmp")), Some(SaveFormat::Bmp));
+    }
+
+    #[test]
+    fn is_raster_image_path_accepts_openable_image_extensions() {
+        for name in ["a.png", "a.JPG", "a.jpeg", "a.bmp", "a.gif", "a.webp"] {
+            assert!(
+                is_raster_image_path(Path::new(name)),
+                "{name} should be a droppable raster image"
+            );
+        }
+        assert!(!is_raster_image_path(Path::new("a.dpaint")));
+        assert!(!is_raster_image_path(Path::new("a.txt")));
+        assert!(!is_raster_image_path(Path::new("a")));
     }
 
     #[test]
