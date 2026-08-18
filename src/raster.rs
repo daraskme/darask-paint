@@ -1300,8 +1300,7 @@ pub fn blit_rgba(
 }
 
 /// ソースを宛先の中央に置くための左上オフセット(大きい画像は負になり、
-/// `blit_rgba` がはみ出しをクリップする)。ドロップ画像をクリップしたくない
-/// ときは先に `canvas_size_to_fit` で宛先を広げてから使う。
+/// `blit_rgba` がはみ出しをクリップする)。
 pub fn centered_blit_offset(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (i32, i32) {
     (
         (dst_w as i32 - src_w as i32) / 2,
@@ -1310,7 +1309,8 @@ pub fn centered_blit_offset(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (
 }
 
 /// ソース画像をクリップせず載せるために必要なキャンバス寸法。
-pub fn canvas_size_to_fit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
+#[cfg(test)]
+fn canvas_size_to_fit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {
     (dst_w.max(src_w), dst_h.max(src_h))
 }
 
@@ -1342,7 +1342,14 @@ pub fn reveal_extent_outside_old_canvas(
     let (dst_w, dst_h) = dst_size;
     let (old_w, old_h) = old_size;
     if dst_w > old_w {
-        copy_extent_rect(dst, dst_size, src, src_size, origin, old_w, 0, dst_w, dst_h);
+        copy_extent_rect(
+            dst,
+            dst_size,
+            src,
+            src_size,
+            origin,
+            (old_w, 0, dst_w, dst_h),
+        );
     }
     if dst_h > old_h {
         copy_extent_rect(
@@ -1351,10 +1358,7 @@ pub fn reveal_extent_outside_old_canvas(
             src,
             src_size,
             origin,
-            0,
-            old_h,
-            old_w.min(dst_w),
-            dst_h,
+            (0, old_h, old_w.min(dst_w), dst_h),
         );
     }
 }
@@ -1365,14 +1369,12 @@ fn copy_extent_rect(
     src: &[u8],
     src_size: (u32, u32),
     origin: (i32, i32),
-    x0: u32,
-    y0: u32,
-    x1: u32,
-    y1: u32,
+    rect: (u32, u32, u32, u32),
 ) {
     let (dst_w, dst_h) = dst_size;
     let (src_w, src_h) = src_size;
     let (ox, oy) = origin;
+    let (x0, y0, x1, y1) = rect;
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 || x0 >= x1 || y0 >= y1 {
         return;
     }

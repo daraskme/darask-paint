@@ -75,7 +75,7 @@ fn encode_ico_bmp_bgra(rgba: &[u8], size: u32) -> Vec<u8> {
     let xor_len = (size as usize)
         .saturating_mul(size as usize)
         .saturating_mul(4);
-    let and_row = ((size + 31) / 32) * 4;
+    let and_row = size.div_ceil(32) * 4;
     let and_len = (and_row as usize).saturating_mul(size as usize);
     let mut out = Vec::with_capacity(40 + xor_len + and_len);
     out.extend_from_slice(&40u32.to_le_bytes());

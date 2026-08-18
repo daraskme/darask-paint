@@ -10045,7 +10045,7 @@ mod tests {
             &[20, 0, 0, 255]
         );
         assert_eq!(
-            &app.active_tab().doc.layers[1].pixels[1 * 4..2 * 4],
+            &app.active_tab().doc.layers[1].pixels[4..8],
             &[30, 0, 0, 255]
         );
         assert!(app.active_tab().doc.layers[1].extent.is_some());
