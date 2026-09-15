@@ -474,6 +474,40 @@ enum BackgroundJobError {
     PluginFailed,
 }
 
+/// 外部プラグインへ送る領域の生画素。UI スレッドで切り出し、ワーカー
+/// スレッドで PNG へ符号化する(`App::extract_plugin_region`)。
+struct PluginRegion {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    gray: Vec<u8>,
+}
+
+impl PluginRegion {
+    /// `(画像 PNG, マスク PNG)` を返す。
+    fn encode_png(&self) -> Result<(Vec<u8>, Vec<u8>), BackgroundJobError> {
+        let mut image_png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut image_png)
+            .write_image(
+                &self.rgba,
+                self.width,
+                self.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
+        let mut mask_png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut mask_png)
+            .write_image(
+                &self.gray,
+                self.width,
+                self.height,
+                image::ExtendedColorType::L8,
+            )
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
+        Ok((image_png, mask_png))
+    }
+}
+
 impl BackgroundJobError {
     fn message(self) -> &'static str {
         match self {
@@ -5752,38 +5786,53 @@ impl DaraskApp {
         Some((rect, mask))
     }
 
-    fn encode_plugin_region(
+    /// 外部プラグインへ送る領域の生画素(RGBA8)とマスク(L8)を切り出す。
+    /// PNG 符号化はワーカースレッド側(`PluginRegion::encode_png`)で行い、
+    /// UI スレッドは行スライスのコピーだけで済ませる(大きな選択で
+    /// 数百 ms のフレーム停止を避ける)。
+    fn extract_plugin_region(
         &self,
         rect: crate::document::IRect,
         mask: &crate::document::SelMask,
-    ) -> Result<(Vec<u8>, Vec<u8>), BackgroundJobError> {
+    ) -> Result<PluginRegion, BackgroundJobError> {
         let width = u32::try_from(rect.width()).map_err(|_| BackgroundJobError::InvalidOutput)?;
         let height = u32::try_from(rect.height()).map_err(|_| BackgroundJobError::InvalidOutput)?;
         let count = (width as usize)
             .checked_mul(height as usize)
             .ok_or(BackgroundJobError::InvalidOutput)?;
-        let mut rgba = Vec::with_capacity(
-            count
-                .checked_mul(4)
-                .ok_or(BackgroundJobError::InvalidOutput)?,
-        );
-        let mut gray = Vec::with_capacity(count);
+        let byte_len = count
+            .checked_mul(4)
+            .ok_or(BackgroundJobError::InvalidOutput)?;
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(byte_len)
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
+        let mut gray = Vec::new();
+        gray.try_reserve_exact(count)
+            .map_err(|_| BackgroundJobError::InvalidOutput)?;
         let doc = &self.active_tab().doc;
+        let rect = rect.clamp_to(doc.width, doc.height);
+        if rect.width() as u32 != width || rect.height() as u32 != height {
+            return Err(BackgroundJobError::InvalidOutput);
+        }
+        let pixels = &doc.active_layer().pixels;
+        let doc_w = doc.width as usize;
+        let row_bytes = width as usize * 4;
         for y in rect.y0..rect.y1 {
+            let start = (y as usize * doc_w + rect.x0 as usize) * 4;
+            let row = pixels
+                .get(start..start + row_bytes)
+                .ok_or(BackgroundJobError::InvalidOutput)?;
+            rgba.extend_from_slice(row);
             for x in rect.x0..rect.x1 {
-                rgba.extend_from_slice(&doc.get_pixel(x, y).unwrap_or([0, 0, 0, 0]));
                 gray.push(mask.get(x, y));
             }
         }
-        let mut image_png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut image_png)
-            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
-            .map_err(|_| BackgroundJobError::InvalidOutput)?;
-        let mut mask_png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut mask_png)
-            .write_image(&gray, width, height, image::ExtendedColorType::L8)
-            .map_err(|_| BackgroundJobError::InvalidOutput)?;
-        Ok((image_png, mask_png))
+        Ok(PluginRegion {
+            width,
+            height,
+            rgba,
+            gray,
+        })
     }
 
     fn ensure_background_job_idle(&mut self) -> bool {
@@ -5854,7 +5903,7 @@ impl DaraskApp {
             self.show_toast("AI 修復には選択範囲が必要です".to_owned());
             return;
         };
-        let Ok((image_png, mask_png)) = self.encode_plugin_region(rect, &mask) else {
+        let Ok(region) = self.extract_plugin_region(rect, &mask) else {
             self.show_toast("送信画像を作成できませんでした".to_owned());
             return;
         };
@@ -5862,6 +5911,7 @@ impl DaraskApp {
         let width = rect.width() as u32;
         let height = rect.height() as u32;
         self.spawn_plugin_job(ctx, BackgroundJobKind::IopaintInpaint, rect, move || {
+            let (image_png, mask_png) = region.encode_png()?;
             verify_plugin(
                 port,
                 plugin::IOPAINT_PLUGIN,
@@ -5882,7 +5932,7 @@ impl DaraskApp {
             self.show_toast("AI 置換には選択範囲が必要です".to_owned());
             return;
         };
-        let Ok((image_png, mask_png)) = self.encode_plugin_region(rect, &mask) else {
+        let Ok(region) = self.extract_plugin_region(rect, &mask) else {
             self.show_toast("送信画像を作成できませんでした".to_owned());
             return;
         };
@@ -5890,6 +5940,7 @@ impl DaraskApp {
         let width = rect.width() as u32;
         let height = rect.height() as u32;
         self.spawn_plugin_job(ctx, BackgroundJobKind::DiffusionInpaint, rect, move || {
+            let (image_png, mask_png) = region.encode_png()?;
             verify_plugin(
                 port,
                 plugin::DIFFUSION_PLUGIN,

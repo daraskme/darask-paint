@@ -258,6 +258,20 @@ pub fn stroke_segment(
 /// ペンの AA モード(tools/pen.rs)や v2 のレイヤー合成
 /// (`Document::recomposite`)が使う。
 pub fn blend_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    // 出現頻度の高い 3 ケース(透明ソース / 不透明ソース / 透明デスト)は
+    // 汎用の浮動小数計算と結果が 1 バイトも変わらないため、除算を省いて
+    // そのまま返す(`blend_over_matches_general_formula_on_fast_paths` で
+    // 全組み合わせを検証)。レイヤー合成では大半の画素がこの経路を通る。
+    if src[3] == 0 {
+        return if dst[3] == 0 { [0, 0, 0, 0] } else { dst };
+    }
+    if src[3] == 255 || dst[3] == 0 {
+        return src;
+    }
+    blend_over_general(dst, src)
+}
+
+fn blend_over_general(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
     let src_a = src[3] as f32 / 255.0;
     let dst_a = dst[3] as f32 / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
@@ -625,14 +639,14 @@ pub fn flood_fill(
             // ここで同じアルファロック規則(α=0 は完全不変・それ以外は α 固定
             // で RGB のみ)を実装する。ロック無しは従来どおりの一括代入。
             if alpha_lock {
-                for px in row.chunks_exact_mut(4) {
+                for px in row.as_chunks_mut::<4>().0 {
                     if px[3] == 0 {
                         continue;
                     }
                     px[0..3].copy_from_slice(&color[0..3]);
                 }
             } else {
-                for px in row.chunks_exact_mut(4) {
+                for px in row.as_chunks_mut::<4>().0 {
                     px.copy_from_slice(&color);
                 }
             }
@@ -1759,6 +1773,26 @@ mod tests {
         let out = blend_over([255, 255, 255, 255], [0, 0, 0, 128]);
         assert_eq!(out[3], 255);
         assert!((120..=135).contains(&out[0]));
+    }
+
+    #[test]
+    fn blend_over_matches_general_formula_on_fast_paths() {
+        // 早期リターンする 3 ケースを、全チャンネル値 × 全アルファ値で
+        // 汎用式と突き合わせる(値の組み合わせはチャンネルごとに独立なので
+        // R だけ全走査し、G/B は定数で十分)。
+        for v in 0..=255u8 {
+            for a in 0..=255u8 {
+                let dst = [v, 7, 200, a];
+                let src = [v ^ 0x5a, 9, 100, 0];
+                assert_eq!(blend_over(dst, src), blend_over_general(dst, src));
+                let dst = [v ^ 0x5a, 7, 200, a];
+                let src = [v, 9, 100, 255];
+                assert_eq!(blend_over(dst, src), blend_over_general(dst, src));
+                let dst = [v ^ 0x5a, 7, 200, 0];
+                let src = [v, 9, 100, a];
+                assert_eq!(blend_over(dst, src), blend_over_general(dst, src));
+            }
+        }
     }
 
     #[test]

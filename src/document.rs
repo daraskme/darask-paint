@@ -1203,13 +1203,16 @@ fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) 
                     continue;
                 };
                 let opacity = layer.opacity;
-                for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
-                    let mut s = [src[0], src[1], src[2], src[3]];
+                // `as_chunks::<4>` で画素を `[u8; 4]` として直接扱い、画素
+                // ごとの添字境界チェックと `copy_from_slice` の長さ検査を消す。
+                let dst_px = out_row.as_chunks_mut::<4>().0;
+                let src_px = layer_row.as_chunks::<4>().0;
+                for (dst, src) in dst_px.iter_mut().zip(src_px) {
+                    let mut s = *src;
                     if opacity != 255 {
                         s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
                     }
-                    let d = [dst[0], dst[1], dst[2], dst[3]];
-                    dst.copy_from_slice(&raster::blend_over(d, s));
+                    *dst = raster::blend_over(*dst, s);
                 }
             }
             continue;
@@ -1224,23 +1227,25 @@ fn composite_layers(layers: &[&Layer], width: u32, rect: IRect, out: &mut [u8]) 
             let opacity = layer.opacity;
             match blends.get(i).copied().flatten() {
                 None => {
-                    for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
-                        let mut s = [src[0], src[1], src[2], src[3]];
+                    let dst_px = out_row.as_chunks_mut::<4>().0;
+                    let src_px = layer_row.as_chunks::<4>().0;
+                    for (dst, src) in dst_px.iter_mut().zip(src_px) {
+                        let mut s = *src;
                         if opacity != 255 {
                             s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
                         }
-                        let d = [dst[0], dst[1], dst[2], dst[3]];
-                        dst.copy_from_slice(&raster::blend_over(d, s));
+                        *dst = raster::blend_over(*dst, s);
                     }
                 }
                 Some(blend) => {
-                    for (dst, src) in out_row.chunks_exact_mut(4).zip(layer_row.chunks_exact(4)) {
-                        let mut s = [src[0], src[1], src[2], src[3]];
+                    let dst_px = out_row.as_chunks_mut::<4>().0;
+                    let src_px = layer_row.as_chunks::<4>().0;
+                    for (dst, src) in dst_px.iter_mut().zip(src_px) {
+                        let mut s = *src;
                         if opacity != 255 {
                             s[3] = ((s[3] as u32 * opacity as u32) / 255) as u8;
                         }
-                        let d = [dst[0], dst[1], dst[2], dst[3]];
-                        dst.copy_from_slice(&blend_pixel(d, s, blend));
+                        *dst = blend_pixel(*dst, s, blend);
                     }
                 }
             }

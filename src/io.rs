@@ -174,7 +174,8 @@ fn composite_over_white_rgb(doc: &Document) -> Result<Vec<u8>, String> {
     rgb.try_reserve_exact(len)
         .map_err(|_| "保存用メモリを確保できません".to_owned())?;
     rgb.resize(len, 0);
-    for (src, dst) in doc.composite.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+    let src_px = doc.composite.as_chunks::<4>().0;
+    for (src, dst) in src_px.iter().zip(rgb.as_chunks_mut::<3>().0) {
         let a = src[3] as f32 / 255.0;
         for c in 0..3 {
             let v = src[c] as f32 * a + 255.0 * (1.0 - a);
