@@ -297,6 +297,27 @@ impl SelMask {
         self.get(x, y) != 0
     }
 
+    /// `(x, y)` からの 1 行をコピーする。bbox 外や欠損部分は 0。
+    pub fn copy_row(&self, x: i32, y: i32, out: &mut [u8]) {
+        out.fill(0);
+        if self.is_empty() || y < self.bbox.y0 || y >= self.bbox.y1 {
+            return;
+        }
+        let width = self.bbox.width() as usize;
+        let src_x = (i64::from(x) - i64::from(self.bbox.x0)).max(0) as usize;
+        let dst_x = (i64::from(self.bbox.x0) - i64::from(x)).max(0) as usize;
+        if src_x >= width || dst_x >= out.len() {
+            return;
+        }
+        let start = (y - self.bbox.y0) as usize * width + src_x;
+        let count = (width - src_x)
+            .min(out.len() - dst_x)
+            .min(self.mask.len().saturating_sub(start));
+        if let Some(row) = self.mask.get(start..start + count) {
+            out[dst_x..dst_x + count].copy_from_slice(row);
+        }
+    }
+
     /// `width`×`height` の範囲へクランプする(`bbox` を切り詰め、マスクを
     /// 再インデックスして詰め直す)。選択は通常ドキュメントサイズが変わる
     /// 操作の前に必ずコミット済み(commit_selection)になるため実運用では
@@ -312,10 +333,8 @@ impl SelMask {
         let w = new_bbox.width() as usize;
         let h = new_bbox.height() as usize;
         let mut mask = vec![0u8; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                mask[y * w + x] = self.get(new_bbox.x0 + x as i32, new_bbox.y0 + y as i32);
-            }
+        for (y, row) in mask.chunks_exact_mut(w).enumerate() {
+            self.copy_row(new_bbox.x0, new_bbox.y0 + y as i32, row);
         }
         SelMask {
             bbox: new_bbox,

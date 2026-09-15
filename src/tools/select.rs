@@ -2300,6 +2300,36 @@ mod tests {
     }
 
     #[test]
+    fn selmask_copy_row_matches_point_reads_with_clipping_and_missing_pixels() {
+        let bbox = IRect {
+            x0: -2,
+            y0: -1,
+            x1: 3,
+            y1: 2,
+        };
+        for len in 0..=15 {
+            let mask = SelMask {
+                bbox,
+                mask: (0..len).map(|i| (i * 17) as u8).collect(),
+            };
+            for y in -2..=3 {
+                for x in -5..=5 {
+                    for width in 0..=10 {
+                        let mut row = vec![123; width];
+                        mask.copy_row(x, y, &mut row);
+                        let expected: Vec<_> =
+                            (0..width).map(|i| mask.get(x + i as i32, y)).collect();
+                        assert_eq!(row, expected, "len={len}, x={x}, y={y}, width={width}");
+                    }
+                }
+            }
+        }
+        let mut row = [123; 5];
+        SelMask::empty().copy_row(0, 0, &mut row);
+        assert_eq!(row, [0; 5]);
+    }
+
+    #[test]
     fn selmask_clamp_to_reindexes_a_shrunk_bbox() {
         // 選択の一部だけがドキュメント範囲内に残る状況(防御的な安全弁)。
         let bbox = IRect {
