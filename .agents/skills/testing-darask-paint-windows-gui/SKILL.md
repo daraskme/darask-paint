@@ -1,0 +1,1 @@
+file://C:\Users\Administrator\repos\testing-darask-paint\SKILL.md
