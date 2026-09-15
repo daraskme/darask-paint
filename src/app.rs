@@ -5814,6 +5814,7 @@ impl DaraskApp {
         if rect.width() as u32 != width || rect.height() as u32 != height {
             return Err(BackgroundJobError::InvalidOutput);
         }
+        gray.resize(count, 0);
         let pixels = &doc.active_layer().pixels;
         let doc_w = doc.width as usize;
         let row_bytes = width as usize * 4;
@@ -5823,9 +5824,12 @@ impl DaraskApp {
                 .get(start..start + row_bytes)
                 .ok_or(BackgroundJobError::InvalidOutput)?;
             rgba.extend_from_slice(row);
-            for x in rect.x0..rect.x1 {
-                gray.push(mask.get(x, y));
-            }
+            let mask_start = (y - rect.y0) as usize * width as usize;
+            mask.copy_row(
+                rect.x0,
+                y,
+                &mut gray[mask_start..mask_start + width as usize],
+            );
         }
         Ok(PluginRegion {
             width,
