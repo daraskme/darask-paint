@@ -193,6 +193,13 @@ impl BrushEngine {
                     *slot = coverage_here;
                 }
                 let coverage = *slot;
+                // カバレッジ 0 の画素はこのストロークでまだ一度も触れて
+                // おらず、合成結果は元画素そのもの(書き戻しは無変化)なので
+                // スキップする(外接矩形のうち円の外側 ≈ 21% + ソフト
+                // ブラシの減衰帯外)。
+                if coverage == 0 {
+                    continue;
+                }
                 let original = original_cursor
                     .get(x, y)
                     .or_else(|| surface.get_pixel(x, y))

@@ -11,6 +11,12 @@ eframe = { version = "0.35.0", default-features = false, features = ["glow", "de
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "ico"] }
 rfd = "0.17.2"
 
+[lints.clippy]
+# clippy 1.98 で新設された style lint。合成・保存のホットループは
+# `as_chunks::<N>` へ移行済みで、残りはテストや 1 回限りの走査なので
+# 一括置換の価値が薄く、許可して既存コードのまま維持する。
+chunks_exact_to_as_chunks = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
