@@ -366,8 +366,9 @@ pub fn show_confirm_unsaved(ctx: &egui::Context, doc_label: &str) -> ConfirmOutc
     outcome
 }
 
-/// SPEC §34/§55.1: 「設定(環境設定)」ダイアログ。履歴パネルの表示件数
-/// (1–500、既定 50)とプラグインポート(IOpaint / AI Diffusion)を持つ。
+/// SPEC §34/§55.1/§55.3: 「設定(環境設定)」ダイアログ。履歴パネルの表示
+/// 件数(1–500、既定 50)とプラグインポート(IOpaint / AI Diffusion)、
+/// プラグインフォルダ(空 = 実行ファイルと同じ階層の `plugins`)を持つ。
 /// `New`/`ImageResize` 等と同じ「ドラフト値を `&mut` で受け取り、OK/
 /// キャンセルで呼び出し側(app.rs)が確定/破棄する」パターン(`ModalState::
 /// Preferences` のドラフト値をそのまま渡す)。
@@ -376,6 +377,8 @@ pub fn show_preferences(
     draft_max_undo_steps: &mut u32,
     iopaint_port: &mut u16,
     diffusion_port: &mut u16,
+    plugin_dir: &mut String,
+    default_plugin_dir: &str,
 ) -> DialogOutcome {
     let mut outcome = DialogOutcome::Pending;
     let dialog_id = egui::Id::new("darask_dialog_preferences");
@@ -391,6 +394,23 @@ pub fn show_preferences(
             ui.label("AI Diffusion ポート:");
             ui.add(egui::DragValue::new(diffusion_port).range(1..=u16::MAX));
         });
+        ui.horizontal(|ui| {
+            ui.label("プラグインフォルダ:");
+            ui.add(
+                egui::TextEdit::singleline(plugin_dir)
+                    .hint_text(default_plugin_dir)
+                    .desired_width(320.0),
+            );
+            if ui.button("参照…").clicked() {
+                if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                    *plugin_dir = picked.to_string_lossy().into_owned();
+                }
+            }
+            if ui.button("既定").clicked() {
+                plugin_dir.clear();
+            }
+        });
+        ui.weak("IOpaint / AI Diffusion の zip をこのフォルダに置くと AI メニュー実行時に自動で展開・起動します");
         ui.horizontal(|ui| {
             ui.label("履歴パネルの表示件数:");
             let mut v = *draft_max_undo_steps;

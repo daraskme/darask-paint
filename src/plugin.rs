@@ -511,7 +511,7 @@ fn json_u32(text: &str, key: &str) -> Result<u32, PluginError> {
         .map_err(|_| PluginError::InvalidResponse("invalid JSON integer"))
 }
 
-fn json_string(text: &str, key: &str) -> Result<String, PluginError> {
+pub(crate) fn json_string(text: &str, key: &str) -> Result<String, PluginError> {
     let rest = json_value_start(text, key)?;
     let Some(mut chars) = rest.strip_prefix('"').map(str::chars) else {
         return Err(PluginError::InvalidResponse("invalid JSON string"));

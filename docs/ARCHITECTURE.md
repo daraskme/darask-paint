@@ -894,6 +894,7 @@ SPEC.md「v12 拡張仕様」(§50〜§57)に対応。実装は 7 フェーズ(P
 - ジョブ発行・適用は P4 の `BackgroundJob` 基盤を共用(kind: BuiltinInpaint / IopaintInpaint / DiffusionGenerate / DiffusionInpaint)。
 - fork 側(daraskme/darask-paint-iopaint の参照エンジン): `--darask-plugin-mode`(SPEC §55.2)。fork 側(darask-paint-ai-diffusion): `darask_server.py` + bat + manifest(SPEC §56)。どちらも Python 側は本体リポジトリ外(このリポジトリの受け入れ検査対象外だが、両モデルレビューを Phase 内で実施)。
 - 設定: `plugin_iopaint_port` / `plugin_diffusion_port`(u16、パース失敗は既定値)。設定ダイアログに数値欄 2 つ。
+- `src/plugin_launcher.rs`(SPEC §55.3): `resolve_plugin_dir(configured) -> Option<PathBuf>`(空 = 実行ファイル隣の `plugins`)・`find_plugin(root, name) -> Result<InstalledPlugin, LaunchError>`(直下 `*.zip` を `tar.exe` で展開。`.darask-zip-stamp` で未変更スキップ。`darask-plugin.json` の `name`/`launcher` を `plugin::json_string` で読む)・`launch(&InstalledPlugin)`(`cmd /C launcher` を `CREATE_NEW_CONSOLE` で。`static RUNNING: Mutex<Vec<(String, Child)>>` で二重起動防止)。`app.rs` 側は `PluginTarget` を UI スレッドで作ってワーカーに渡し、`ensure_plugin_ready(&target, cancel)` = health →(否なら)find+launch → 1 秒間隔・最大 120 秒の health 再試行。`spawn_plugin_job` のクロージャは `&AtomicBool`(キャンセルフラグ)を受け取る。設定 `plugin.dir`(String、空 = 既定)とダイアログのパス欄・参照・既定ボタン。テスト用 `new_for_test`(`persist_settings == false`)はプラグインフォルダを `None` にして実フォルダを見ない。
 
 ## 22.6b P1.5 — ドッキングパネル(SPEC §58)
 
