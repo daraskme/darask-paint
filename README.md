@@ -84,7 +84,22 @@ plugins\
 展開には Windows 10 以降に標準で入っている `tar.exe` を使います。従来どおりリポジトリを clone して
 `darask-plugin.bat` を手で起動する方法も引き続き使えます(起動済みなら zip は見に行きません)。
 
-<!-- plugin-screenshots -->
+#### 動作例(zip 配置 → 自動起動 → 実行)
+
+Windows(CPU のみ)で実際に確認した流れです。
+
+| `plugins` フォルダに zip を置く | 設定ダイアログでフォルダを変更 |
+|---|---|
+| ![plugins フォルダに 2 つの zip](docs/images/plugins-folder.png) | ![設定のプラグインフォルダ欄](docs/images/plugin-dir-preferences.png) |
+
+| IOpaint: 選択範囲の黒線が消える(選択外は保持) | AI Diffusion: 「AI 生成」の結果(CPU, 256×256) |
+|---|---|
+| ![IOpaint 修復結果](docs/images/iopaint-result.png) | ![AI Diffusion 生成結果](docs/images/diffusion-result.png) |
+
+初回のみプラグインの黒い窓で Python 環境・モデルの導入が走ります(数分〜)。その間は
+「起動しました。セットアップ完了後にもう一度」トーストが出るので、完了後に同じメニューを
+もう一度実行してください。GPU が無い環境ではプラグイン側が自動で CPU 版 PyTorch を選びます
+(推論は遅くなります)。
 
 - **テキストツール**(`T`): クリックした位置にインラインの複数行テキストボックス(IME 対応)を表示します。
   `Ctrl+Enter` またはボックス外クリックで確定するとアンチエイリアス付きでラスタライズされ、
