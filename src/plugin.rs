@@ -23,6 +23,20 @@ fn io_timeout() -> Duration {
     }
 }
 
+/// 生成・修復の POST は応答が返るまでソケットが無音になる。CPU 推論では数分かかるので
+/// プラグイン側のジョブ上限(AI Diffusion は既定 300 秒)を超える値にして、タイム
+/// アウトはプラグインが先に判定してエラー応答を返すようにする。
+fn job_read_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(150)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(600)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHealth {
     pub plugin: String,
@@ -162,6 +176,7 @@ fn post_image_mask(
         writer.write_all(suffix)?;
         writer.flush()?;
     }
+    stream.set_read_timeout(Some(job_read_timeout()))?;
     read_response(&mut stream, MAX_RESPONSE_BYTES)
 }
 
@@ -169,6 +184,7 @@ fn post_json(port: u16, path: &str, body: &[u8]) -> Result<Vec<u8>, PluginError>
     let mut stream = connect(port)?;
     write_request_head(&mut stream, port, "POST", path, body.len())?;
     stream.write_all(body)?;
+    stream.set_read_timeout(Some(job_read_timeout()))?;
     read_response(&mut stream, MAX_RESPONSE_BYTES)
 }
 
