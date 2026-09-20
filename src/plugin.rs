@@ -482,8 +482,17 @@ pub fn parse_health_json(bytes: &[u8]) -> Result<PluginHealth, PluginError> {
         api: json_u32(text, "api")?,
         engine: json_string(text, "engine")?,
         backend: json_string(text, "backend")?,
-        model: json_string(text, "model")?,
+        model: json_string_or_null(text, "model")?,
     })
+}
+
+/// `"model": null`(AI Diffusion がモデル未読込・エンジン異常のときに返す)は
+/// 空文字として扱う。
+fn json_string_or_null(text: &str, key: &str) -> Result<String, PluginError> {
+    if json_value_start(text, key)?.starts_with("null") {
+        return Ok(String::new());
+    }
+    json_string(text, key)
 }
 
 fn json_value_start<'a>(text: &'a str, key: &str) -> Result<&'a str, PluginError> {
@@ -712,6 +721,20 @@ mod tests {
         .expect("health");
         assert_eq!(health.plugin, IOPAINT_PLUGIN);
         assert_eq!(health.model, "lama");
+    }
+
+    #[test]
+    fn health_json_treats_null_model_as_empty() {
+        let health = parse_health_json(
+            br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"error","model":null,"detail":"ComfyUI process exited unexpectedly"}"#,
+        )
+        .expect("health");
+        assert_eq!(health.backend, "error");
+        assert_eq!(health.model, "");
+        assert!(parse_health_json(
+            br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"ready","model":nul}"#
+        )
+        .is_err());
     }
 
     #[test]

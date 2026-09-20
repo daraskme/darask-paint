@@ -474,6 +474,9 @@ enum BackgroundJobError {
     /// SPEC §55.3: プラグインフォルダからランチャーを起動したが、待標時間内に
     /// health が ready にならなかった(初回セットアップ中など)。
     PluginStarting,
+    /// SPEC §55.3: プラグインは応答しているがエンジン側が `backend:"error"` を
+    /// 返している(ComfyUI が落ちた等)。待っても直らないので即返す。
+    PluginBackendError,
     /// SPEC §55.3: zip の展開に失敗した。
     PluginExtractFailed,
     /// SPEC §55.3: `darask-plugin.json` が壊れている・ランチャーが無い・
@@ -529,6 +532,7 @@ impl BackgroundJobError {
             BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが見つかりません(plugins フォルダに darask-paint-iopaint の zip を置くか、darask-plugin.bat を実行してください)",
             BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが見つかりません(plugins フォルダに darask-paint-ai-diffusion の zip を置くか、darask-plugin.bat を実行してください)",
             BackgroundJobError::PluginStarting => "AI プラグインを起動しました。コンソールのセットアップが完了したらもう一度実行してください",
+            BackgroundJobError::PluginBackendError => "AI プラグインのエンジンが起動に失敗しました(プラグインのコンソールとログを確認してください)",
             BackgroundJobError::PluginExtractFailed => "プラグイン zip の展開に失敗しました(zip が壊れていないか確認してください)",
             BackgroundJobError::PluginLaunchFailed => "プラグインを起動できませんでした(darask-plugin.json / darask-plugin.bat を確認してください)",
             BackgroundJobError::PluginBusy => "AI プラグインは処理中です。完了後にもう一度実行してください",
@@ -603,11 +607,13 @@ fn verify_plugin(
         plugin::DIFFUSION_PLUGIN => !health.model.trim().is_empty(),
         _ => false,
     };
-    if health.plugin != expected
-        || health.api != plugin::PLUGIN_API_VERSION
-        || health.backend != "ready"
-        || !model_ready
-    {
+    if health.plugin != expected || health.api != plugin::PLUGIN_API_VERSION {
+        return Err(unavailable);
+    }
+    if health.backend == "error" {
+        return Err(BackgroundJobError::PluginBackendError);
+    }
+    if health.backend != "ready" || !model_ready {
         return Err(unavailable);
     }
     Ok(())
@@ -661,8 +667,12 @@ fn ensure_plugin_ready(
         unavailable,
         plugin_dir,
     } = target;
-    if verify_plugin(*port, expected, *unavailable).is_ok() {
-        return Ok(());
+    match verify_plugin(*port, expected, *unavailable) {
+        Ok(()) => return Ok(()),
+        Err(BackgroundJobError::PluginBackendError) => {
+            return Err(BackgroundJobError::PluginBackendError);
+        }
+        Err(_) => {}
     }
     if !plugin_launcher::launcher_is_running(manifest_name) {
         let root = plugin_dir.as_deref().ok_or(*unavailable)?;
@@ -684,8 +694,12 @@ fn ensure_plugin_ready(
             return Err(BackgroundJobError::PluginStarting);
         }
         thread::sleep(PLUGIN_START_POLL);
-        if verify_plugin(*port, expected, *unavailable).is_ok() {
-            return Ok(());
+        match verify_plugin(*port, expected, *unavailable) {
+            Ok(()) => return Ok(()),
+            Err(BackgroundJobError::PluginBackendError) => {
+                return Err(BackgroundJobError::PluginBackendError);
+            }
+            Err(_) => {}
         }
         // ランチャーが ready になる前に終わった = セットアップ失敗・ウィンドウを
         // 閉じた。待ち続けても無駄なのですぐ返す。
@@ -13710,6 +13724,41 @@ mod tests {
         app.start_iopaint_inpaint(&egui::Context::default());
         wait_for_background_job(&mut app);
         server.join().expect("server");
+    }
+
+    #[test]
+    fn diffusion_health_backend_error_reports_engine_failure_without_waiting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health connection");
+            let request = read_test_http_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            let health = br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"error","model":null,"detail":"ComfyUI process exited unexpectedly"}"#;
+            write_test_http_response(&mut stream, 200, health);
+            thread::sleep(Duration::from_millis(50));
+            listener.set_nonblocking(true).expect("nonblocking");
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.plugin_diffusion_port = port;
+        let started = Instant::now();
+        app.start_diffusion_generate(
+            &egui::Context::default(),
+            "test".to_owned(),
+            String::new(),
+            None,
+        );
+        wait_for_background_job(&mut app);
+        server.join().expect("server");
+        assert!(started.elapsed() < PLUGIN_START_TIMEOUT);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("エンジンが起動に失敗")));
     }
 
     #[test]
