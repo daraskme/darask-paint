@@ -136,6 +136,9 @@ pub struct Settings {
     pub max_undo_steps: u32,
     pub plugin_iopaint_port: u16,
     pub plugin_diffusion_port: u16,
+    /// SPEC §55.3: プラグイン zip を置くフォルダ。空なら実行ファイルと同じ
+    /// 階層の `plugins`(`plugin_launcher::resolve_plugin_dir`)。
+    pub plugin_dir: String,
     /// v12 §58: ドッキングパネルの配置(右/左/フローティング・ドック内順序・
     /// 折りたたみ・フローティングの位置と寸法)。パースと直列化の実体は
     /// `ui/panels.rs`(キーは `panel.<kind>.*`)。
@@ -175,6 +178,7 @@ impl Default for Settings {
             max_undo_steps: DEFAULT_MAX_UNDO_STEPS,
             plugin_iopaint_port: DEFAULT_IOPAINT_PORT,
             plugin_diffusion_port: DEFAULT_DIFFUSION_PORT,
+            plugin_dir: String::new(),
             // SPEC §58: 既定は全パネル右ドック(色→レイヤー→履歴)。
             panels: PanelLayout::default(),
         }
@@ -494,6 +498,9 @@ pub fn parse(text: &str) -> Settings {
                     settings.plugin_diffusion_port = v;
                 }
             }
+            "plugin.dir" => {
+                settings.plugin_dir = value.trim().to_owned();
+            }
             "history.max_steps" => {
                 if let Ok(v) = value.parse::<u32>() {
                     settings.max_undo_steps = v;
@@ -612,6 +619,9 @@ pub fn serialize(settings: &Settings) -> String {
         "plugin.diffusion.port",
         &s.plugin_diffusion_port.to_string(),
     );
+    // 空(既定)でも書き出す: 往復で `Settings` が一致し、ユーザーが
+    // ファイルを開いたときにキー名が分かる。
+    push_line(&mut out, "plugin.dir", s.plugin_dir.trim());
     // v12 §58: `panel.<kind>.*` は行数がパネル数×配置で変わるため、
     // `ui/panels.rs` に `キー\t値\n` の塊を作らせて末尾へ連結する。
     out.push_str(&panels::serialize(&s.panels));
@@ -746,6 +756,7 @@ mod tests {
             max_undo_steps: 123,
             plugin_iopaint_port: 18423,
             plugin_diffusion_port: 18424,
+            plugin_dir: "D:\\darask\\plugins".to_owned(),
             panels: sample_panel_layout(),
         }
     }
@@ -898,6 +909,21 @@ palette.0\t#FF0000
         let bad = parse("plugin.iopaint.port\tnope\nplugin.diffusion.port\t70000\n");
         assert_eq!(bad.plugin_iopaint_port, DEFAULT_IOPAINT_PORT);
         assert_eq!(bad.plugin_diffusion_port, DEFAULT_DIFFUSION_PORT);
+    }
+
+    #[test]
+    fn plugin_dir_round_trips_and_defaults_to_empty() {
+        assert_eq!(Settings::default().plugin_dir, "");
+        let settings = Settings {
+            plugin_dir: "C:\\Tools\\darask plugins".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            parse(&serialize(&settings)).plugin_dir,
+            "C:\\Tools\\darask plugins"
+        );
+        assert_eq!(parse("plugin.dir\t  \n").plugin_dir, "");
+        assert_eq!(parse(&serialize(&Settings::default())).plugin_dir, "");
     }
 
     #[test]

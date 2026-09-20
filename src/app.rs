@@ -63,6 +63,7 @@ use crate::io::{self, SaveFormat};
 use crate::keymap::{self, Action};
 use crate::pages::PageSet;
 use crate::plugin::{self, PluginError};
+use crate::plugin_launcher::{self, LaunchError};
 use crate::raster;
 use crate::settings::{self, Settings};
 use crate::text;
@@ -470,6 +471,17 @@ enum BackgroundJobError {
     InvalidOutput,
     IopaintUnavailable,
     DiffusionUnavailable,
+    /// SPEC §55.3: プラグインフォルダからランチャーを起動したが、待標時間内に
+    /// health が ready にならなかった(初回セットアップ中など)。
+    PluginStarting,
+    /// SPEC §55.3: プラグインは応答しているがエンジン側が `backend:"error"` を
+    /// 返している(ComfyUI が落ちた等)。待っても直らないので即返す。
+    PluginBackendError,
+    /// SPEC §55.3: zip の展開に失敗した。
+    PluginExtractFailed,
+    /// SPEC §55.3: `darask-plugin.json` が壊れている・ランチャーが無い・
+    /// プロセス生成に失敗した。
+    PluginLaunchFailed,
     PluginBusy,
     PluginFailed,
 }
@@ -517,8 +529,12 @@ impl BackgroundJobError {
                 "処理が結果を返さずに終了しました(結果は適用していません)"
             }
             BackgroundJobError::InvalidOutput => "処理の結果が壊れていました(結果は適用していません)",
-            BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが起動していません(darask-paint-iopaint の darask-plugin.bat を実行してください)",
-            BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが起動していません(darask-paint-ai-diffusion の darask-plugin.bat を実行してください)",
+            BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが見つかりません(plugins フォルダに darask-paint-iopaint の zip を置くか、darask-plugin.bat を実行してください)",
+            BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが見つかりません(plugins フォルダに darask-paint-ai-diffusion の zip を置くか、darask-plugin.bat を実行してください)",
+            BackgroundJobError::PluginStarting => "AI プラグインを起動しました。コンソールのセットアップが完了したらもう一度実行してください",
+            BackgroundJobError::PluginBackendError => "AI プラグインのエンジンが起動に失敗しました(プラグインのコンソールとログを確認してください)",
+            BackgroundJobError::PluginExtractFailed => "プラグイン zip の展開に失敗しました(zip が壊れていないか確認してください)",
+            BackgroundJobError::PluginLaunchFailed => "プラグインを起動できませんでした(darask-plugin.json / darask-plugin.bat を確認してください)",
             BackgroundJobError::PluginBusy => "AI プラグインは処理中です。完了後にもう一度実行してください",
             BackgroundJobError::PluginFailed => "AI プラグインの処理に失敗しました",
         }
@@ -591,11 +607,13 @@ fn verify_plugin(
         plugin::DIFFUSION_PLUGIN => !health.model.trim().is_empty(),
         _ => false,
     };
-    if health.plugin != expected
-        || health.api != plugin::PLUGIN_API_VERSION
-        || health.backend != "ready"
-        || !model_ready
-    {
+    if health.plugin != expected || health.api != plugin::PLUGIN_API_VERSION {
+        return Err(unavailable);
+    }
+    if health.backend == "error" {
+        return Err(BackgroundJobError::PluginBackendError);
+    }
+    if health.backend != "ready" || !model_ready {
         return Err(unavailable);
     }
     Ok(())
@@ -606,6 +624,102 @@ fn map_plugin_error(error: PluginError) -> BackgroundJobError {
         PluginError::HttpStatus(503) => BackgroundJobError::PluginBusy,
         _ => BackgroundJobError::PluginFailed,
     }
+}
+
+/// SPEC §55.3: ランチャー起動後に health が ready になるのを待つ上限。ウォーム
+/// スタート(モデル読込・ComfyUI 起動)はこの範囲に収まる。初回セットアップ
+/// (数分〜)は超えるので `PluginStarting` を返してもう一度実行してもらう
+/// (そのときランチャーがまだ走っていれば二重起動はしない)。
+const PLUGIN_START_TIMEOUT: Duration = Duration::from_secs(120);
+const PLUGIN_START_POLL: Duration = Duration::from_secs(1);
+
+/// プラグイン 1 つへの接続先と、見つからないときの起動元(プラグインフォルダ)。
+/// UI スレッドで作ってワーカーへ渡す(ワーカーは `self` を見ない)。
+struct PluginTarget {
+    port: u16,
+    expected: &'static str,
+    manifest_name: &'static str,
+    unavailable: BackgroundJobError,
+    plugin_dir: Option<PathBuf>,
+}
+
+fn map_launch_error(error: LaunchError, unavailable: BackgroundJobError) -> BackgroundJobError {
+    match error {
+        LaunchError::NotFound => unavailable,
+        LaunchError::Extract(_) => BackgroundJobError::PluginExtractFailed,
+        LaunchError::InvalidManifest | LaunchError::Spawn(_) => {
+            BackgroundJobError::PluginLaunchFailed
+        }
+    }
+}
+
+/// SPEC §55.3: health を見て、動いていなければプラグインフォルダの zip から
+/// 展開・起動して ready を待つ。ワーカースレッド上で実行する(展開と待機は
+/// 秒単位になる)。`cancel` が立ったら待つのをやめる(結果はどうせ捨てられる)。
+fn ensure_plugin_ready(
+    target: &PluginTarget,
+    cancel: &AtomicBool,
+) -> Result<(), BackgroundJobError> {
+    let PluginTarget {
+        port,
+        expected,
+        manifest_name,
+        unavailable,
+        plugin_dir,
+    } = target;
+    match verify_plugin(*port, expected, *unavailable) {
+        Ok(()) => return Ok(()),
+        Err(BackgroundJobError::PluginBackendError) => {
+            return Err(BackgroundJobError::PluginBackendError);
+        }
+        Err(_) => {}
+    }
+    if !plugin_launcher::launcher_is_running(manifest_name) {
+        let root = plugin_dir.as_deref().ok_or(*unavailable)?;
+        let launched = plugin_launcher::find_plugin(root, manifest_name)
+            .and_then(|installed| plugin_launcher::launch(&installed));
+        if let Err(error) = launched {
+            // GUI サブシステムでは通常見えないが、コンソールから起動したときの
+            // 診断用(トーストは短い定型文しか出せない)。
+            eprintln!(
+                "darask-paint: plugin `{manifest_name}` in {}: {error}",
+                root.display()
+            );
+            return Err(map_launch_error(error, *unavailable));
+        }
+    }
+    let deadline = Instant::now() + PLUGIN_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(BackgroundJobError::PluginStarting);
+        }
+        thread::sleep(PLUGIN_START_POLL);
+        match verify_plugin(*port, expected, *unavailable) {
+            Ok(()) => return Ok(()),
+            Err(BackgroundJobError::PluginBackendError) => {
+                return Err(BackgroundJobError::PluginBackendError);
+            }
+            Err(_) => {}
+        }
+        // ランチャーが ready になる前に終わった = セットアップ失敗・ウィンドウを
+        // 閉じた。待ち続けても無駄なのですぐ返す。
+        if !plugin_launcher::launcher_is_running(manifest_name) {
+            return Err(BackgroundJobError::PluginLaunchFailed);
+        }
+    }
+    Err(BackgroundJobError::PluginStarting)
+}
+
+/// 設定ダイアログのプラグインフォルダ欄に薄く表示する既定パス。
+fn default_plugin_dir_hint() -> String {
+    plugin_launcher::resolve_plugin_dir("")
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            format!(
+                "(実行ファイルと同じ階層の {})",
+                plugin_launcher::DEFAULT_PLUGIN_DIR_NAME
+            )
+        })
 }
 
 fn decode_plugin_png(
@@ -747,6 +861,7 @@ enum ModalState {
         draft_max_undo_steps: u32,
         draft_iopaint_port: u16,
         draft_diffusion_port: u16,
+        draft_plugin_dir: String,
     },
     DiffusionGenerate {
         prompt: String,
@@ -1091,6 +1206,8 @@ pub struct DaraskApp {
     max_undo_steps: u32,
     plugin_iopaint_port: u16,
     plugin_diffusion_port: u16,
+    /// SPEC §55.3: プラグイン zip を置くフォルダ(空 = 既定)。
+    plugin_dir: String,
 
     // -- v12 §58: ドッキングパネル(ARCHITECTURE.md §22.6b) ---------------
     /// パネル(色/レイヤー/履歴)の配置。SPEC §26 の永続化対象
@@ -1408,6 +1525,7 @@ impl DaraskApp {
             max_undo_steps: settings.max_undo_steps,
             plugin_iopaint_port: settings.plugin_iopaint_port,
             plugin_diffusion_port: settings.plugin_diffusion_port,
+            plugin_dir: settings.plugin_dir,
             // v12 §58: 設定から復元した配置。画面外クランプは最初のフレーム。
             panels: settings.panels,
             panels_need_clamp: true,
@@ -5153,6 +5271,7 @@ impl DaraskApp {
             max_undo_steps: self.max_undo_steps,
             plugin_iopaint_port: self.plugin_iopaint_port,
             plugin_diffusion_port: self.plugin_diffusion_port,
+            plugin_dir: self.plugin_dir.clone(),
             // v12 §58: ドッキングパネルの配置(ドラッグ・メニュー操作の結果は
             // `self.panels` に随時反映されているので、ここはその写しでよい)。
             panels: self.panels.clone(),
@@ -5276,6 +5395,7 @@ impl DaraskApp {
             draft_max_undo_steps: self.max_undo_steps,
             draft_iopaint_port: self.plugin_iopaint_port,
             draft_diffusion_port: self.plugin_diffusion_port,
+            draft_plugin_dir: self.plugin_dir.clone(),
         });
     }
 
@@ -5291,10 +5411,12 @@ impl DaraskApp {
         new_max_undo_steps: u32,
         iopaint_port: u16,
         diffusion_port: u16,
+        plugin_dir: String,
     ) {
         self.max_undo_steps = new_max_undo_steps;
         self.plugin_iopaint_port = iopaint_port;
         self.plugin_diffusion_port = diffusion_port;
+        self.plugin_dir = plugin_dir.trim().to_owned();
         for tab in &mut self.tabs {
             tab.history.set_max_steps(new_max_undo_steps as usize);
         }
@@ -5856,7 +5978,7 @@ impl DaraskApp {
         rect: crate::document::IRect,
         compute: F,
     ) where
-        F: FnOnce() -> Result<InpaintOutput, BackgroundJobError>
+        F: FnOnce(&AtomicBool) -> Result<InpaintOutput, BackgroundJobError>
             + Send
             + std::panic::UnwindSafe
             + 'static,
@@ -5872,11 +5994,17 @@ impl DaraskApp {
         }
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let repaint_ctx = ctx.clone();
         let spawned = thread::Builder::new()
             .name("darask-plugin".to_owned())
             .spawn(move || {
-                run_background_worker(job_id, compute, &sender, || repaint_ctx.request_repaint());
+                run_background_worker(
+                    job_id,
+                    move || compute(&worker_cancel),
+                    &sender,
+                    || repaint_ctx.request_repaint(),
+                );
             });
         match spawned {
             Ok(join) => {
@@ -5898,6 +6026,36 @@ impl DaraskApp {
         }
     }
 
+    /// SPEC §55.3: 設定のプラグインフォルダ(空なら実行ファイルと同じ階層の
+    /// `plugins`)。ユニットテストでは実フォルダを見に行かない(テストバイナリの
+    /// 隣に `plugins` があっても起動しない)。
+    fn plugin_dir_path(&self) -> Option<PathBuf> {
+        if !self.persist_settings {
+            return None;
+        }
+        plugin_launcher::resolve_plugin_dir(&self.plugin_dir)
+    }
+
+    fn iopaint_target(&self) -> PluginTarget {
+        PluginTarget {
+            port: self.plugin_iopaint_port,
+            expected: plugin::IOPAINT_PLUGIN,
+            manifest_name: plugin_launcher::IOPAINT_MANIFEST_NAME,
+            unavailable: BackgroundJobError::IopaintUnavailable,
+            plugin_dir: self.plugin_dir_path(),
+        }
+    }
+
+    fn diffusion_target(&self) -> PluginTarget {
+        PluginTarget {
+            port: self.plugin_diffusion_port,
+            expected: plugin::DIFFUSION_PLUGIN,
+            manifest_name: plugin_launcher::DIFFUSION_MANIFEST_NAME,
+            unavailable: BackgroundJobError::DiffusionUnavailable,
+            plugin_dir: self.plugin_dir_path(),
+        }
+    }
+
     fn start_iopaint_inpaint(&mut self, ctx: &egui::Context) {
         if !self.ensure_background_job_idle() {
             return;
@@ -5911,20 +6069,22 @@ impl DaraskApp {
             self.show_toast("送信画像を作成できませんでした".to_owned());
             return;
         };
-        let port = self.plugin_iopaint_port;
+        let target = self.iopaint_target();
+        let port = target.port;
         let width = rect.width() as u32;
         let height = rect.height() as u32;
-        self.spawn_plugin_job(ctx, BackgroundJobKind::IopaintInpaint, rect, move || {
-            let (image_png, mask_png) = region.encode_png()?;
-            verify_plugin(
-                port,
-                plugin::IOPAINT_PLUGIN,
-                BackgroundJobError::IopaintUnavailable,
-            )?;
-            let bytes =
-                plugin::iopaint_inpaint(port, &image_png, &mask_png).map_err(map_plugin_error)?;
-            decode_plugin_png(&bytes, width, height)
-        });
+        self.spawn_plugin_job(
+            ctx,
+            BackgroundJobKind::IopaintInpaint,
+            rect,
+            move |cancel| {
+                let (image_png, mask_png) = region.encode_png()?;
+                ensure_plugin_ready(&target, cancel)?;
+                let bytes = plugin::iopaint_inpaint(port, &image_png, &mask_png)
+                    .map_err(map_plugin_error)?;
+                decode_plugin_png(&bytes, width, height)
+            },
+        );
     }
 
     fn start_diffusion_inpaint(&mut self, ctx: &egui::Context, prompt: String, strength: f32) {
@@ -5940,26 +6100,28 @@ impl DaraskApp {
             self.show_toast("送信画像を作成できませんでした".to_owned());
             return;
         };
-        let port = self.plugin_diffusion_port;
+        let target = self.diffusion_target();
+        let port = target.port;
         let width = rect.width() as u32;
         let height = rect.height() as u32;
-        self.spawn_plugin_job(ctx, BackgroundJobKind::DiffusionInpaint, rect, move || {
-            let (image_png, mask_png) = region.encode_png()?;
-            verify_plugin(
-                port,
-                plugin::DIFFUSION_PLUGIN,
-                BackgroundJobError::DiffusionUnavailable,
-            )?;
-            let bytes = plugin::diffusion_inpaint(
-                port,
-                &image_png,
-                &mask_png,
-                &prompt,
-                Some(strength.clamp(0.01, 1.0)),
-            )
-            .map_err(map_plugin_error)?;
-            decode_plugin_png(&bytes, width, height)
-        });
+        self.spawn_plugin_job(
+            ctx,
+            BackgroundJobKind::DiffusionInpaint,
+            rect,
+            move |cancel| {
+                let (image_png, mask_png) = region.encode_png()?;
+                ensure_plugin_ready(&target, cancel)?;
+                let bytes = plugin::diffusion_inpaint(
+                    port,
+                    &image_png,
+                    &mask_png,
+                    &prompt,
+                    Some(strength.clamp(0.01, 1.0)),
+                )
+                .map_err(map_plugin_error)?;
+                decode_plugin_png(&bytes, width, height)
+            },
+        );
     }
 
     fn start_diffusion_generate(
@@ -5989,20 +6151,23 @@ impl DaraskApp {
             self.show_toast("生成サイズが不正です".to_owned());
             return;
         }
-        let port = self.plugin_diffusion_port;
+        let target = self.diffusion_target();
+        let port = target.port;
         let width = rect.width() as u32;
         let height = rect.height() as u32;
-        self.spawn_plugin_job(ctx, BackgroundJobKind::DiffusionGenerate, rect, move || {
-            verify_plugin(
-                port,
-                plugin::DIFFUSION_PLUGIN,
-                BackgroundJobError::DiffusionUnavailable,
-            )?;
-            let negative = (!negative.trim().is_empty()).then_some(negative.as_str());
-            let bytes = plugin::diffusion_generate(port, &prompt, negative, width, height, seed)
-                .map_err(map_plugin_error)?;
-            decode_plugin_png(&bytes, width, height)
-        });
+        self.spawn_plugin_job(
+            ctx,
+            BackgroundJobKind::DiffusionGenerate,
+            rect,
+            move |cancel| {
+                ensure_plugin_ready(&target, cancel)?;
+                let negative = (!negative.trim().is_empty()).then_some(negative.as_str());
+                let bytes =
+                    plugin::diffusion_generate(port, &prompt, negative, width, height, seed)
+                        .map_err(map_plugin_error)?;
+                decode_plugin_png(&bytes, width, height)
+            },
+        );
     }
 
     fn start_inpaint_selection(&mut self, ctx: &egui::Context) {
@@ -7191,17 +7356,22 @@ impl DaraskApp {
                 draft_max_undo_steps,
                 draft_iopaint_port,
                 draft_diffusion_port,
+                draft_plugin_dir,
             } => match dialogs::show_preferences(
                 ctx,
                 draft_max_undo_steps,
                 draft_iopaint_port,
                 draft_diffusion_port,
+                draft_plugin_dir,
+                &default_plugin_dir_hint(),
             ) {
                 DialogOutcome::Confirmed => {
+                    let plugin_dir = std::mem::take(draft_plugin_dir);
                     self.apply_preferences(
                         *draft_max_undo_steps,
                         *draft_iopaint_port,
                         *draft_diffusion_port,
+                        plugin_dir,
                     );
                     keep_open = false;
                 }
@@ -7938,6 +8108,7 @@ mod tests {
             max_undo_steps: settings::DEFAULT_MAX_UNDO_STEPS,
             plugin_iopaint_port: settings::DEFAULT_IOPAINT_PORT,
             plugin_diffusion_port: settings::DEFAULT_DIFFUSION_PORT,
+            plugin_dir: String::new(),
             panels: PanelLayout::default(),
             panels_need_clamp: false,
             color_wheel: ColorWheelState::new(),
@@ -10345,6 +10516,7 @@ mod tests {
             200,
             settings::DEFAULT_IOPAINT_PORT,
             settings::DEFAULT_DIFFUSION_PORT,
+            String::new(),
         );
         assert_eq!(app.max_undo_steps, 200);
     }
@@ -10367,6 +10539,7 @@ mod tests {
             3,
             settings::DEFAULT_IOPAINT_PORT,
             settings::DEFAULT_DIFFUSION_PORT,
+            String::new(),
         );
 
         for tab in &mut app.tabs {
@@ -10385,6 +10558,7 @@ mod tests {
             3,
             settings::DEFAULT_IOPAINT_PORT,
             settings::DEFAULT_DIFFUSION_PORT,
+            String::new(),
         );
         app.open_new_tab(Document::new(4, 4, Background::White));
 
@@ -13550,6 +13724,41 @@ mod tests {
         app.start_iopaint_inpaint(&egui::Context::default());
         wait_for_background_job(&mut app);
         server.join().expect("server");
+    }
+
+    #[test]
+    fn diffusion_health_backend_error_reports_engine_failure_without_waiting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health connection");
+            let request = read_test_http_request(&mut stream);
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/v1/health HTTP/1.1"));
+            let health = br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"error","model":null,"detail":"ComfyUI process exited unexpectedly"}"#;
+            write_test_http_response(&mut stream, 200, health);
+            thread::sleep(Duration::from_millis(50));
+            listener.set_nonblocking(true).expect("nonblocking");
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let mut app = new_for_test(Document::new(8, 8, Background::White));
+        app.plugin_diffusion_port = port;
+        let started = Instant::now();
+        app.start_diffusion_generate(
+            &egui::Context::default(),
+            "test".to_owned(),
+            String::new(),
+            None,
+        );
+        wait_for_background_job(&mut app);
+        server.join().expect("server");
+        assert!(started.elapsed() < PLUGIN_START_TIMEOUT);
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("エンジンが起動に失敗")));
     }
 
     #[test]

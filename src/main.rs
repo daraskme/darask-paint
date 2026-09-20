@@ -14,6 +14,7 @@ mod io;
 mod keymap;
 mod pages;
 mod plugin;
+mod plugin_launcher;
 mod project;
 mod raster;
 mod settings;

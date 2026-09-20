@@ -23,6 +23,20 @@ fn io_timeout() -> Duration {
     }
 }
 
+/// 生成・修復の POST は応答が返るまでソケットが無音になる。CPU 推論では数分かかるので
+/// プラグイン側のジョブ上限(AI Diffusion は既定 300 秒)を超える値にして、タイム
+/// アウトはプラグインが先に判定してエラー応答を返すようにする。
+fn job_read_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(150)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(600)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHealth {
     pub plugin: String,
@@ -162,6 +176,7 @@ fn post_image_mask(
         writer.write_all(suffix)?;
         writer.flush()?;
     }
+    stream.set_read_timeout(Some(job_read_timeout()))?;
     read_response(&mut stream, MAX_RESPONSE_BYTES)
 }
 
@@ -169,6 +184,7 @@ fn post_json(port: u16, path: &str, body: &[u8]) -> Result<Vec<u8>, PluginError>
     let mut stream = connect(port)?;
     write_request_head(&mut stream, port, "POST", path, body.len())?;
     stream.write_all(body)?;
+    stream.set_read_timeout(Some(job_read_timeout()))?;
     read_response(&mut stream, MAX_RESPONSE_BYTES)
 }
 
@@ -482,8 +498,17 @@ pub fn parse_health_json(bytes: &[u8]) -> Result<PluginHealth, PluginError> {
         api: json_u32(text, "api")?,
         engine: json_string(text, "engine")?,
         backend: json_string(text, "backend")?,
-        model: json_string(text, "model")?,
+        model: json_string_or_null(text, "model")?,
     })
+}
+
+/// `"model": null`(AI Diffusion がモデル未読込・エンジン異常のときに返す)は
+/// 空文字として扱う。
+fn json_string_or_null(text: &str, key: &str) -> Result<String, PluginError> {
+    if json_value_start(text, key)?.starts_with("null") {
+        return Ok(String::new());
+    }
+    json_string(text, key)
 }
 
 fn json_value_start<'a>(text: &'a str, key: &str) -> Result<&'a str, PluginError> {
@@ -511,7 +536,7 @@ fn json_u32(text: &str, key: &str) -> Result<u32, PluginError> {
         .map_err(|_| PluginError::InvalidResponse("invalid JSON integer"))
 }
 
-fn json_string(text: &str, key: &str) -> Result<String, PluginError> {
+pub(crate) fn json_string(text: &str, key: &str) -> Result<String, PluginError> {
     let rest = json_value_start(text, key)?;
     let Some(mut chars) = rest.strip_prefix('"').map(str::chars) else {
         return Err(PluginError::InvalidResponse("invalid JSON string"));
@@ -712,6 +737,20 @@ mod tests {
         .expect("health");
         assert_eq!(health.plugin, IOPAINT_PLUGIN);
         assert_eq!(health.model, "lama");
+    }
+
+    #[test]
+    fn health_json_treats_null_model_as_empty() {
+        let health = parse_health_json(
+            br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"error","model":null,"detail":"ComfyUI process exited unexpectedly"}"#,
+        )
+        .expect("health");
+        assert_eq!(health.backend, "error");
+        assert_eq!(health.model, "");
+        assert!(parse_health_json(
+            br#"{"plugin":"darask-ai-diffusion","api":1,"engine":"x","backend":"ready","model":nul}"#
+        )
+        .is_err());
     }
 
     #[test]
