@@ -1645,7 +1645,12 @@ impl DaraskApp {
     /// shortcuts` が別枠のまま処理する、`keymap` モジュールドキュメント
     /// コメント参照)。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
+        // egui は Esc のフレーム開始時にフォーカスを外す。編集中の状態も
+        // ガードしないと、一覧より前に Esc を消費して名前変更を確定してしまう。
+        if self.active_tab().layer_rename.is_some()
+            || ctx.egui_wants_keyboard_input()
+            || self.modal.is_some()
+        {
             return;
         }
         // v3 §18: Enter(確定)/Esc(キャンセル)は選択/移動ツール使用中のみ
@@ -10851,6 +10856,21 @@ mod tests {
         assert_eq!(app.active_tab().doc.layers.len(), 2);
         app.handle_layers_panel_action(LayersPanelAction::Delete);
         assert_eq!(app.active_tab().doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn layer_rename_keeps_escape_out_of_global_shortcuts() {
+        let mut app = new_for_test(Document::new(4, 4, Background::White));
+        app.active_tab_mut().layer_rename = Some((0, "Should cancel".into(), false));
+        let ctx = ctx_with_key_event(Key::Escape, Modifiers::NONE);
+        assert!(!ctx.egui_wants_keyboard_input());
+        app.handle_shortcuts(&ctx);
+        assert!(
+            ctx.input(|input| input.key_pressed(Key::Escape)),
+            "レイヤーパネルがキャンセルを処理できるよう Esc を残す"
+        );
+        assert_eq!(app.active_tab().doc.layers[0].name, "背景");
+        assert!(!app.active_tab().doc.modified);
     }
 
     #[test]
