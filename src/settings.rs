@@ -628,18 +628,9 @@ pub fn serialize(settings: &Settings) -> String {
     out
 }
 
-/// `%APPDATA%\darask-paint\settings.txt`(存在しない/`APPDATA` 未設定なら
-/// `None`。ARCHITECTURE.md §16.7)。
+/// Windows は APPDATA、Linux は XDG_CONFIG_HOME のユーザー設定を使う。
 fn settings_file_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    if appdata.is_empty() {
-        return None;
-    }
-    Some(
-        PathBuf::from(appdata)
-            .join("darask-paint")
-            .join("settings.txt"),
-    )
+    Some(crate::paths::config_dir()?.join("settings.txt"))
 }
 
 /// v8 レビュー修正: 設定ファイルの読込サイズ上限。正常な settings.txt は

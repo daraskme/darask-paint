@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Darask Paint
+Comment=Lightweight raster image editor
+Exec=darask-paint %f
+Icon=darask-paint
+Terminal=false
+Categories=Graphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/webp;

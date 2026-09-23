@@ -1,6 +1,6 @@
 # Darask Paint
 
-超高速起動・軽量・シンプルな Windows 用ラスタ画像編集ソフト(Krita の起動待ちにうんざりした人向け)。
+超高速起動・軽量・シンプルな Windows / NixOS 用ラスタ画像編集ソフト(Krita の起動待ちにうんざりした人向け)。
 Rust + eframe/egui。単一 exe。UI は日本語。
 
 ## ドキュメント

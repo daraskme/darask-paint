@@ -529,12 +529,12 @@ impl BackgroundJobError {
                 "処理が結果を返さずに終了しました(結果は適用していません)"
             }
             BackgroundJobError::InvalidOutput => "処理の結果が壊れていました(結果は適用していません)",
-            BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが見つかりません(plugins フォルダに darask-paint-iopaint の zip を置くか、darask-plugin.bat を実行してください)",
-            BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが見つかりません(plugins フォルダに darask-paint-ai-diffusion の zip を置くか、darask-plugin.bat を実行してください)",
+            BackgroundJobError::IopaintUnavailable => "IOpaint プラグインが見つかりません(plugins フォルダに darask-paint-iopaint の zip を置くか、プラグインのランチャーを実行してください)",
+            BackgroundJobError::DiffusionUnavailable => "AI Diffusion プラグインが見つかりません(plugins フォルダに darask-paint-ai-diffusion の zip を置くか、プラグインのランチャーを実行してください)",
             BackgroundJobError::PluginStarting => "AI プラグインを起動しました。コンソールのセットアップが完了したらもう一度実行してください",
             BackgroundJobError::PluginBackendError => "AI プラグインのエンジンが起動に失敗しました(プラグインのコンソールとログを確認してください)",
             BackgroundJobError::PluginExtractFailed => "プラグイン zip の展開に失敗しました(zip が壊れていないか確認してください)",
-            BackgroundJobError::PluginLaunchFailed => "プラグインを起動できませんでした(darask-plugin.json / darask-plugin.bat を確認してください)",
+            BackgroundJobError::PluginLaunchFailed => "プラグインを起動できませんでした(darask-plugin.json とランチャーを確認してください)",
             BackgroundJobError::PluginBusy => "AI プラグインは処理中です。完了後にもう一度実行してください",
             BackgroundJobError::PluginFailed => "AI プラグインの処理に失敗しました",
         }
@@ -13697,7 +13697,7 @@ mod tests {
         assert!(app
             .toast
             .as_ref()
-            .is_some_and(|toast| toast.0.contains("darask-plugin.bat")));
+            .is_some_and(|toast| toast.0.contains("ランチャー")));
     }
 
     #[test]

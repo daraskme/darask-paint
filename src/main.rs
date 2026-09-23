@@ -13,6 +13,7 @@ mod inpaint;
 mod io;
 mod keymap;
 mod pages;
+mod paths;
 mod plugin;
 mod plugin_launcher;
 mod project;
