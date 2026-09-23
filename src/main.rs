@@ -78,6 +78,7 @@ fn main() -> eframe::Result {
     let icon_rgba = icon::generate_icon_rgba(ICON_SIZE);
 
     let viewport = egui::ViewportBuilder::default()
+        .with_app_id("darask-paint")
         .with_inner_size([settings.window_width as f32, settings.window_height as f32])
         .with_min_inner_size([
             settings::MIN_WINDOW_WIDTH as f32,
