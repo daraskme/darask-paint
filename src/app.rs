@@ -79,7 +79,7 @@ use crate::tools::{LassoMode, Tool, ToolCtx, ToolEvent, ToolKind};
 use crate::ui::color_panel::{self, ColorPanelCtx};
 use crate::ui::color_wheel::ColorWheelState;
 use crate::ui::dialogs::{ConfirmOutcome, DialogOutcome};
-use crate::ui::layers_panel::{LayersPanelAction, RenameState, ThumbnailCache};
+use crate::ui::layers_panel::{LayerRowCommand, LayersPanelAction, RenameState, ThumbnailCache};
 use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
 use crate::ui::pages_panel::PageThumbnailCache;
@@ -6916,6 +6916,29 @@ impl DaraskApp {
             LayersPanelAction::SetBlend(blend) => self.set_active_layer_blend(blend),
             LayersPanelAction::SetAlphaLock(locked) => self.set_active_layer_alpha_lock(locked),
             LayersPanelAction::CommitRename(idx, name) => self.commit_rename_action(idx, name),
+            LayersPanelAction::ForLayer { uid, command } => {
+                let Some(idx) = self
+                    .active_tab()
+                    .doc
+                    .layers
+                    .iter()
+                    .position(|layer| layer.uid == uid)
+                else {
+                    return;
+                };
+                self.set_active_layer(idx);
+                match command {
+                    LayerRowCommand::Duplicate => self.layer_duplicate(),
+                    LayerRowCommand::Delete => self.layer_delete(),
+                    LayerRowCommand::MoveUp => self.layer_move_up(),
+                    LayerRowCommand::MoveDown => self.layer_move_down(),
+                    LayerRowCommand::MergeDown => self.layer_merge_down(),
+                    LayerRowCommand::ToggleAlphaLock => {
+                        let locked = self.active_tab().doc.layers[idx].alpha_lock;
+                        self.set_active_layer_alpha_lock(!locked);
+                    }
+                }
+            }
         }
     }
 
@@ -10827,6 +10850,49 @@ mod tests {
         app.handle_layers_panel_action(LayersPanelAction::MergeDown);
         assert_eq!(app.active_tab().doc.layers.len(), 2);
         app.handle_layers_panel_action(LayersPanelAction::Delete);
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn layer_row_commands_target_the_named_layer_and_keep_undo() {
+        let mut app = new_for_test(Document::new(6, 6, Background::White));
+        app.layer_add();
+        let background = app.active_tab().doc.layers[0].uid;
+        app.handle_layers_panel_action(LayersPanelAction::ForLayer {
+            uid: background,
+            command: LayerRowCommand::Duplicate,
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 3);
+        assert_eq!(app.active_tab().doc.active_index(), 1);
+        assert_eq!(
+            app.active_tab().doc.layers[1].pixels,
+            app.active_tab().doc.layers[0].pixels
+        );
+        app.handle_menu_action(MenuAction::Undo, &egui::Context::default());
+        assert_eq!(app.active_tab().doc.layers.len(), 2);
+
+        app.handle_layers_panel_action(LayersPanelAction::ForLayer {
+            uid: background,
+            command: LayerRowCommand::MoveUp,
+        });
+        assert_eq!(app.active_tab().doc.layers[1].uid, background);
+        app.handle_layers_panel_action(LayersPanelAction::ForLayer {
+            uid: background,
+            command: LayerRowCommand::ToggleAlphaLock,
+        });
+        assert!(app.active_tab().doc.layers[1].alpha_lock);
+        assert!(!app.active_tab().doc.layers[0].alpha_lock);
+
+        app.handle_layers_panel_action(LayersPanelAction::ForLayer {
+            uid: background,
+            command: LayerRowCommand::Delete,
+        });
+        assert_eq!(app.active_tab().doc.layers.len(), 1);
+        // 削除済みの行メニューが届いても、別のレイヤーを操作しない。
+        app.handle_layers_panel_action(LayersPanelAction::ForLayer {
+            uid: background,
+            command: LayerRowCommand::Duplicate,
+        });
         assert_eq!(app.active_tab().doc.layers.len(), 1);
     }
 
