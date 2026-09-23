@@ -743,7 +743,10 @@ mod tests {
         }
         // SPEC §58: 左ドックは空なので出さない = 中央領域は左端から始まる。
         assert_eq!(central.left(), 0.0);
-        assert!(central.right() <= SCREEN.x - panels::DOCK_WIDTH + 0.5);
+        assert!(
+            central.right() <= SCREEN.x - panels::DOCK_WIDTH + 0.5,
+            "central: {central:?}"
+        );
     }
 
     /// SPEC §58: 「右ドックが空なら右パネル自体を出さない(キャンバス最大化)」。

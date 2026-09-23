@@ -1,13 +1,13 @@
 //! プラグインフォルダ(zip 配置)の探索・展開・起動(SPEC §55.3)。
 //!
-//! `darask-paint.exe` と同じ階層の `plugins\`(または設定 `plugin.dir` で
-//! 指定したフォルダ)に置かれた IOpaint / AI Diffusion の配布 zip を、
-//! AI メニュー実行時に**初めて**展開し、同梱の `darask-plugin.bat` を別
+//! OS ごとの既定フォルダ(または設定 `plugin.dir` で指定したフォルダ)の
+//! IOpaint / AI Diffusion 配布 zip を AI メニュー実行時に初めて展開する。
+//! Windows は `darask-plugin.bat`、Linux は `darask-plugin.sh` を別
 //! コンソールで起動する。起動時のディレクトリ走査や自動接続は一切しない
 //! (SPEC §55.1 の「起動時にプラグインを探さない」を維持する)。
 //!
-//! 展開は Windows 10 以降に標準搭載の `%SystemRoot%\System32\tar.exe`
-//! (bsdtar)に委ねる。zip パーサ依存を増やさずに済み、bsdtar は既定で
+//! 展開は Windows の `%SystemRoot%\System32\tar.exe` または Linux の
+//! `bsdtar` に委ねる。zip パーサ依存を増やさずに済み、bsdtar は既定で
 //! 絶対パス・`..` を含むエントリの書き出しを拒否する(パストラバーサル
 //! 防御)。
 
@@ -69,15 +69,22 @@ pub struct InstalledPlugin {
 }
 
 /// 設定値 `configured`(空なら既定)からプラグインフォルダを決める。
-/// 既定は実行ファイルと同じ階層の `plugins`。実行ファイルの場所が取れない
-/// 場合だけ `None`。
+/// Windows は実行ファイルと同じ階層、Linux は XDG_DATA_HOME 以下。
+/// 既定の保存先を取得できない場合は `None`。
 pub fn resolve_plugin_dir(configured: &str) -> Option<PathBuf> {
     let trimmed = configured.trim();
     if !trimmed.is_empty() {
         return Some(PathBuf::from(trimmed));
     }
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join(DEFAULT_PLUGIN_DIR_NAME))
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join(DEFAULT_PLUGIN_DIR_NAME))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(crate::paths::data_dir()?.join(DEFAULT_PLUGIN_DIR_NAME))
+    }
 }
 
 /// `root` 直下の zip を必要なら展開し、`darask-plugin.json` の `name` が
@@ -127,7 +134,12 @@ fn load_manifest(dir: &Path, manifest_name: &str) -> Option<Result<InstalledPlug
     if name != manifest_name {
         return None;
     }
-    let Ok(launcher) = json_string(&text, "launcher") else {
+    let launcher_key = if cfg!(windows) {
+        "launcher"
+    } else {
+        "launcherLinux"
+    };
+    let Ok(launcher) = json_string(&text, launcher_key) else {
         return Some(Err(LaunchError::InvalidManifest));
     };
     // ランチャーは同一ディレクトリ内の単一ファイル名に限定する。
@@ -215,10 +227,18 @@ fn extract_pending_zips(root: &Path) -> Result<(), LaunchError> {
 }
 
 fn system_tar() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(|root| PathBuf::from(root).join("System32").join("tar.exe"))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("tar"))
+    #[cfg(windows)]
+    {
+        std::env::var_os("SystemRoot")
+            .map(|root| PathBuf::from(root).join("System32").join("tar.exe"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from("tar"))
+    }
+    #[cfg(not(windows))]
+    {
+        // GNU tar cannot extract ZIP archives. Use libarchive on Linux too.
+        PathBuf::from("bsdtar")
+    }
 }
 
 fn extract_zip(zip: &Path, target: &Path) -> Result<(), LaunchError> {
@@ -270,22 +290,41 @@ pub fn launch(plugin: &InstalledPlugin) -> Result<(), LaunchError> {
     if launcher_is_running(&plugin.name) {
         return Ok(());
     }
-    let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-    let mut command = Command::new(comspec);
-    command
-        .arg("/C")
-        .arg(&plugin.launcher)
-        .current_dir(&plugin.dir);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NEW_CONSOLE);
-    }
-    let child = command.spawn().map_err(LaunchError::Spawn)?;
+    let child = launcher_command(plugin)?
+        .spawn()
+        .map_err(LaunchError::Spawn)?;
     if let Ok(mut running) = RUNNING.lock() {
         running.push((plugin.name.clone(), child));
     }
     Ok(())
+}
+
+fn launcher_command(plugin: &InstalledPlugin) -> Result<Command, LaunchError> {
+    // Resolve before changing cwd: configured plugin folders may be relative.
+    let launcher = fs::canonicalize(&plugin.launcher).map_err(LaunchError::Spawn)?;
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = Command::new(comspec);
+        command
+            .arg("/C")
+            .arg(&launcher)
+            .creation_flags(CREATE_NEW_CONSOLE);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        // xterm stays alive for the child, allowing RUNNING to prevent duplicate setup.
+        // bash also handles ZIPs whose executable permission bits were lost on Windows.
+        let mut command = Command::new("xterm");
+        command
+            .args(["-T", "Darask Paint plugin", "-e", "bash"])
+            .arg(&launcher);
+        command
+    };
+    command.current_dir(launcher.parent().ok_or(LaunchError::InvalidManifest)?);
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -310,7 +349,7 @@ mod tests {
         fs::create_dir_all(dir).expect("mkdir");
         fs::write(
             dir.join(MANIFEST_FILE),
-            format!("{{\n  \"name\": \"{name}\",\n  \"displayName\": \"x\",\n  \"launcher\": \"{launcher}\"\n}}\n"),
+            format!("{{\n  \"name\": \"{name}\",\n  \"displayName\": \"x\",\n  \"launcher\": \"{launcher}\",\n  \"launcherLinux\": \"{launcher}\"\n}}\n"),
         )
         .expect("write manifest");
     }
@@ -323,6 +362,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn resolve_defaults_to_plugins_beside_the_executable() {
         let dir = resolve_plugin_dir("").expect("exe dir");
@@ -394,7 +434,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[cfg(windows)]
     fn make_zip(root: &Path, zip_name: &str, source_dir: &Path) {
         let status = Command::new(system_tar())
             .arg("-a")
@@ -408,7 +447,6 @@ mod tests {
         assert!(status.success(), "tar -a -cf should succeed");
     }
 
-    #[cfg(windows)]
     #[test]
     fn zip_in_root_is_extracted_once_and_reextracted_when_replaced() {
         let root = temp_root("zip");
@@ -446,7 +484,6 @@ mod tests {
         let _ = fs::remove_dir_all(&staging);
     }
 
-    #[cfg(windows)]
     #[test]
     fn corrupt_zip_reports_extract_error() {
         let root = temp_root("corrupt");
@@ -461,5 +498,39 @@ mod tests {
     #[test]
     fn launcher_is_not_running_for_unknown_plugin() {
         assert!(!launcher_is_running("never-launched"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_uses_shell_launcher_and_preserves_paths_as_one_argument() {
+        let root = temp_root("shell with spaces");
+        let dir = root.join("plugin");
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{"name":"iopaint","launcher":"windows.bat","launcherLinux":"linux.sh"}"#,
+        )
+        .expect("manifest");
+        fs::write(dir.join("linux.sh"), "exit 0\n").expect("shell");
+        let plugin = find_plugin(&root, IOPAINT_MANIFEST_NAME).expect("linux manifest");
+        assert_eq!(plugin.launcher, dir.join("linux.sh"));
+        let command = launcher_command(&plugin).expect("command");
+        assert_eq!(command.get_program(), "xterm");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[3], "bash");
+        assert_eq!(
+            args[4],
+            fs::canonicalize(&plugin.launcher).expect("absolute path")
+        );
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            r#"{"name":"iopaint","launcher":"windows.bat"}"#,
+        )
+        .expect("old manifest");
+        assert!(matches!(
+            find_plugin(&root, IOPAINT_MANIFEST_NAME),
+            Err(LaunchError::InvalidManifest)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -8,3 +8,6 @@
 /shot*.png
 /assets/icon-source.png
 /assets/icon-preview.png
+
+# Nix build outputs
+/result*

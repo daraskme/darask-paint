@@ -55,6 +55,21 @@ pub enum LayersPanelAction {
     SetAlphaLock(bool),
     /// 名前変更の確定(ダブルクリック編集の Enter/フォーカス外し)。
     CommitRename(usize, String),
+    /// 行メニューはアクティブ行ではなく、開いたレイヤーを操作する。
+    ForLayer {
+        uid: u64,
+        command: LayerRowCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRowCommand {
+    Duplicate,
+    Delete,
+    MoveUp,
+    MoveDown,
+    MergeDown,
+    ToggleAlphaLock,
 }
 
 /// ダブルクリックで開始した名前編集の状態(`app.rs` が保持する)。
@@ -85,6 +100,8 @@ const MAX_THUMBNAILS_PER_FRAME: usize = 4;
 const THUMBNAIL_SLOT: egui::Vec2 = egui::vec2(THUMBNAIL_MAX_W as f32, THUMBNAIL_MAX_H as f32);
 /// 目アイコンのサイズ(正方形)。
 const EYE_SIZE: f32 = 16.0;
+const ROW_HEIGHT: f32 = 40.0;
+const ICON_BUTTON_SIZE: f32 = 26.0;
 
 /// v12 §50.1: レイヤーサムネイルのテクスチャキャッシュ(**タブごと**に
 /// `Tab` が 1 個保持する)。
@@ -273,6 +290,9 @@ pub fn show(ui: &mut egui::Ui, ctx: LayersPanelCtx) -> Option<LayersPanelAction>
     show_active_layer_controls(ui, doc, active, &mut action);
     ui.add_space(4.0);
 
+    // 操作は一覧の前にまとめる。多層文書で末尾までスクロールする必要がない。
+    show_layer_toolbar(ui, doc, &mut action);
+    ui.add_space(2.0);
     show_layer_list(ui, doc, active, rename, thumbnails, &mut action);
     // v12 §50.1(追いレビュー③): 1 フレームの生成上限で持ち越した可視行が
     // ある間だけ、**条件付きで** 1 回だけ再描画を要求して追いつかせる。
@@ -282,63 +302,101 @@ pub fn show(ui: &mut egui::Ui, ctx: LayersPanelCtx) -> Option<LayersPanelAction>
         ui.ctx().request_repaint();
     }
 
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("新規"))
-            .on_hover_text(keymap::menu_label("新規レイヤー", Action::LayerAdd))
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Add);
-        }
-        if ui
-            .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("複製"))
-            .on_hover_text(keymap::menu_label("レイヤーを複製", Action::LayerDuplicate))
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Duplicate);
-        }
-        // SPEC §13: 「レイヤーが 1 枚のときは削除・結合は無効」。
-        if ui
-            .add_enabled(layer_count > 1, egui::Button::new("削除"))
-            .on_hover_text("レイヤーを削除")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Delete);
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(active + 1 < layer_count, egui::Button::new("上へ"))
-            .on_hover_text("上へ移動")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MoveUp);
-        }
-        if ui
-            .add_enabled(active > 0, egui::Button::new("下へ"))
-            .on_hover_text("下へ移動")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MoveDown);
-        }
-        // v12 §50.2: 非通常ブレンドを含む 2 枚は結合できない(グレーアウト)。
-        let can_merge = doc.can_merge_active_down();
-        let merge_hint = if !can_merge && layer_count > 1 && active > 0 {
-            "「通常」以外のブレンドを含むレイヤーは結合できません".to_owned()
-        } else {
-            keymap::menu_label("下のレイヤーと結合", Action::LayerMergeDown)
-        };
-        if ui
-            .add_enabled(can_merge, egui::Button::new("下と結合"))
-            .on_hover_text(merge_hint)
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MergeDown);
-        }
-    });
-
     action
+}
+
+fn show_layer_toolbar(ui: &mut egui::Ui, doc: &Document, action: &mut Option<LayersPanelAction>) {
+    let active = doc.active_index();
+    let count = doc.layers.len();
+    let buttons = [
+        (
+            "add",
+            keymap::menu_label("新規レイヤー", Action::LayerAdd),
+            count < MAX_LAYERS,
+            icons::paint_layer_add_icon as fn(&egui::Painter, egui::Rect, egui::Color32),
+            LayersPanelAction::Add,
+        ),
+        (
+            "duplicate",
+            keymap::menu_label("レイヤーを複製", Action::LayerDuplicate),
+            count < MAX_LAYERS,
+            icons::paint_layer_duplicate_icon,
+            LayersPanelAction::Duplicate,
+        ),
+        (
+            "up",
+            "上へ移動".into(),
+            active + 1 < count,
+            icons::paint_layer_move_up_icon,
+            LayersPanelAction::MoveUp,
+        ),
+        (
+            "down",
+            "下へ移動".into(),
+            active > 0,
+            icons::paint_layer_move_down_icon,
+            LayersPanelAction::MoveDown,
+        ),
+        (
+            "merge",
+            if active > 0 && !doc.can_merge_active_down() {
+                "「通常」以外のブレンドを含むレイヤーは結合できません".into()
+            } else {
+                keymap::menu_label("下と結合", Action::LayerMergeDown)
+            },
+            doc.can_merge_active_down(),
+            icons::paint_layer_merge_down_icon,
+            LayersPanelAction::MergeDown,
+        ),
+        (
+            "delete",
+            "レイヤーを削除".into(),
+            count > 1,
+            icons::paint_layer_delete_icon,
+            LayersPanelAction::Delete,
+        ),
+    ];
+    let columns = ((ui.available_width() + 4.0) / (ICON_BUTTON_SIZE + 4.0))
+        .floor()
+        .clamp(1.0, 6.0) as usize;
+    for row in buttons.chunks(columns) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (id, label, enabled, paint, requested) in row {
+                let response = ui
+                    .add_enabled_ui(*enabled, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::Vec2::splat(ICON_BUTTON_SIZE),
+                            egui::Sense::hover(),
+                        );
+                        let response = ui.interact(
+                            rect,
+                            ui.id().with(("layer_action", id)),
+                            egui::Sense::click(),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                label,
+                            )
+                        });
+                        if ui.is_rect_visible(rect) {
+                            let visuals = ui.style().interact(&response);
+                            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+                            paint(ui.painter(), rect.shrink(4.0), visuals.fg_stroke.color);
+                        }
+                        response
+                    })
+                    .inner
+                    .on_hover_text(label)
+                    .on_disabled_hover_text(label);
+                if response.clicked() {
+                    *action = Some(requested.clone());
+                }
+            }
+        });
+    }
 }
 
 /// SPEC §50.1: 一覧の直上に置くアクティブレイヤーの設定
@@ -355,23 +413,42 @@ fn show_active_layer_controls(
 
     // ARCHITECTURE.md §14.9-8: 値が実際に変わったフレームだけ要求を出す
     // (ドラッグ中の全面 recomposite を毎フレーム 1 回に抑える)。
-    ui.label("不透明度:");
     let mut opacity_pct = (layer.opacity as f32 / 255.0 * 100.0).round() as i32;
-    if ui
-        .add(egui::Slider::new(&mut opacity_pct, 0..=100).suffix("%"))
-        .changed()
-    {
-        let new_opacity = ((opacity_pct.clamp(0, 100) as f32) / 100.0 * 255.0).round() as u8;
-        if layer.opacity != new_opacity {
-            *action = Some(LayersPanelAction::SetOpacity(new_opacity));
+    ui.horizontal(|ui| {
+        ui.label("不透明度");
+        let value_width = ui
+            .painter()
+            .layout_no_wrap(
+                "100%".into(),
+                ui.style().drag_value_text_style.resolve(ui.style()),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+            + 2.0 * ui.spacing().button_padding.x;
+        ui.spacing_mut().slider_width = (ui.available_width()
+            - value_width.max(ui.spacing().interact_size.x)
+            - ui.spacing().item_spacing.x
+            - 2.0)
+            .max(16.0);
+        if ui
+            .add(egui::Slider::new(&mut opacity_pct, 0..=100).suffix("%"))
+            .changed()
+        {
+            let new_opacity = ((opacity_pct.clamp(0, 100) as f32) / 100.0 * 255.0).round() as u8;
+            if layer.opacity != new_opacity {
+                *action = Some(LayersPanelAction::SetOpacity(new_opacity));
+            }
         }
-    }
+    });
 
     ui.horizontal(|ui| {
         ui.label("合成:");
         egui::ComboBox::from_id_salt("darask_layer_blend")
             .selected_text(layer.blend.label())
-            .width(96.0)
+            .width(
+                (ui.available_width() - ICON_BUTTON_SIZE - ui.spacing().item_spacing.x).max(60.0),
+            )
             .show_ui(ui, |ui| {
                 for mode in BlendMode::ALL {
                     if ui
@@ -385,21 +462,27 @@ fn show_active_layer_controls(
             });
 
         // アルファロックのトグル(市松+錠のアイコン、SPEC §50.3)。
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(EYE_SIZE + 6.0, EYE_SIZE + 6.0),
-            egui::Sense::click(),
-        );
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(ICON_BUTTON_SIZE), egui::Sense::click());
         let response = response.on_hover_text(if layer.alpha_lock {
             "透明保護: ON(透明部分を保護。クリックで解除)"
         } else {
             "透明保護: OFF(クリックで透明部分を保護)"
+        });
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                ui.is_enabled(),
+                layer.alpha_lock,
+                "透明保護",
+            )
         });
         if ui.is_rect_visible(rect) {
             let visuals = ui.style().interact_selectable(&response, layer.alpha_lock);
             ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
             icons::paint_alpha_lock_icon(
                 ui.painter(),
-                rect.shrink(3.0),
+                rect.shrink(5.0),
                 visuals.fg_stroke.color,
                 layer.alpha_lock,
             );
@@ -543,46 +626,134 @@ fn show_layer_row(
     action: &mut Option<LayersPanelAction>,
 ) -> egui::Rect {
     let is_editing = matches!(rename, Some((i, _, _)) if *i == idx);
-    ui.horizontal(|ui| {
-        show_eye_toggle(ui, doc, idx, action);
-        if is_editing {
-            show_thumbnail(ui, doc, idx, thumbnails);
-            show_rename_editor(ui, idx, rename, action);
-            return;
-        }
-        let is_active = idx == active;
-        let dragged = ui.dnd_drag_source(egui::Id::new(("darask_layer_row", idx)), idx, |ui| {
-            let fill = if is_active {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            // `Frame` は背景を中身より先に描く(自前で `rect_filled` すると
-            // サムネイルの上を塗ってしまう)。
-            egui::Frame::NONE
-                .fill(fill)
-                .inner_margin(egui::Margin::symmetric(2, 1))
-                .corner_radius(3.0)
-                .show(ui, |ui| {
+    let is_active = idx == active;
+    let row_width = ui.available_width();
+    let fill = if is_active {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().faint_bg_color
+    };
+    let frame = egui::Frame::NONE
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(4, 4))
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_width((row_width - 8.0).max(0.0));
+            ui.horizontal(|ui| {
+                ui.set_min_height(ROW_HEIGHT);
+                ui.spacing_mut().item_spacing.x = 5.0;
+                show_eye_toggle(ui, doc, idx, action);
+                if is_editing {
                     show_thumbnail(ui, doc, idx, thumbnails);
-                    show_name_label(ui, doc, idx, is_active);
-                });
+                    show_rename_editor(ui, idx, rename, action);
+                    return;
+                }
+                let body_width = ui.available_width();
+                let dragged =
+                    ui.dnd_drag_source(egui::Id::new(("darask_layer_row", idx)), idx, |ui| {
+                        ui.set_min_size(egui::vec2(body_width, ROW_HEIGHT));
+                        ui.horizontal(|ui| {
+                            show_thumbnail(ui, doc, idx, thumbnails);
+                            show_name_label(ui, doc, idx, is_active);
+                        });
+                    });
+                let row = dragged
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                if row.clicked() || row.secondary_clicked() {
+                    action.get_or_insert(LayersPanelAction::Activate(idx));
+                }
+                if row.double_clicked() {
+                    if let Some(layer) = doc.layers.get(idx) {
+                        *rename = Some((idx, layer.name.clone(), true));
+                    }
+                }
+                row.context_menu(|ui| show_row_menu(ui, doc, idx, rename, action));
+                if let Some(layer) = doc.layers.get(idx) {
+                    row.on_hover_text(format!(
+                        "{}\n{}\nダブルクリックで名前変更 / ドラッグで並べ替え / 右クリックで操作",
+                        layer.name,
+                        layer_status(layer)
+                    ));
+                }
+            });
         });
-        let row = dragged
-            .response
-            .interact(egui::Sense::click())
-            .on_hover_text("クリックでアクティブ化、ダブルクリックで名前変更、ドラッグで並べ替え");
-        if row.clicked() {
-            action.get_or_insert(LayersPanelAction::Activate(idx));
+    let rect = frame.response.rect;
+    if is_active && ui.is_rect_visible(rect) {
+        let stripe = egui::Rect::from_min_size(
+            rect.min + egui::vec2(0.0, 4.0),
+            egui::vec2(3.0, rect.height() - 8.0),
+        );
+        ui.painter()
+            .rect_filled(stripe, 2.0, ui.visuals().selection.stroke.color);
+    }
+    rect
+}
+
+fn show_row_menu(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    idx: usize,
+    rename: &mut RenameState,
+    action: &mut Option<LayersPanelAction>,
+) {
+    let Some(layer) = doc.layers.get(idx) else {
+        return;
+    };
+    if ui.button("名前を変更").clicked() {
+        *rename = Some((idx, layer.name.clone(), true));
+        ui.close();
+    }
+    if ui
+        .button(if layer.visible {
+            "非表示にする"
+        } else {
+            "表示する"
+        })
+        .clicked()
+    {
+        *action = Some(LayersPanelAction::SetVisible(idx, !layer.visible));
+        ui.close();
+    }
+    if ui
+        .selectable_label(layer.alpha_lock, "透明部分を保護")
+        .clicked()
+    {
+        *action = Some(LayersPanelAction::ForLayer {
+            uid: layer.uid,
+            command: LayerRowCommand::ToggleAlphaLock,
+        });
+        ui.close();
+    }
+    ui.separator();
+    let can_merge = idx
+        .checked_sub(1)
+        .and_then(|i| doc.layers.get(i))
+        .is_some_and(|below| below.blend == BlendMode::Normal && layer.blend == BlendMode::Normal);
+    for (label, enabled, command) in [
+        (
+            "複製",
+            doc.layers.len() < MAX_LAYERS,
+            LayerRowCommand::Duplicate,
+        ),
+        (
+            "上へ移動",
+            idx + 1 < doc.layers.len(),
+            LayerRowCommand::MoveUp,
+        ),
+        ("下へ移動", idx > 0, LayerRowCommand::MoveDown),
+        ("下と結合", can_merge, LayerRowCommand::MergeDown),
+        ("削除", doc.layers.len() > 1, LayerRowCommand::Delete),
+    ] {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            *action = Some(LayersPanelAction::ForLayer {
+                uid: layer.uid,
+                command,
+            });
+            ui.close();
         }
-        if row.double_clicked() {
-            if let Some(layer) = doc.layers.get(idx) {
-                *rename = Some((idx, layer.name.clone(), true));
-            }
-        }
-    })
-    .response
-    .rect
+    }
 }
 
 /// SPEC §50.1: 目アイコン(チェックボックス廃止)。挙動は従来と同一
@@ -596,7 +767,8 @@ fn show_eye_toggle(
     let Some(visible) = doc.layers.get(idx).map(|l| l.visible) else {
         return;
     };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(EYE_SIZE, EYE_SIZE), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::Vec2::splat(ICON_BUTTON_SIZE), egui::Sense::hover());
     // 安定した id を与える(テストから `Context::read_response` で位置を
     // 引けるようにするため。自動採番の id はレイアウト依存で参照しづらい)。
     let response = ui.interact(
@@ -609,13 +781,30 @@ fn show_eye_toggle(
     } else {
         "非表示(クリックで表示)"
     });
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            visible,
+            "レイヤーの表示",
+        )
+    });
     if ui.is_rect_visible(rect) {
         let color = if visible {
             ui.visuals().widgets.active.fg_stroke.color
         } else {
             ui.visuals().widgets.noninteractive.fg_stroke.color
         };
-        icons::paint_eye_icon(ui.painter(), rect, color, visible);
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        icons::paint_eye_icon(
+            ui.painter(),
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(EYE_SIZE)),
+            color,
+            visible,
+        );
     }
     if response.clicked() {
         action.get_or_insert(LayersPanelAction::SetVisible(idx, !visible));
@@ -634,6 +823,8 @@ fn show_thumbnail(ui: &mut egui::Ui, doc: &Document, idx: usize, thumbnails: &mu
         return;
     };
     let texture = thumbnails.texture(ui.ctx(), idx, layer, doc.width, doc.height, doc.content_gen);
+    ui.painter()
+        .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
     match texture {
         Some(texture) => {
             let size = texture.size_vec2();
@@ -650,25 +841,75 @@ fn show_thumbnail(ui: &mut egui::Ui, doc: &Document, idx: usize, thumbnails: &mu
                 .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
         }
     }
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// 名前(表示のみ。クリック・ダブルクリックは行全体の response が受ける —
 /// `show_layer_row` のコメント参照)。
 fn show_name_label(ui: &mut egui::Ui, doc: &Document, idx: usize, is_active: bool) {
-    let name = doc
-        .layers
-        .get(idx)
-        .map(|l| l.name.clone())
-        .unwrap_or_default();
-    let color = if is_active {
-        ui.visuals().selection.stroke.color
-    } else {
-        ui.visuals().widgets.inactive.fg_stroke.color
+    let Some(layer) = doc.layers.get(idx) else {
+        return;
     };
-    ui.add(egui::Label::new(egui::RichText::new(name).color(color)).truncate());
+    let width = (ui.available_width()
+        - if layer.alpha_lock {
+            EYE_SIZE + ui.spacing().item_spacing.x
+        } else {
+            0.0
+        })
+    .max(0.0);
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let color = if layer.visible {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let mut name = egui::RichText::new(&layer.name).color(color);
+        if is_active {
+            name = name.strong();
+        }
+        ui.add(egui::Label::new(name).truncate());
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(layer_status(layer))
+                    .size(10.0)
+                    .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
+            )
+            .truncate(),
+        );
+    });
+    if layer.alpha_lock {
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(EYE_SIZE), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            icons::paint_alpha_lock_icon(
+                ui.painter(),
+                rect,
+                ui.visuals().widgets.inactive.fg_stroke.color,
+                true,
+            );
+        }
+    }
 }
 
-/// ダブルクリックで開始した名前編集(Enter/フォーカス外しで確定)。
+fn layer_status(layer: &Layer) -> String {
+    let opacity = (layer.opacity as f32 / 255.0 * 100.0).round() as u32;
+    let mut status = format!("{} · {}%", layer.blend.label(), opacity);
+    if !layer.visible {
+        status.push_str(" · 非表示");
+    }
+    if layer.alpha_lock {
+        status.push_str(" · 透明保護");
+    }
+    status
+}
+
+/// 名前編集(Enter/フォーカス外しで確定、Esc でキャンセル)。
 fn show_rename_editor(
     ui: &mut egui::Ui,
     idx: usize,
@@ -680,13 +921,18 @@ fn show_rename_editor(
     };
     let response = ui.add(
         egui::TextEdit::singleline(text)
-            .desired_width(90.0)
+            .desired_width(ui.available_width())
             .id(egui::Id::new(("darask_layer_rename", idx))),
     );
     // 編集開始フレームのみフォーカスを要求する(`RenameState` の
     // ドキュメントコメント参照)。
     if *needs_focus {
         response.request_focus();
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        response.surrender_focus();
+        *rename = None;
+        return;
     }
     let lost_focus = response.lost_focus();
     if let Some((_, _, needs_focus)) = rename.as_mut() {
@@ -708,6 +954,74 @@ fn show_rename_editor(
 mod tests {
     use super::*;
     use crate::document::Background;
+
+    #[test]
+    fn escape_cancels_rename_without_committing() {
+        let ctx = egui::Context::default();
+        let doc = Document::new(4, 4, Background::White);
+        let mut rename = Some((0, "changed name".into(), true));
+        let mut thumbnails = ThumbnailCache::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+        });
+        let mut action = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                action = show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+            },
+        );
+        assert!(action.is_none());
+        assert!(rename.is_none());
+        assert!(!ctx.egui_wants_keyboard_input());
+    }
+
+    #[test]
+    fn long_names_and_locked_layers_fit_a_narrow_panel() {
+        for width in [150.0, 210.0, 320.0] {
+            let ctx = egui::Context::default();
+            crate::ui::theme::apply(&ctx);
+            let mut doc = Document::new(4, 4, Background::White);
+            doc.layers[0].alpha_lock = true;
+            let mut rename = None;
+            let mut thumbnails = ThumbnailCache::default();
+            let mut short_height = 0.0;
+            for name in [
+                "Short",
+                "A very long layer name that must never widen the panel",
+            ] {
+                doc.layers[0].name = name.into();
+                let mut bounds = egui::Rect::NOTHING;
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_width(width);
+                    show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+                    bounds = ui.min_rect();
+                });
+                assert!(bounds.width() <= width + 0.5, "width {width}: {bounds:?}");
+                let row = ctx
+                    .read_response(egui::Id::new(("darask_layer_row", 0)))
+                    .expect("row");
+                if name == "Short" {
+                    short_height = row.rect.height();
+                } else {
+                    assert!(
+                        (row.rect.height() - short_height).abs() <= 0.5,
+                        "width {width}: {:?} vs {short_height}",
+                        row.rect
+                    );
+                }
+            }
+        }
+    }
 
     fn ctx_for<'a>(
         doc: &'a Document,

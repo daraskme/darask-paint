@@ -34,13 +34,32 @@ pub(crate) const JAPANESE_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\msgothic.ttc",
 ];
 
-/// `JAPANESE_FONT_CANDIDATES` を順に試し、最初に読めたバイト列を返す。
-/// 全滅した場合(Win11 では起きない想定、ARCHITECTURE.md §9-4)は `None`
-/// (パニックしない、CLAUDE.md 鉄則)。
+/// 明示指定、Windows システムフォント、Linux Fontconfig の順に探索する。
+/// Nix パッケージは DARASK_FONT_FILE に日本語フォントを設定する。
 pub(crate) fn load_font_bytes() -> Option<Vec<u8>> {
-    JAPANESE_FONT_CANDIDATES
+    if let Some(bytes) =
+        std::env::var_os("DARASK_FONT_FILE").and_then(|path| std::fs::read(path).ok())
+    {
+        return Some(bytes);
+    }
+    if let Some(bytes) = JAPANESE_FONT_CANDIDATES
         .iter()
         .find_map(|path| std::fs::read(path).ok())
+    {
+        return Some(bytes);
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", "sans-serif:lang=ja"])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let path = String::from_utf8(output.stdout).ok()?;
+            return std::fs::read(path.trim()).ok();
+        }
+    }
+    None
 }
 
 /// `.ttc`(フォントコレクション)内でのインデックス。ARCHITECTURE.md §9:
@@ -1720,8 +1739,8 @@ mod tests {
         }
     }
 
-    /// 列の 1 セル目の句読点は、半セル上げるとインクが画像外へ出てしまう。
-    /// はみ出しぶんだけ下げてインクを失わないこと(上端に接する)。
+    /// 先頭の句読点を半セル上げ、はみ出すフォントでは上端に収める。
+    /// IPAex のように元のインク位置が低いフォントでも全体を保持する。
     #[test]
     fn leading_vertical_punctuation_is_not_clipped_at_the_top() {
         let Some(font) = load_test_font() else {
@@ -1734,7 +1753,14 @@ mod tests {
         let (vw, vh, vertical_px) =
             rasterize_text_vertical(&font, "。", 48.0, [0, 0, 0, 255], 0.0, 0.0).expect("ok");
         let (_, vy0, _, vy1) = ink_bounds(vw, vh, &vertical_px).expect("ink");
-        assert_eq!(vy0, 0, "上端に接する(それより上へは出さない)");
+        let font_ref = FontRef::try_from_slice(&font).expect("font");
+        let scaled = font_ref.as_scaled(48.0);
+        let half_cell = (scaled.height() + scaled.line_gap()).max(1.0) / 2.0;
+        let expected_top = (hy0 as f32 - half_cell).max(0.0);
+        assert!(
+            (vy0 as f32 - expected_top).abs() <= 1.0,
+            "半セル上げて上端に収める"
+        );
         assert_eq!(
             vy1 - vy0,
             hy1 - hy0,
