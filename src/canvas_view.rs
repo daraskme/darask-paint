@@ -137,6 +137,9 @@ pub struct CanvasView {
     /// ハンドルでリサイズされたときは `app.rs` が新しい `id` を割り当てる
     /// ので、その場合はここで正しく作り直される)。
     floating_texture: Option<(u64, TextureHandle)>,
+    /// 市松模様の 2×2 テクスチャ(初回描画時に遅延生成)。`Repeat` で
+    /// 敷き詰めて 1 枚の四角形として描く。
+    checker_texture: Option<TextureHandle>,
     gesture: Option<Gesture>,
     last_pointer: Pos2,
     /// 直近フレームでカーソル直下だった画像座標(ステータスバー表示用)。
@@ -164,6 +167,7 @@ impl CanvasView {
             texture: None,
             texture_size: (0, 0),
             floating_texture: None,
+            checker_texture: None,
             gesture: None,
             last_pointer: Pos2::ZERO,
             hover_img: None,
@@ -493,7 +497,10 @@ impl CanvasView {
         let painter = ui.painter_at(rect);
         let image_rect = self.image_screen_rect(doc, ppp);
         if let Some(image_rect) = image_rect {
-            draw_checkerboard(&painter, image_rect.intersect(rect));
+            let checker = self
+                .checker_texture
+                .get_or_insert_with(|| load_checker_texture(ui.ctx()));
+            draw_checkerboard(&painter, checker, image_rect.intersect(rect));
         }
         self.draw_image(&painter, doc, ppp);
 
@@ -830,44 +837,60 @@ fn texture_options() -> TextureOptions {
 fn extract_sub_image(doc: &Document, rect: IRect) -> egui::ColorImage {
     let w = rect.width() as usize;
     let h = rect.height() as usize;
-    let mut bytes = vec![0u8; w * h * 4];
+    let doc_w = doc.width as usize;
+    let mut pixels = Vec::with_capacity(w * h);
     for y in 0..h {
-        let doc_start = ((rect.y0 as usize + y) * doc.width as usize + rect.x0 as usize) * 4;
-        let out_start = y * w * 4;
-        bytes[out_start..out_start + w * 4]
-            .copy_from_slice(&doc.composite[doc_start..doc_start + w * 4]);
+        let doc_start = ((rect.y0 as usize + y) * doc_w + rect.x0 as usize) * 4;
+        let row = &doc.composite[doc_start..doc_start + w * 4];
+        pixels.extend(
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&[r, g, b, a]| Color32::from_rgba_unmultiplied(r, g, b, a)),
+        );
     }
-    egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes)
+    egui::ColorImage::new([w, h], pixels)
+}
+
+const CHECKER_LIGHT: Color32 = Color32::from_gray(205);
+const CHECKER_DARK: Color32 = Color32::from_gray(165);
+
+/// 1 テクセル = 市松 1 マスの 2×2 テクスチャ。
+fn load_checker_texture(ctx: &egui::Context) -> TextureHandle {
+    let image = egui::ColorImage::new(
+        [2, 2],
+        vec![CHECKER_LIGHT, CHECKER_DARK, CHECKER_DARK, CHECKER_LIGHT],
+    );
+    ctx.load_texture(
+        "darask-checker",
+        image,
+        TextureOptions {
+            magnification: TextureFilter::Nearest,
+            minification: TextureFilter::Nearest,
+            wrap_mode: TextureWrapMode::Repeat,
+            mipmap_mode: None,
+        },
+    )
+}
+
+/// 市松模様のテクスチャ座標。マスはスクリーン座標の `CHECKER_CELL` 格子に
+/// 揃う(パンしても模様は画面に固定)。
+fn checker_uv(rect: Rect) -> Rect {
+    let period = CHECKER_CELL * 2.0;
+    Rect::from_min_max(
+        pos2(rect.min.x / period, rect.min.y / period),
+        pos2(rect.max.x / period, rect.max.y / period),
+    )
 }
 
 /// 市松模様(SPEC §3: 透明ピクセルの下に表示)。`rect` は画像の画面上矩形を
-/// viewport にクリップしたもの。
-fn draw_checkerboard(painter: &egui::Painter, rect: Rect) {
+/// viewport にクリップしたもの。マスごとに矩形を積むとズームアウトした
+/// 大画面で数千頂点/フレームになるため、繰り返しテクスチャの四角形 1 枚で描く。
+fn draw_checkerboard(painter: &egui::Painter, texture: &TextureHandle, rect: Rect) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
-    const LIGHT: Color32 = Color32::from_gray(205);
-    const DARK: Color32 = Color32::from_gray(165);
-
-    let col0 = (rect.min.x / CHECKER_CELL).floor() as i64;
-    let row0 = (rect.min.y / CHECKER_CELL).floor() as i64;
-    let col1 = (rect.max.x / CHECKER_CELL).ceil() as i64;
-    let row1 = (rect.max.y / CHECKER_CELL).ceil() as i64;
-
-    for row in row0..row1 {
-        for col in col0..col1 {
-            let cell = Rect::from_min_size(
-                pos2(col as f32 * CHECKER_CELL, row as f32 * CHECKER_CELL),
-                vec2(CHECKER_CELL, CHECKER_CELL),
-            )
-            .intersect(rect);
-            if cell.width() <= 0.0 || cell.height() <= 0.0 {
-                continue;
-            }
-            let color = if (row + col) % 2 == 0 { LIGHT } else { DARK };
-            painter.rect_filled(cell, 0.0, color);
-        }
-    }
+    painter.image(texture.id(), rect, checker_uv(rect), Color32::WHITE);
 }
 
 /// 選択枠の点線の見た目(`draw_dashed_rect`/`draw_selection_mask_outline`
@@ -926,6 +949,39 @@ fn draw_dashed_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_sub_image_matches_unmultiplied_conversion_of_the_region() {
+        let mut doc = Document::new(5, 4, crate::document::Background::Transparent);
+        for (i, b) in doc.composite.iter_mut().enumerate() {
+            *b = (i * 37 % 256) as u8;
+        }
+        let rect = IRect {
+            x0: 1,
+            y0: 1,
+            x1: 4,
+            y1: 3,
+        };
+        let mut bytes = Vec::new();
+        for y in 1..3usize {
+            let start = (y * 5 + 1) * 4;
+            bytes.extend_from_slice(&doc.composite[start..start + 3 * 4]);
+        }
+        let expected = egui::ColorImage::from_rgba_unmultiplied([3, 2], &bytes);
+        let got = extract_sub_image(&doc, rect);
+        assert_eq!(got.size, expected.size);
+        assert_eq!(got.pixels, expected.pixels);
+    }
+
+    #[test]
+    fn checker_uv_maps_one_cell_to_half_a_texture_period() {
+        let uv = checker_uv(Rect::from_min_max(
+            pos2(0.0, CHECKER_CELL),
+            pos2(CHECKER_CELL * 3.0, CHECKER_CELL * 4.0),
+        ));
+        assert_eq!(uv.min, pos2(0.0, 0.5));
+        assert_eq!(uv.max, pos2(1.5, 2.0));
+    }
 
     // -- v3 レビューで発見・修正したバグ: ブラシ/消しゴム使用中の Space・
     // 中ボタンパン中もブラシ円カーソルが描かれ、Grabbing カーソルと二重
