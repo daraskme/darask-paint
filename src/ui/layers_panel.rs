@@ -13,7 +13,7 @@
 //! `commit_open_gesture()` を通してから適用する(メニュー・ツールバーと
 //! 同じ流儀に揃った)。
 //!
-//! v12 §50.1 で行の構成を **[目アイコン][サムネイル][名前]** に刷新し、
+//! v12 §50.1 で行の構成を **[サムネイル][名前][目アイコン]** に刷新し、
 //! ドラッグ&ドロップでの並べ替え(1 undo 単位)と、一覧直上の
 //! 不透明度 / ブレンド / アルファロックを追加した。サムネイルの生成は
 //! `Document::content_gen`(成功した変更でのみ増える世代)が変わった
@@ -85,6 +85,13 @@ const MAX_THUMBNAILS_PER_FRAME: usize = 4;
 const THUMBNAIL_SLOT: egui::Vec2 = egui::vec2(THUMBNAIL_MAX_W as f32, THUMBNAIL_MAX_H as f32);
 /// 目アイコンのサイズ(正方形)。
 const EYE_SIZE: f32 = 16.0;
+/// 一覧の 1 行の最小の高さと左右の余白。
+const ROW_HEIGHT: f32 = 36.0;
+const ROW_PAD: f32 = 4.0;
+/// ツールバー・透明保護トグルのアイコンボタン(正方形)。
+const TOOL_BUTTON: f32 = 22.0;
+/// 行の詳細欄に出す透明保護の錠(正方形)。
+const LOCK_BADGE: f32 = 10.0;
 
 /// v12 §50.1: レイヤーサムネイルのテクスチャキャッシュ(**タブごと**に
 /// `Tab` が 1 個保持する)。
@@ -283,66 +290,116 @@ pub fn show(ui: &mut egui::Ui, ctx: LayersPanelCtx) -> Option<LayersPanelAction>
     }
 
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("新規"))
-            .on_hover_text(keymap::menu_label("新規レイヤー", Action::LayerAdd))
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Add);
-        }
-        if ui
-            .add_enabled(layer_count < MAX_LAYERS, egui::Button::new("複製"))
-            .on_hover_text(keymap::menu_label("レイヤーを複製", Action::LayerDuplicate))
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Duplicate);
-        }
-        // SPEC §13: 「レイヤーが 1 枚のときは削除・結合は無効」。
-        if ui
-            .add_enabled(layer_count > 1, egui::Button::new("削除"))
-            .on_hover_text("レイヤーを削除")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::Delete);
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(active + 1 < layer_count, egui::Button::new("上へ"))
-            .on_hover_text("上へ移動")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MoveUp);
-        }
-        if ui
-            .add_enabled(active > 0, egui::Button::new("下へ"))
-            .on_hover_text("下へ移動")
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MoveDown);
-        }
-        // v12 §50.2: 非通常ブレンドを含む 2 枚は結合できない(グレーアウト)。
-        let can_merge = doc.can_merge_active_down();
-        let merge_hint = if !can_merge && layer_count > 1 && active > 0 {
-            "「通常」以外のブレンドを含むレイヤーは結合できません".to_owned()
-        } else {
-            keymap::menu_label("下のレイヤーと結合", Action::LayerMergeDown)
-        };
-        if ui
-            .add_enabled(can_merge, egui::Button::new("下と結合"))
-            .on_hover_text(merge_hint)
-            .clicked()
-        {
-            action = Some(LayersPanelAction::MergeDown);
-        }
-    });
+    show_layer_toolbar(ui, doc, active, &mut action);
 
     action
 }
 
+/// 一覧下のアイコンツールバー(新規/複製/下と結合/上へ/下へ … 右端に削除)。
+fn show_layer_toolbar(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    active: usize,
+    action: &mut Option<LayersPanelAction>,
+) {
+    let layer_count = doc.layers.len();
+    let (sep, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        sep.x_range(),
+        sep.center().y,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+    ui.add_space(2.0);
+
+    let can_add = layer_count < MAX_LAYERS;
+    // v12 §50.2: 非通常ブレンドを含む 2 枚は結合できない(グレーアウト)。
+    let can_merge = doc.can_merge_active_down();
+    let merge_hint = if !can_merge && layer_count > 1 && active > 0 {
+        "「通常」以外のブレンドを含むレイヤーは結合できません".to_owned()
+    } else {
+        keymap::menu_label("下のレイヤーと結合", Action::LayerMergeDown)
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let buttons = [
+            (
+                can_add,
+                icons::paint_layer_add_icon as IconPaint,
+                keymap::menu_label("新規レイヤー", Action::LayerAdd),
+                LayersPanelAction::Add,
+            ),
+            (
+                can_add,
+                icons::paint_layer_duplicate_icon,
+                keymap::menu_label("レイヤーを複製", Action::LayerDuplicate),
+                LayersPanelAction::Duplicate,
+            ),
+            (
+                can_merge,
+                icons::paint_layer_merge_down_icon,
+                merge_hint,
+                LayersPanelAction::MergeDown,
+            ),
+            (
+                active + 1 < layer_count,
+                icons::paint_layer_move_up_icon,
+                "上へ移動".to_owned(),
+                LayersPanelAction::MoveUp,
+            ),
+            (
+                active > 0,
+                icons::paint_layer_move_down_icon,
+                "下へ移動".to_owned(),
+                LayersPanelAction::MoveDown,
+            ),
+        ];
+        for (enabled, paint, hint, requested) in buttons {
+            if toolbar_button(ui, enabled, paint, hint) {
+                *action = Some(requested);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // SPEC §13: 「レイヤーが 1 枚のときは削除・結合は無効」。
+            if toolbar_button(
+                ui,
+                layer_count > 1,
+                icons::paint_layer_delete_icon,
+                "レイヤーを削除".to_owned(),
+            ) {
+                *action = Some(LayersPanelAction::Delete);
+            }
+        });
+    });
+}
+
+type IconPaint = fn(&egui::Painter, egui::Rect, egui::Color32);
+
+/// 枠なしのアイコンボタン(ホバー時のみ背景)。押されたら `true`。
+fn toolbar_button(ui: &mut egui::Ui, enabled: bool, paint: IconPaint, hint: String) -> bool {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(TOOL_BUTTON, TOOL_BUTTON), sense);
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let mut painter = ui.painter().clone();
+        if !enabled {
+            painter.multiply_opacity(ui.visuals().disabled_alpha());
+        } else if response.hovered() {
+            painter.rect_filled(rect, 3.0, visuals.weak_bg_fill);
+        }
+        paint(&painter, rect.shrink(3.0), visuals.fg_stroke.color);
+    }
+    let clicked = response.clicked();
+    response.on_hover_text(hint);
+    clicked
+}
+
 /// SPEC §50.1: 一覧の直上に置くアクティブレイヤーの設定
-/// (不透明度 §13 / ブレンド §50.2 / アルファロック §50.3)。
+/// (ブレンド §50.2 / アルファロック §50.3 / 不透明度 §13)。
 fn show_active_layer_controls(
     ui: &mut egui::Ui,
     doc: &Document,
@@ -353,25 +410,11 @@ fn show_active_layer_controls(
         return;
     };
 
-    // ARCHITECTURE.md §14.9-8: 値が実際に変わったフレームだけ要求を出す
-    // (ドラッグ中の全面 recomposite を毎フレーム 1 回に抑える)。
-    ui.label("不透明度:");
-    let mut opacity_pct = (layer.opacity as f32 / 255.0 * 100.0).round() as i32;
-    if ui
-        .add(egui::Slider::new(&mut opacity_pct, 0..=100).suffix("%"))
-        .changed()
-    {
-        let new_opacity = ((opacity_pct.clamp(0, 100) as f32) / 100.0 * 255.0).round() as u8;
-        if layer.opacity != new_opacity {
-            *action = Some(LayersPanelAction::SetOpacity(new_opacity));
-        }
-    }
-
     ui.horizontal(|ui| {
-        ui.label("合成:");
+        let lock_w = TOOL_BUTTON + ui.spacing().item_spacing.x;
         egui::ComboBox::from_id_salt("darask_layer_blend")
             .selected_text(layer.blend.label())
-            .width(96.0)
+            .width((ui.available_width() - lock_w).max(60.0))
             .show_ui(ui, |ui| {
                 for mode in BlendMode::ALL {
                     if ui
@@ -382,13 +425,13 @@ fn show_active_layer_controls(
                         *action = Some(LayersPanelAction::SetBlend(mode));
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("合成モード");
 
         // アルファロックのトグル(市松+錠のアイコン、SPEC §50.3)。
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(EYE_SIZE + 6.0, EYE_SIZE + 6.0),
-            egui::Sense::click(),
-        );
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(TOOL_BUTTON, TOOL_BUTTON), egui::Sense::click());
         let response = response.on_hover_text(if layer.alpha_lock {
             "透明保護: ON(透明部分を保護。クリックで解除)"
         } else {
@@ -406,6 +449,23 @@ fn show_active_layer_controls(
         }
         if response.clicked() {
             *action = Some(LayersPanelAction::SetAlphaLock(!layer.alpha_lock));
+        }
+    });
+
+    // ARCHITECTURE.md §14.9-8: 値が実際に変わったフレームだけ要求を出す
+    // (ドラッグ中の全面 recomposite を毎フレーム 1 回に抑える)。
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("不透明度").small());
+        let mut opacity_pct = (layer.opacity as f32 / 255.0 * 100.0).round() as i32;
+        ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(40.0);
+        if ui
+            .add(egui::Slider::new(&mut opacity_pct, 0..=100).suffix("%"))
+            .changed()
+        {
+            let new_opacity = ((opacity_pct.clamp(0, 100) as f32) / 100.0 * 255.0).round() as u8;
+            if layer.opacity != new_opacity {
+                *action = Some(LayersPanelAction::SetOpacity(new_opacity));
+            }
         }
     });
 }
@@ -430,6 +490,7 @@ fn show_layer_list(
 
     let list_response = ui
         .scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             for idx in (0..layer_count).rev() {
                 let row = show_layer_row(ui, doc, idx, active, rename, thumbnails, action);
                 rows.push((idx, row));
@@ -519,8 +580,9 @@ fn draw_insertion_indicator(ui: &egui::Ui, rows: &[(usize, egui::Rect)], slot: u
     );
 }
 
-/// 1 行 = [目アイコン][サムネイル][名前]。戻り値は行全体の矩形
-/// (ドラッグ&ドロップの挿入位置計算に使う)。
+/// 1 行 = [サムネイル][名前 / 合成・不透明度][目アイコン]。戻り値は行全体の
+/// 矩形(ドラッグ&ドロップの挿入位置計算に使う)。背景(アクティブ/ホバー)は
+/// 行を並べた後に先頭へ差し込んだ `Shape` を差し替えて描く。
 ///
 /// **目アイコンはドラッグ源の外に置く**(egui 0.35 の当たり判定は「後から
 /// 登録された widget が上」で、`dnd_drag_source` は中身より**後**に
@@ -543,46 +605,65 @@ fn show_layer_row(
     action: &mut Option<LayersPanelAction>,
 ) -> egui::Rect {
     let is_editing = matches!(rename, Some((i, _, _)) if *i == idx);
-    ui.horizontal(|ui| {
-        show_eye_toggle(ui, doc, idx, action);
-        if is_editing {
-            show_thumbnail(ui, doc, idx, thumbnails);
-            show_rename_editor(ui, idx, rename, action);
-            return;
-        }
-        let is_active = idx == active;
-        let dragged = ui.dnd_drag_source(egui::Id::new(("darask_layer_row", idx)), idx, |ui| {
-            let fill = if is_active {
-                ui.visuals().selection.bg_fill
+    let is_active = idx == active;
+    let background = ui.painter().add(egui::Shape::Noop);
+    let rect = ui
+        .horizontal(|ui| {
+            ui.set_min_height(ROW_HEIGHT);
+            ui.add_space(ROW_PAD);
+            let content_w =
+                (ui.available_width() - EYE_SIZE - ROW_PAD - ui.spacing().item_spacing.x * 2.0)
+                    .max(0.0);
+            if is_editing {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_w, ROW_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_width(content_w);
+                        show_thumbnail(ui, doc, idx, thumbnails);
+                        show_rename_editor(ui, idx, rename, action);
+                    },
+                );
             } else {
-                egui::Color32::TRANSPARENT
-            };
-            // `Frame` は背景を中身より先に描く(自前で `rect_filled` すると
-            // サムネイルの上を塗ってしまう)。
-            egui::Frame::NONE
-                .fill(fill)
-                .inner_margin(egui::Margin::symmetric(2, 1))
-                .corner_radius(3.0)
-                .show(ui, |ui| {
-                    show_thumbnail(ui, doc, idx, thumbnails);
-                    show_name_label(ui, doc, idx, is_active);
-                });
-        });
-        let row = dragged
-            .response
-            .interact(egui::Sense::click())
-            .on_hover_text("クリックでアクティブ化、ダブルクリックで名前変更、ドラッグで並べ替え");
-        if row.clicked() {
-            action.get_or_insert(LayersPanelAction::Activate(idx));
-        }
-        if row.double_clicked() {
-            if let Some(layer) = doc.layers.get(idx) {
-                *rename = Some((idx, layer.name.clone(), true));
+                let dragged =
+                    ui.dnd_drag_source(egui::Id::new(("darask_layer_row", idx)), idx, |ui| {
+                        ui.set_width(content_w);
+                        ui.horizontal(|ui| {
+                            show_thumbnail(ui, doc, idx, thumbnails);
+                            show_name_label(ui, doc, idx, is_active);
+                        });
+                    });
+                let row = dragged
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_text(
+                        "クリックでアクティブ化、ダブルクリックで名前変更、ドラッグで並べ替え",
+                    );
+                if row.clicked() {
+                    action.get_or_insert(LayersPanelAction::Activate(idx));
+                }
+                if row.double_clicked() {
+                    if let Some(layer) = doc.layers.get(idx) {
+                        *rename = Some((idx, layer.name.clone(), true));
+                    }
+                }
             }
-        }
-    })
-    .response
-    .rect
+            show_eye_toggle(ui, doc, idx, action);
+        })
+        .response
+        .rect;
+
+    let visuals = ui.visuals();
+    let fill = if is_active {
+        visuals.selection.bg_fill
+    } else if ui.rect_contains_pointer(rect) {
+        visuals.widgets.hovered.weak_bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter()
+        .set(background, egui::Shape::rect_filled(rect, 3.0, fill));
+    rect
 }
 
 /// SPEC §50.1: 目アイコン(チェックボックス廃止)。挙動は従来と同一
@@ -610,10 +691,12 @@ fn show_eye_toggle(
         "非表示(クリックで表示)"
     });
     if ui.is_rect_visible(rect) {
-        let color = if visible {
-            ui.visuals().widgets.active.fg_stroke.color
+        let color = if response.hovered() {
+            ui.visuals().widgets.hovered.fg_stroke.color
+        } else if visible {
+            ui.visuals().widgets.inactive.fg_stroke.color
         } else {
-            ui.visuals().widgets.noninteractive.fg_stroke.color
+            ui.visuals().weak_text_color()
         };
         icons::paint_eye_icon(ui.painter(), rect, color, visible);
     }
@@ -624,7 +707,7 @@ fn show_eye_toggle(
 
 /// SPEC §50.1: サムネイル(最大 40×30・縦横比維持・市松下地・そのレイヤーの
 /// 画素のみ)。可視行かつ世代が変わったときだけ生成し、まだ無い行は
-/// プレースホルダ(単色矩形)を描く。
+/// プレースホルダ(単色矩形)を描く。非表示レイヤーは薄く描く。
 fn show_thumbnail(ui: &mut egui::Ui, doc: &Document, idx: usize, thumbnails: &mut ThumbnailCache) {
     let (rect, _) = ui.allocate_exact_size(THUMBNAIL_SLOT, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -634,38 +717,79 @@ fn show_thumbnail(ui: &mut egui::Ui, doc: &Document, idx: usize, thumbnails: &mu
         return;
     };
     let texture = thumbnails.texture(ui.ctx(), idx, layer, doc.width, doc.height, doc.content_gen);
-    match texture {
+    let draw = match texture {
         Some(texture) => {
-            let size = texture.size_vec2();
-            let draw = egui::Rect::from_center_size(rect.center(), size).intersect(rect);
+            let draw =
+                egui::Rect::from_center_size(rect.center(), texture.size_vec2()).intersect(rect);
+            let tint = if layer.visible {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_white_alpha(90)
+            };
             ui.painter().image(
                 texture.id(),
                 draw,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+                tint,
             );
+            draw
         }
         None => {
             ui.painter()
-                .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+                .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+            rect
         }
-    }
+    };
+    ui.painter().rect_stroke(
+        draw,
+        0.0,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Outside,
+    );
 }
 
-/// 名前(表示のみ。クリック・ダブルクリックは行全体の response が受ける —
+/// 名前と、その下に小さく「合成モード 不透明度%」(+透明保護の錠)。表示のみ
+/// (クリック・ダブルクリックは行全体の response が受ける —
 /// `show_layer_row` のコメント参照)。
 fn show_name_label(ui: &mut egui::Ui, doc: &Document, idx: usize, is_active: bool) {
-    let name = doc
-        .layers
-        .get(idx)
-        .map(|l| l.name.clone())
-        .unwrap_or_default();
-    let color = if is_active {
-        ui.visuals().selection.stroke.color
-    } else {
-        ui.visuals().widgets.inactive.fg_stroke.color
+    let Some(layer) = doc.layers.get(idx) else {
+        return;
     };
-    ui.add(egui::Label::new(egui::RichText::new(name).color(color)).truncate());
+    let visuals = ui.visuals();
+    let (name_color, detail_color) = if is_active {
+        (
+            visuals.selection.stroke.color,
+            visuals.selection.stroke.color.gamma_multiply(0.75),
+        )
+    } else if layer.visible {
+        (
+            visuals.widgets.inactive.fg_stroke.color,
+            visuals.weak_text_color(),
+        )
+    } else {
+        (
+            visuals.weak_text_color(),
+            visuals.weak_text_color().gamma_multiply(0.7),
+        )
+    };
+    let opacity_pct = (layer.opacity as f32 / 255.0 * 100.0).round() as i32;
+    let detail = format!("{} {}%", layer.blend.label(), opacity_pct);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add(egui::Label::new(egui::RichText::new(&layer.name).color(name_color)).truncate());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.add(
+                egui::Label::new(egui::RichText::new(detail).small().color(detail_color))
+                    .truncate(),
+            );
+            if layer.alpha_lock {
+                let (rect, _) = ui
+                    .allocate_exact_size(egui::vec2(LOCK_BADGE, LOCK_BADGE), egui::Sense::hover());
+                icons::paint_alpha_lock_icon(ui.painter(), rect, detail_color, true);
+            }
+        });
+    });
 }
 
 /// ダブルクリックで開始した名前編集(Enter/フォーカス外しで確定)。
