@@ -178,8 +178,13 @@ impl BrushEngine {
         // 参照)。
         let mut original_cursor = ctx.history.original_pixel_cursor();
         let mut surface = ctx.doc.active_surface_mut(ctx.clip);
+        let reach = raster::stamp_reach(params.radius, params.hardness, params.pencil);
         for y in bounds.y0..bounds.y1 {
-            for x in bounds.x0..bounds.x1 {
+            // 外接矩形のうちスタンプ円と交わらない部分(≈ 21%)は走査しない。
+            let Some((xs, xe)) = raster::circle_row_span(cx, cy, reach, y, bounds) else {
+                continue;
+            };
+            for x in xs..xe {
                 let coverage_here = if params.pencil {
                     raster::stamp_pencil_coverage(cx, cy, params.radius, x, y)
                 } else {
@@ -189,17 +194,15 @@ impl BrushEngine {
                 let Some(slot) = self.mask.get_mut(idx) else {
                     continue;
                 };
-                if coverage_here > *slot {
-                    *slot = coverage_here;
-                }
-                let coverage = *slot;
-                // カバレッジ 0 の画素はこのストロークでまだ一度も触れて
-                // おらず、合成結果は元画素そのもの(書き戻しは無変化)なので
-                // スキップする(外接矩形のうち円の外側 ≈ 21% + ソフト
-                // ブラシの減衰帯外)。
-                if coverage == 0 {
+                // 画素値は「元画素 × マスク値」だけで決まるため、マスクが
+                // 増えない画素(未被覆の画素、および先行スタンプで既に同等
+                // 以上に塗られた画素)の書き戻しは無変化になりスキップできる。
+                // 高密度に重なるストロークでは合成の大半がここで省ける。
+                if coverage_here <= *slot {
                     continue;
                 }
+                *slot = coverage_here;
+                let coverage = coverage_here;
                 let original = original_cursor
                     .get(x, y)
                     .or_else(|| surface.get_pixel(x, y))
