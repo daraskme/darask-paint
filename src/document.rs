@@ -43,11 +43,21 @@ impl IdAllocator {
 
     /// 次の ID。枯渇(`u64::MAX` まで配り切った)なら `None`。
     pub fn next(&self) -> Option<u64> {
-        self.0
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
-                v.checked_add(1)
-            })
-            .ok()
+        // `fetch_update` は新しい stable で非推奨、後継 `try_update` は古い
+        // toolchain に無いので、どちらでも通る CAS ループで書く。
+        let mut current = self.0.load(AtomicOrdering::Relaxed);
+        loop {
+            let next = current.checked_add(1)?;
+            match self.0.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(previous) => return Some(previous),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// 枯渇時に `INVALID_ID` へ倒す版(ID を持てないと構造体が作れない
