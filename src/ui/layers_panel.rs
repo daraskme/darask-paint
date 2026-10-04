@@ -55,6 +55,21 @@ pub enum LayersPanelAction {
     SetAlphaLock(bool),
     /// 名前変更の確定(ダブルクリック編集の Enter/フォーカス外し)。
     CommitRename(usize, String),
+    /// 行メニューはアクティブ行ではなく、開いたレイヤーを操作する。
+    ForLayer {
+        uid: u64,
+        command: LayerRowCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRowCommand {
+    Duplicate,
+    Delete,
+    MoveUp,
+    MoveDown,
+    MergeDown,
+    ToggleAlphaLock,
 }
 
 /// ダブルクリックで開始した名前編集の状態(`app.rs` が保持する)。
@@ -633,19 +648,22 @@ fn show_layer_row(
                             show_name_label(ui, doc, idx, is_active);
                         });
                     });
-                let row = dragged
-                    .response
-                    .interact(egui::Sense::click())
-                    .on_hover_text(
-                        "クリックでアクティブ化、ダブルクリックで名前変更、ドラッグで並べ替え",
-                    );
-                if row.clicked() {
+                let row = dragged.response.interact(egui::Sense::click());
+                if row.clicked() || row.secondary_clicked() {
                     action.get_or_insert(LayersPanelAction::Activate(idx));
                 }
                 if row.double_clicked() {
                     if let Some(layer) = doc.layers.get(idx) {
                         *rename = Some((idx, layer.name.clone(), true));
                     }
+                }
+                row.context_menu(|ui| show_row_menu(ui, doc, idx, rename, action));
+                if let Some(layer) = doc.layers.get(idx) {
+                    row.on_hover_text(format!(
+                        "{}\n{}\nクリックでアクティブ化 / ダブルクリックで名前変更 / ドラッグで並べ替え / 右クリックで操作",
+                        layer.name,
+                        layer_status(layer)
+                    ));
                 }
             }
             show_eye_toggle(ui, doc, idx, action);
@@ -664,6 +682,83 @@ fn show_layer_row(
     ui.painter()
         .set(background, egui::Shape::rect_filled(rect, 3.0, fill));
     rect
+}
+
+fn show_row_menu(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    idx: usize,
+    rename: &mut RenameState,
+    action: &mut Option<LayersPanelAction>,
+) {
+    let Some(layer) = doc.layers.get(idx) else {
+        return;
+    };
+    if ui.button("名前を変更").clicked() {
+        *rename = Some((idx, layer.name.clone(), true));
+        ui.close();
+    }
+    if ui
+        .button(if layer.visible {
+            "非表示にする"
+        } else {
+            "表示する"
+        })
+        .clicked()
+    {
+        *action = Some(LayersPanelAction::SetVisible(idx, !layer.visible));
+        ui.close();
+    }
+    if ui
+        .selectable_label(layer.alpha_lock, "透明部分を保護")
+        .clicked()
+    {
+        *action = Some(LayersPanelAction::ForLayer {
+            uid: layer.uid,
+            command: LayerRowCommand::ToggleAlphaLock,
+        });
+        ui.close();
+    }
+    ui.separator();
+    let can_merge = idx
+        .checked_sub(1)
+        .and_then(|i| doc.layers.get(i))
+        .is_some_and(|below| below.blend == BlendMode::Normal && layer.blend == BlendMode::Normal);
+    for (label, enabled, command) in [
+        (
+            "複製",
+            doc.layers.len() < MAX_LAYERS,
+            LayerRowCommand::Duplicate,
+        ),
+        (
+            "上へ移動",
+            idx + 1 < doc.layers.len(),
+            LayerRowCommand::MoveUp,
+        ),
+        ("下へ移動", idx > 0, LayerRowCommand::MoveDown),
+        ("下と結合", can_merge, LayerRowCommand::MergeDown),
+        ("削除", doc.layers.len() > 1, LayerRowCommand::Delete),
+    ] {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            *action = Some(LayersPanelAction::ForLayer {
+                uid: layer.uid,
+                command,
+            });
+            ui.close();
+        }
+    }
+}
+
+fn layer_status(layer: &Layer) -> String {
+    let opacity = (layer.opacity as f32 / 255.0 * 100.0).round() as u32;
+    let mut status = format!("{} · {}%", layer.blend.label(), opacity);
+    if !layer.visible {
+        status.push_str(" · 非表示");
+    }
+    if layer.alpha_lock {
+        status.push_str(" · 透明保護");
+    }
+    status
 }
 
 /// SPEC §50.1: 目アイコン(チェックボックス廃止)。挙動は従来と同一
@@ -689,6 +784,14 @@ fn show_eye_toggle(
         "表示中(クリックで非表示)"
     } else {
         "非表示(クリックで表示)"
+    });
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            visible,
+            "レイヤーの表示",
+        )
     });
     if ui.is_rect_visible(rect) {
         let color = if response.hovered() {
@@ -792,7 +895,7 @@ fn show_name_label(ui: &mut egui::Ui, doc: &Document, idx: usize, is_active: boo
     });
 }
 
-/// ダブルクリックで開始した名前編集(Enter/フォーカス外しで確定)。
+/// 名前編集(Enter/フォーカス外しで確定、Esc でキャンセル)。
 fn show_rename_editor(
     ui: &mut egui::Ui,
     idx: usize,
@@ -804,13 +907,18 @@ fn show_rename_editor(
     };
     let response = ui.add(
         egui::TextEdit::singleline(text)
-            .desired_width(90.0)
+            .desired_width(ui.available_width())
             .id(egui::Id::new(("darask_layer_rename", idx))),
     );
     // 編集開始フレームのみフォーカスを要求する(`RenameState` の
     // ドキュメントコメント参照)。
     if *needs_focus {
         response.request_focus();
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        response.surrender_focus();
+        *rename = None;
+        return;
     }
     let lost_focus = response.lost_focus();
     if let Some((_, _, needs_focus)) = rename.as_mut() {
@@ -832,6 +940,74 @@ fn show_rename_editor(
 mod tests {
     use super::*;
     use crate::document::Background;
+
+    #[test]
+    fn escape_cancels_rename_without_committing() {
+        let ctx = egui::Context::default();
+        let doc = Document::new(4, 4, Background::White);
+        let mut rename = Some((0, "changed name".into(), true));
+        let mut thumbnails = ThumbnailCache::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+        });
+        let mut action = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                action = show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+            },
+        );
+        assert!(action.is_none());
+        assert!(rename.is_none());
+        assert!(!ctx.egui_wants_keyboard_input());
+    }
+
+    #[test]
+    fn long_names_and_locked_layers_fit_a_narrow_panel() {
+        for width in [150.0, 210.0, 320.0] {
+            let ctx = egui::Context::default();
+            crate::ui::theme::apply(&ctx);
+            let mut doc = Document::new(4, 4, Background::White);
+            doc.layers[0].alpha_lock = true;
+            let mut rename = None;
+            let mut thumbnails = ThumbnailCache::default();
+            let mut short_height = 0.0;
+            for name in [
+                "Short",
+                "A very long layer name that must never widen the panel",
+            ] {
+                doc.layers[0].name = name.into();
+                let mut bounds = egui::Rect::NOTHING;
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_width(width);
+                    show(ui, ctx_for(&doc, &mut rename, &mut thumbnails));
+                    bounds = ui.min_rect();
+                });
+                assert!(bounds.width() <= width + 0.5, "width {width}: {bounds:?}");
+                let row = ctx
+                    .read_response(egui::Id::new(("darask_layer_row", 0)))
+                    .expect("row");
+                if name == "Short" {
+                    short_height = row.rect.height();
+                } else {
+                    assert!(
+                        (row.rect.height() - short_height).abs() <= 0.5,
+                        "width {width}: {:?} vs {short_height}",
+                        row.rect
+                    );
+                }
+            }
+        }
+    }
 
     fn ctx_for<'a>(
         doc: &'a Document,

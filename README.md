@@ -2,13 +2,25 @@
 
 [![CI](https://github.com/daraskme/darask-paint/actions/workflows/ci.yml/badge.svg)](https://github.com/daraskme/darask-paint/actions/workflows/ci.yml)
 
-超高速起動・軽量・シンプルな Windows 用ラスタ画像編集ソフトです。
+超高速起動・軽量・シンプルな Windows / NixOS 用ラスタ画像編集ソフトです。
 Krita のような多機能ペイントソフトの起動待ちにうんざりした人向けに、
 「起動が速いこと」を最優先に作られています。
 
 Rust + eframe/egui 製、単一 exe(ランタイム・インストーラ不要)。UI はすべて日本語です。
 
 スクリーンショットはありません(README では省略しています)。
+
+## NixOS で起動する
+
+```sh
+nix run .
+```
+
+このリポジトリを clone したディレクトリで実行します。Nix の `nix-command` / `flakes` を有効にしてください。
+Wayland / X11、日本語フォント、ファイルダイアログ、プラグイン用端末を Nix パッケージで用意します。
+ビルドは `nix build`、開発環境は `nix develop` です。
+詳しい導入・AI プラグイン・GPU の設定は [NixOS 手順](docs/NIXOS.md) を参照してください。
+以下の exe / bat の説明は Windows 向けです。
 
 ## 特徴
 

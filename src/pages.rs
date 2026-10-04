@@ -111,6 +111,7 @@ fn trim_leading_zeroes(digits: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::ffi::OsString;
 
     #[test]

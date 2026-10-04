@@ -6,8 +6,8 @@ repository = "https://github.com/daraskme/darask-paint"
 
 [dependencies]
 ab_glyph = "=0.2.32"
-arboard = "3.6.1"
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts"] }
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "ico"] }
 rfd = "0.17.2"
 
