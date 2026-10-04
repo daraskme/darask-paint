@@ -215,7 +215,10 @@ pub fn stamp_round(
     let r2 = hard_edge_radius(radius).powi(2);
     let write = if erase { [0, 0, 0, 0] } else { color };
     for y in bounds.y0..bounds.y1 {
-        for x in bounds.x0..bounds.x1 {
+        let Some((xs, xe)) = circle_row_span(cx, cy, r2.sqrt(), y, bounds) else {
+            continue;
+        };
+        for x in xs..xe {
             let dx = x as f32 + 0.5 - cx;
             let dy = y as f32 + 0.5 - cy;
             if dx * dx + dy * dy <= r2 {
@@ -251,6 +254,34 @@ pub fn stroke_segment(
         stamp_round(surface, x, y, radius, color, erase);
     }
     segment_bounds(from, to, radius).clamp_to(surface.width, surface.height)
+}
+
+/// 中心 `(cx, cy)`・半径 `reach` の円に画素中心が入りうる行 `y` の x 範囲
+/// `[xs, xe)` を `bounds` 内で返す(円と交わらない行は `None`)。
+/// 1px の余裕を持たせた保守的な範囲なので、呼び出し側は範囲内で従来どおり
+/// 画素ごとの厳密な判定を行えば結果は外接矩形全体を走査した場合と一致する
+/// (範囲外の画素は必ず円の外)。
+pub fn circle_row_span(cx: f32, cy: f32, reach: f32, y: i32, bounds: IRect) -> Option<(i32, i32)> {
+    let dy = y as f32 + 0.5 - cy;
+    let h2 = reach * reach - dy * dy;
+    if h2 < -2.0 * reach.max(1.0) {
+        return None;
+    }
+    let half = h2.max(0.0).sqrt() + 1.0;
+    let xs = ((cx - 0.5 - half).floor() as i32).max(bounds.x0);
+    let xe = ((cx - 0.5 + half).ceil() as i32 + 1).min(bounds.x1);
+    (xs < xe).then_some((xs, xe))
+}
+
+/// `stamp_soft_coverage`(`pencil` なら `stamp_pencil_coverage`)が 0 より
+/// 大きくなりうる画素中心までの距離の上限。
+pub fn stamp_reach(radius: f32, hardness: f32, pencil: bool) -> f32 {
+    if pencil {
+        hard_edge_radius(radius)
+    } else {
+        let r = radius.max(0.0);
+        r.max(r * hardness.clamp(0.0, 1.0) + 0.5)
+    }
 }
 
 /// straight-alpha の source-over 合成(ARCHITECTURE.md §5)。
@@ -1425,6 +1456,34 @@ fn copy_extent_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn circle_row_span_covers_every_pixel_inside_the_reach() {
+        let bounds = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 64,
+            y1: 64,
+        };
+        for &(cx, cy, reach) in &[
+            (20.3, 30.7, 0.75),
+            (31.5, 31.5, 12.0),
+            (10.0, 50.2, 25.4),
+            (0.1, 63.9, 5.5),
+        ] {
+            for y in bounds.y0..bounds.y1 {
+                let span = circle_row_span(cx, cy, reach, y, bounds);
+                for x in bounds.x0..bounds.x1 {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    if dx * dx + dy * dy <= reach * reach {
+                        let (xs, xe) = span.expect("row intersecting the circle has a span");
+                        assert!(xs <= x && x < xe, "({x},{y}) outside span {xs}..{xe}");
+                    }
+                }
+            }
+        }
+    }
 
     fn reference_flood_mask(surface: &Surface, x: i32, y: i32, tolerance: u8) -> SelMask {
         let Some(target) = surface.get_pixel(x, y) else {

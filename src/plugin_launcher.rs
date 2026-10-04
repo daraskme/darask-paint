@@ -301,7 +301,9 @@ pub fn launch(plugin: &InstalledPlugin) -> Result<(), LaunchError> {
 
 fn launcher_command(plugin: &InstalledPlugin) -> Result<Command, LaunchError> {
     // Resolve before changing cwd: configured plugin folders may be relative.
-    let launcher = fs::canonicalize(&plugin.launcher).map_err(LaunchError::Spawn)?;
+    // `canonicalize` would yield a `\\?\` verbatim path on Windows, which
+    // cmd.exe cannot use as a script path or current directory.
+    let launcher = std::path::absolute(&plugin.launcher).map_err(LaunchError::Spawn)?;
     #[cfg(windows)]
     let mut command = {
         use std::os::windows::process::CommandExt;
@@ -520,7 +522,7 @@ mod tests {
         assert_eq!(args[3], "bash");
         assert_eq!(
             args[4],
-            fs::canonicalize(&plugin.launcher).expect("absolute path")
+            std::path::absolute(&plugin.launcher).expect("absolute path")
         );
         fs::write(
             dir.join(MANIFEST_FILE),

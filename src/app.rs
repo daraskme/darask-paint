@@ -1645,12 +1645,13 @@ impl DaraskApp {
     /// shortcuts` が別枠のまま処理する、`keymap` モジュールドキュメント
     /// コメント参照)。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // egui は Esc のフレーム開始時にフォーカスを外す。編集中の状態も
+        // egui は Esc のフレーム開始時にフォーカスを外す。名前編集中の Esc を
         // ガードしないと、一覧より前に Esc を消費して名前変更を確定してしまう。
-        if self.active_tab().layer_rename.is_some()
-            || ctx.egui_wants_keyboard_input()
-            || self.modal.is_some()
-        {
+        // Esc に限定するのは、編集欄が描かれない状態(パネル非表示など)で
+        // 全ショートカットが効かなくなるのを避けるため。
+        let rename_escape = self.active_tab().layer_rename.is_some()
+            && ctx.input(|input| input.key_pressed(Key::Escape));
+        if rename_escape || ctx.egui_wants_keyboard_input() || self.modal.is_some() {
             return;
         }
         // v3 §18: Enter(確定)/Esc(キャンセル)は選択/移動ツール使用中のみ
