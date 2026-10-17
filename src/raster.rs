@@ -14,8 +14,8 @@
 //! (以前は `Document::mark_dirty` を内部で直接呼んでいたが、`Document` を
 //! 知らなくなったため、dirty のマージは呼び出し側の責務になった)。
 //!
-//! ピクセルアクセスは常に `Surface::get_pixel`/`set_pixel` 経由で行い、
-//! 境界外書き込みでパニックしないという方針(CLAUDE.md 鉄則)を守る。
+//! ピクセルアクセスは `Surface` のメソッドまたは境界確認済みの行スライスで
+//! 行い、境界外書き込みでパニックしないという方針(CLAUDE.md 鉄則)を守る。
 
 use crate::document::{IRect, SelMask};
 
@@ -36,8 +36,8 @@ pub struct Surface<'a> {
     /// v12 §50.3: アルファロック(透明部分の保護)。`clip` と全く同じ設計で、
     /// **書き込みの唯一の集約点である `set_pixel` だけがこれを見る** ため、
     /// ブラシ/鉛筆/消しゴム/図形/グラデーション/色調補正など `set_pixel` 経由で
-    /// 書くすべての経路が自動的にロックへ従う(`flood_fill` の行スライス
-    /// 直書きだけは別途 alpha-aware にしてある)。
+    /// 書くすべての経路が自動的にロックへ従う(`flood_fill`・`apply_mosaic`
+    /// の行スライス直書きにも同じロック規則を適用する)。
     ///
     /// `Document::active_surface_mut` がアクティブレイヤーの
     /// `Layer::alpha_lock` をそのまま渡す。浮動片の確定合成・貼り付け・
@@ -288,6 +288,7 @@ pub fn stamp_reach(radius: f32, hardness: f32, pencil: bool) -> f32 {
 /// `dst`/`src`/戻り値はいずれも straight alpha の RGBA8。
 /// ペンの AA モード(tools/pen.rs)や v2 のレイヤー合成
 /// (`Document::recomposite`)が使う。
+#[inline]
 pub fn blend_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
     // 出現頻度の高い 3 ケース(透明ソース / 不透明ソース / 透明デスト)は
     // 汎用の浮動小数計算と結果が 1 バイトも変わらないため、除算を省いて
@@ -299,7 +300,29 @@ pub fn blend_over(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
     if src[3] == 255 || dst[3] == 0 {
         return src;
     }
+    if dst[3] == 255 {
+        return blend_over_opaque_destination(dst, src);
+    }
     blend_over_general(dst, src)
+}
+
+// 不透明な背景では出力 α も 255。整数補間は色・α の全 256^3 通りで
+// 旧 f32 式の四捨五入まで一致する。中間値は最大 65,152。
+// この分岐を別関数に保つことで、透明/不透明ソースの既存の高速経路を
+// コンパクトに保つ。インライン化すると合成ベンチでその経路が遅くなる。
+#[inline(never)]
+fn blend_over_opaque_destination(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
+    let alpha = u32::from(src[3]);
+    let inverse = 255 - alpha;
+    let mix = |s: u8, d: u8| -> u8 {
+        ((u32::from(s) * alpha + u32::from(d) * inverse + 127) / 255) as u8
+    };
+    [
+        mix(src[0], dst[0]),
+        mix(src[1], dst[1]),
+        mix(src[2], dst[2]),
+        255,
+    ]
 }
 
 fn blend_over_general(dst: [u8; 4], src: [u8; 4]) -> [u8; 4] {
@@ -1071,11 +1094,11 @@ pub fn auto_block_size(width: u32, height: u32) -> u32 {
 ///
 /// - **格子は画像全体に固定**(`block` の倍数境界)。選択の形に依存しないので、
 ///   隣接する領域に 2 回かけても格子がズレない。
-/// - **平均には選択マスク外の画素も含む**(ブロック全体の平均)。読み取りは
-///   `Surface::get_pixel`(クリップを見ない)なのでこれが自然に成立する。
-/// - **置換は選択内の画素のみ**: 書き込みは `Surface::set_pixel` を通すので、
-///   選択クリップ(`Surface::clip`)とアルファロック(§50.3: α 保存・
-///   `dst_a == 0` スキップ)が 1 箇所で効く。
+/// - **平均には選択マスク外の画素も含む**(ブロック全体の平均)。読み取り時は
+///   クリップを見ず、ブロック内の行スライス全体を読む。
+/// - **置換は選択内の画素のみ**: 行スライスの書き込みにも `Surface::set_pixel`
+///   と同じ選択クリップとアルファロック(§50.3: α 保存・`dst_a == 0`
+///   スキップ)を適用する。
 /// - 端の欠けブロックは**実在画素のみ**で平均する(画像外は数えない)。
 /// - 平均は **α 加重**: RGB は α を重みとする加重平均、α は単純平均。
 ///   ブロックが全透明なら透明黒(RGB も 0)。
@@ -1091,16 +1114,29 @@ pub fn apply_mosaic(surface: &mut Surface, region: IRect, block: u32) -> IRect {
     if bounds.is_empty() {
         return bounds;
     }
+    // 選択 bbox の外は書き込まない。平均に使う範囲は、この矩形ではなく
+    // 従来どおり画像原点に整列したブロック全体とする。
+    let write_bounds = surface.clip.map_or(bounds, |clip| IRect {
+        x0: bounds.x0.max(clip.bbox.x0),
+        y0: bounds.y0.max(clip.bbox.y0),
+        x1: bounds.x1.min(clip.bbox.x1),
+        y1: bounds.y1.min(clip.bbox.y1),
+    });
+    if write_bounds.is_empty() {
+        return bounds;
+    }
     let block = block.max(1) as i32;
 
-    // 格子(画像原点固定)のうち `bounds` に掛かるものだけを回す。
-    let first_bx = bounds.x0.div_euclid(block);
-    let last_bx = (bounds.x1 - 1).div_euclid(block);
-    let first_by = bounds.y0.div_euclid(block);
-    let last_by = (bounds.y1 - 1).div_euclid(block);
+    // 格子(画像原点固定)のうち書き込み範囲に掛かるものだけを回す。
+    let first_bx = write_bounds.x0.div_euclid(block);
+    let last_bx = (write_bounds.x1 - 1).div_euclid(block);
+    let first_by = write_bounds.y0.div_euclid(block);
+    let last_by = (write_bounds.y1 - 1).div_euclid(block);
 
     let width = surface.width as i32;
     let height = surface.height as i32;
+    // 不完全な末尾画素は get_pixel と同様に読み書きしない。
+    let pixels = surface.pixels.as_chunks_mut::<4>().0;
 
     for by in first_by..=last_by {
         // 平均を取る範囲は「ブロック ∩ 画像」(マスクも region も見ない)。
@@ -1117,10 +1153,13 @@ pub fn apply_mosaic(surface: &mut Surface, region: IRect, block: u32) -> IRect {
             let mut sum_a = 0f32;
             let mut count = 0f32;
             for y in avg_y0..avg_y1 {
-                for x in avg_x0..avg_x1 {
-                    let Some(px) = surface.get_pixel(x, y) else {
-                        continue;
-                    };
+                let start = y as usize * width as usize + avg_x0 as usize;
+                let end = (start + (avg_x1 - avg_x0) as usize).min(pixels.len());
+                let Some(row) = pixels.get(start..end) else {
+                    continue;
+                };
+                // 加算順と f32 演算は維持し、既存の丸め結果まで一致させる。
+                for px in row {
                     let a = px[3] as f32 / 255.0;
                     sum_rgb[0] += px[0] as f32 * a;
                     sum_rgb[1] += px[1] as f32 * a;
@@ -1139,15 +1178,44 @@ pub fn apply_mosaic(surface: &mut Surface, region: IRect, block: u32) -> IRect {
                     color[c] = (sum_rgb[c] / sum_a).round().clamp(0.0, 255.0) as u8;
                 }
             }
-            // 書き込みは「ブロック ∩ 対象領域」だけ(選択クリップとアルファ
-            // ロックは `set_pixel` が見る)。
-            let write_x0 = avg_x0.max(bounds.x0);
-            let write_x1 = avg_x1.min(bounds.x1);
-            let write_y0 = avg_y0.max(bounds.y0);
-            let write_y1 = avg_y1.min(bounds.y1);
+            // 境界判定・画素/マスクのオフセット計算は 1 行に 1 回。
+            let write_x0 = avg_x0.max(write_bounds.x0);
+            let write_x1 = avg_x1.min(write_bounds.x1);
+            let write_y0 = avg_y0.max(write_bounds.y0);
+            let write_y1 = avg_y1.min(write_bounds.y1);
             for y in write_y0..write_y1 {
-                for x in write_x0..write_x1 {
-                    surface.set_pixel(x, y, color);
+                let start = y as usize * width as usize + write_x0 as usize;
+                let end = (start + (write_x1 - write_x0) as usize).min(pixels.len());
+                let Some(row) = pixels.get_mut(start..end) else {
+                    continue;
+                };
+                if let Some(clip) = surface.clip {
+                    let mask_start = (y - clip.bbox.y0) as usize * clip.bbox.width() as usize
+                        + (write_x0 - clip.bbox.x0) as usize;
+                    let mask_end = (mask_start + row.len()).min(clip.mask.len());
+                    let Some(mask_row) = clip.mask.get(mask_start..mask_end) else {
+                        continue;
+                    };
+                    for (pixel, &selected) in row.iter_mut().zip(mask_row) {
+                        if selected == 0 {
+                            continue;
+                        }
+                        if surface.alpha_lock {
+                            if pixel[3] != 0 {
+                                pixel[..3].copy_from_slice(&color[..3]);
+                            }
+                        } else {
+                            *pixel = color;
+                        }
+                    }
+                } else if surface.alpha_lock {
+                    for pixel in row {
+                        if pixel[3] != 0 {
+                            pixel[..3].copy_from_slice(&color[..3]);
+                        }
+                    }
+                } else {
+                    row.fill(color);
                 }
             }
         }
@@ -1850,6 +1918,25 @@ mod tests {
                 let dst = [v ^ 0x5a, 7, 200, 0];
                 let src = [v, 9, 100, a];
                 assert_eq!(blend_over(dst, src), blend_over_general(dst, src));
+            }
+        }
+    }
+
+    #[test]
+    fn blend_over_opaque_destination_matches_general_formula_exhaustively() {
+        // 各色チャンネルは独立。source/destination/alpha の全 256^3 通りで
+        // 旧 f32 式との丸めまで比較し、半透明ブラシ・レイヤーの色を保つ。
+        for alpha in 0..=255u8 {
+            for source in 0..=255u8 {
+                for destination in 0..=255u8 {
+                    let src = [source, source ^ 0x5a, 255 - source, alpha];
+                    let dst = [destination, 255 - destination, destination ^ 0xa5, 255];
+                    assert_eq!(
+                        blend_over(dst, src),
+                        blend_over_general(dst, src),
+                        "source={source}, destination={destination}, alpha={alpha}"
+                    );
+                }
             }
         }
     }
@@ -3117,6 +3204,205 @@ mod tests {
     }
 
     // -- v12 §51.1: モザイク ---------------------------------------------
+
+    /// 座標単位の読み書きを使う参照実装。各ブロックを元画像から平均する。
+    fn reference_mosaic(surface: &mut Surface, region: IRect, block: u32) -> IRect {
+        let bounds = region.clamp_to(surface.width, surface.height);
+        let mut original = surface.pixels.to_vec();
+        let source = Surface {
+            width: surface.width,
+            height: surface.height,
+            pixels: &mut original,
+            clip: None,
+            alpha_lock: false,
+        };
+        let block = block.max(1) as i32;
+        for y0 in (0..surface.height as i32).step_by(block as usize) {
+            for x0 in (0..surface.width as i32).step_by(block as usize) {
+                let x1 = (x0 + block).min(surface.width as i32);
+                let y1 = (y0 + block).min(surface.height as i32);
+                let mut sum = [0.0f32; 4];
+                let mut count = 0.0f32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        if let Some(pixel) = source.get_pixel(x, y) {
+                            let alpha = pixel[3] as f32 / 255.0;
+                            for c in 0..3 {
+                                sum[c] += pixel[c] as f32 * alpha;
+                            }
+                            sum[3] += alpha;
+                            count += 1.0;
+                        }
+                    }
+                }
+                if count == 0.0 {
+                    continue;
+                }
+                let mut color = [0; 4];
+                color[3] = (sum[3] / count * 255.0).round().clamp(0.0, 255.0) as u8;
+                if sum[3] > 0.0 {
+                    for c in 0..3 {
+                        color[c] = (sum[c] / sum[3]).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                for y in y0.max(bounds.y0)..y1.min(bounds.y1) {
+                    for x in x0.max(bounds.x0)..x1.min(bounds.x1) {
+                        surface.set_pixel(x, y, color);
+                    }
+                }
+            }
+        }
+        bounds
+    }
+
+    #[test]
+    fn mosaic_matches_reference_with_masks_locks_and_truncated_buffers() {
+        let (width, height) = (19, 13);
+        let mut seed = 0x1357_2468u32;
+        let original: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let full = IRect {
+            x0: 0,
+            y0: 0,
+            x1: width as i32,
+            y1: height as i32,
+        };
+        let mask = SelMask {
+            bbox: IRect {
+                x0: -2,
+                y0: 3,
+                x1: 17,
+                y1: 15,
+            },
+            mask: (0..19 * 12)
+                .map(|i| if i % 3 == 0 { 0 } else { 1 })
+                .collect(),
+        };
+        let mut truncated_mask = mask.clone();
+        truncated_mask.mask.truncate(65);
+        for clip in [
+            None,
+            Some(&mask),
+            Some(&truncated_mask),
+            Some(&SelMask::empty()),
+        ] {
+            for alpha_lock in [false, true] {
+                for block in [0, 1, 2, 4, 10, 100] {
+                    for region in [
+                        full,
+                        IRect {
+                            x0: 2,
+                            y0: -3,
+                            x1: 11,
+                            y1: 8,
+                        },
+                        IRect {
+                            x0: 30,
+                            y0: 30,
+                            x1: 31,
+                            y1: 31,
+                        },
+                    ] {
+                        for len in [0, 3, 43, original.len() - 7, original.len()] {
+                            let mut expected = original[..len].to_vec();
+                            let mut actual = expected.clone();
+                            let expected_bounds = reference_mosaic(
+                                &mut Surface {
+                                    width,
+                                    height,
+                                    pixels: &mut expected,
+                                    clip,
+                                    alpha_lock,
+                                },
+                                region,
+                                block,
+                            );
+                            let actual_bounds = apply_mosaic(
+                                &mut Surface {
+                                    width,
+                                    height,
+                                    pixels: &mut actual,
+                                    clip,
+                                    alpha_lock,
+                                },
+                                region,
+                                block,
+                            );
+                            assert_eq!(actual_bounds, expected_bounds);
+                            assert_eq!(actual, expected,
+                                "block={block}, region={region:?}, lock={alpha_lock}, len={len}, clip={clip:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 手動計測専用: cargo test --release mosaic_performance -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual release-mode benchmark"]
+    fn mosaic_performance() {
+        use std::{hint::black_box, time::Instant};
+        let (width, height) = (4000, 4000);
+        let mut seed = 0x1357_2468u32;
+        let original: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let region = IRect {
+            x0: 0,
+            y0: 0,
+            x1: width as i32,
+            y1: height as i32,
+        };
+        let mask = SelMask {
+            bbox: region,
+            mask: (0..width * height)
+                .map(|i| if i % 7 == 0 { 0 } else { 255 })
+                .collect(),
+        };
+        let mut pixels = original.clone();
+        for (name, clip, alpha_lock) in [
+            ("full", None, false),
+            ("mask", Some(&mask), false),
+            ("mask+lock", Some(&mask), true),
+        ] {
+            for block in [4, 40, 100] {
+                let mut samples = Vec::new();
+                for iteration in 0..6 {
+                    pixels.copy_from_slice(&original);
+                    let start = Instant::now();
+                    black_box(apply_mosaic(
+                        &mut Surface {
+                            width,
+                            height,
+                            pixels: black_box(&mut pixels),
+                            clip,
+                            alpha_lock,
+                        },
+                        region,
+                        block,
+                    ));
+                    let elapsed = start.elapsed();
+                    black_box(&pixels);
+                    if iteration > 0 {
+                        samples.push(elapsed);
+                    }
+                }
+                samples.sort();
+                eprintln!(
+                    "mosaic 4000x4000 {name} block={block}: median={:?}",
+                    samples[2]
+                );
+            }
+        }
+    }
 
     /// テスト用: クリップ・ロック無しの `Surface` でモザイクをかける。
     fn mosaic_on(pixels: &mut Vec<u8>, w: u32, h: u32, region: IRect, block: u32) {

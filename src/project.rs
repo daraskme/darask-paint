@@ -52,9 +52,15 @@ const CHUNK_REVISIONS: [u8; 4] = *b"REVS";
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
+struct StoredTile {
+    // 重複排除時の値を保持し、書き出し時の再ハッシュを避ける。
+    hash: u64,
+    bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 struct TileStore {
-    tiles: Vec<Vec<u8>>,
+    tiles: Vec<StoredTile>,
     by_hash: HashMap<u64, Vec<u32>>,
 }
 
@@ -66,7 +72,7 @@ impl TileStore {
                 if self
                     .tiles
                     .get(id as usize)
-                    .is_some_and(|tile| tile == bytes)
+                    .is_some_and(|tile| tile.bytes == bytes)
                 {
                     return Ok(id);
                 }
@@ -83,7 +89,7 @@ impl TileStore {
             .try_reserve(1)
             .map_err(|_| "保存タイル索引を確保できません".to_owned())?;
         let owned = try_clone_bytes(bytes, "保存タイル")?;
-        self.tiles.push(owned);
+        self.tiles.push(StoredTile { hash, bytes: owned });
         let candidates = self.by_hash.entry(hash).or_default();
         candidates
             .try_reserve(1)
@@ -124,9 +130,42 @@ const fn crc_table() -> [u32; 256] {
 
 const CRC_TABLE: [u32; 256] = crc_table();
 
+// 各表は 0 バイトを追加で 0〜7 回処理した CRC。起動時の初期化は不要。
+const fn crc_slicing_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0; 256]; 8];
+    tables[0] = CRC_TABLE;
+    let mut slice = 1;
+    while slice < tables.len() {
+        let mut byte = 0;
+        while byte < 256 {
+            let previous = tables[slice - 1][byte];
+            tables[slice][byte] = CRC_TABLE[(previous & 0xff) as usize] ^ (previous >> 8);
+            byte += 1;
+        }
+        slice += 1;
+    }
+    tables
+}
+
+const CRC_SLICING_TABLES: [[u32; 256]; 8] = crc_slicing_tables();
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
-    for &byte in bytes {
+    let (blocks, remainder) = bytes.as_chunks::<8>();
+    for block in blocks {
+        // slicing-by-8: バイトごとの依存を分解する。明示的な LE 読み取りで
+        // CPU のエンディアン・入力アラインメントに依存しない。
+        let head = crc ^ u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        crc = CRC_SLICING_TABLES[7][(head & 0xff) as usize]
+            ^ CRC_SLICING_TABLES[6][((head >> 8) & 0xff) as usize]
+            ^ CRC_SLICING_TABLES[5][((head >> 16) & 0xff) as usize]
+            ^ CRC_SLICING_TABLES[4][(head >> 24) as usize]
+            ^ CRC_SLICING_TABLES[3][block[4] as usize]
+            ^ CRC_SLICING_TABLES[2][block[5] as usize]
+            ^ CRC_SLICING_TABLES[1][block[6] as usize]
+            ^ CRC_SLICING_TABLES[0][block[7] as usize];
+    }
+    for &byte in remainder {
         let index = ((crc ^ u32::from(byte)) & 0xff) as usize;
         crc = CRC_TABLE[index] ^ (crc >> 8);
     }
@@ -824,7 +863,7 @@ fn encode_project_payloads(
     let tiles_payload_len = tiles.tiles.iter().try_fold(4usize, |total, tile| {
         total
             .checked_add(12)
-            .and_then(|value| value.checked_add(tile.len()))
+            .and_then(|value| value.checked_add(tile.bytes.len()))
             .ok_or_else(|| "タイルchunkが大きすぎます".to_owned())
     })?;
     if tiles_payload_len > MAX_CHUNK_BYTES {
@@ -846,9 +885,9 @@ fn encode_project_payloads(
     try_reserve_exact(&mut tiles_payload, tiles_payload_len, "タイルchunk")?;
     put_len(&mut tiles_payload, tiles.tiles.len(), "タイル数")?;
     for tile in &tiles.tiles {
-        put_u64(&mut tiles_payload, content_hash(tile));
-        put_len(&mut tiles_payload, tile.len(), "タイル")?;
-        tiles_payload.extend_from_slice(tile);
+        put_u64(&mut tiles_payload, tile.hash);
+        put_len(&mut tiles_payload, tile.bytes.len(), "タイル")?;
+        tiles_payload.extend_from_slice(&tile.bytes);
     }
 
     let mut meta_payload = Vec::new();
@@ -1923,6 +1962,153 @@ pub fn load(path: &Path) -> Result<(Document, History), String> {
 mod tests {
     use super::*;
     use crate::document::{Background, BlendMode};
+
+    fn reference_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0xedb8_8320
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn crc32_matches_known_vectors_and_bitwise_reference() {
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        let mut seed = 0x1234_abcd_u32;
+        let bytes: Vec<u8> = (0..65_553)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        for offset in 0..16 {
+            for len in 0..=512 {
+                let input = &bytes[offset..offset + len];
+                assert_eq!(
+                    crc32(input),
+                    reference_crc32(input),
+                    "offset={offset}, len={len}"
+                );
+            }
+            let input = &bytes[offset..offset + 65_537];
+            assert_eq!(crc32(input), reference_crc32(input));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode benchmark"]
+    fn crc32_performance() {
+        use std::{hint::black_box, time::Instant};
+        let mut seed = 0x1234_abcd_u32;
+        let bytes: Vec<u8> = (0..64 * 1024 * 1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        for (len, iterations) in [
+            (1024, 1000),
+            (64 * 1024, 16),
+            (1024 * 1024, 1),
+            (bytes.len(), 1),
+        ] {
+            let mut samples = Vec::new();
+            for run in 0..8 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(crc32(black_box(&bytes[..len])));
+                }
+                if run > 0 {
+                    samples.push(start.elapsed() / iterations);
+                }
+            }
+            samples.sort();
+            eprintln!("crc32 {len} bytes: median={:?}", samples[3]);
+        }
+    }
+
+    #[test]
+    fn tile_store_checks_bytes_even_when_hash_candidates_collide() {
+        let mut store = TileStore::default();
+        let first = [1, 2, 3, 4];
+        let second = [4, 3, 2, 1];
+        let first_id = store.intern(&first).expect("first tile");
+        // 衝突候補を意図的に登録。ハッシュだけで同一タイルと判定しない。
+        store
+            .by_hash
+            .entry(content_hash(&second))
+            .or_default()
+            .push(first_id);
+        let second_id = store.intern(&second).expect("second tile");
+        assert_ne!(first_id, second_id);
+        assert_eq!(store.intern(&first).expect("first again"), first_id);
+        assert_eq!(store.intern(&second).expect("second again"), second_id);
+        assert_eq!(store.tiles.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode benchmark"]
+    fn project_encoding_performance() {
+        use std::{hint::black_box, time::Instant};
+
+        for side in [1024, 4000] {
+            for (name, layer_count, solid) in [
+                ("unique", 1, false),
+                ("duplicate-layers", 4, false),
+                ("solid", 1, true),
+            ] {
+                let mut doc = Document::new(side, side, Background::White);
+                if !solid {
+                    let mut seed = 0x1234_abcd_u32;
+                    for byte in &mut doc.layers[0].pixels {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        *byte = (seed >> 24) as u8;
+                    }
+                }
+                for _ in 1..layer_count {
+                    doc.layers.push(doc.layers[0].clone());
+                }
+                let history = History::new();
+                let mut samples = Vec::new();
+                let mut signature = None;
+                for run in 0..8 {
+                    let start = Instant::now();
+                    let payloads = encode_project_payloads(black_box(&doc), &history, VERSION)
+                        .expect("encode payloads");
+                    black_box(&payloads);
+                    let elapsed = start.elapsed();
+                    // 出力の一致確認は計測外。入力生成・結果解放も含めない。
+                    let current = (
+                        payloads.predicted_len,
+                        crc32(&payloads.meta),
+                        crc32(&payloads.tiles),
+                        crc32(&payloads.document),
+                        crc32(&payloads.revisions),
+                    );
+                    if let Some(expected) = signature {
+                        assert_eq!(current, expected);
+                    }
+                    signature = Some(current);
+                    if run > 0 {
+                        samples.push(elapsed);
+                    }
+                }
+                samples.sort();
+                eprintln!(
+                    "project-encoding {name} {side}x{side}: median={:?}, signature={signature:?}",
+                    samples[3]
+                );
+            }
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);

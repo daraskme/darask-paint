@@ -7511,6 +7511,10 @@ impl DaraskApp {
 }
 
 impl eframe::App for DaraskApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        keymap::normalize_clipboard_input(ctx, input);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ensure_tab_invariant();
 

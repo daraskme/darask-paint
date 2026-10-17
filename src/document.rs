@@ -3034,4 +3034,64 @@ mod tests {
         let px = doc.composite_pixel(0, 0).unwrap();
         assert_eq!(px[3], 255);
     }
+
+    #[test]
+    #[ignore = "manual release-mode benchmark"]
+    fn source_over_composite_performance() {
+        use std::{hint::black_box, time::Instant};
+
+        for (name, backdrop_alpha, source_kind, opacity) in [
+            ("opaque-backdrop/mixed-source", 255, 0, 255),
+            ("opaque-backdrop/half-opacity", 255, 1, 128),
+            ("opaque-backdrop/opaque-source", 255, 1, 255),
+            ("opaque-backdrop/sparse-source", 255, 2, 255),
+            ("partial-backdrop/mixed-source", 128, 0, 255),
+            ("transparent-backdrop/mixed-source", 0, 0, 255),
+        ] {
+            let mut doc = Document::new(4000, 4000, Background::Transparent);
+            doc.layers.push(Layer::filled("上", 4000, 4000, [0; 4]));
+            doc.layers[1].opacity = opacity;
+            let mut seed = 0x1234_abcd_u32;
+            let (bottom_layers, top_layers) = doc.layers.split_at_mut(1);
+            for (i, (bottom, top)) in bottom_layers[0]
+                .pixels
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(top_layers[0].pixels.as_chunks_mut::<4>().0)
+                .enumerate()
+            {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let [r, g, b, a] = seed.to_le_bytes();
+                *bottom = [r, g, b, backdrop_alpha];
+                let alpha = match source_kind {
+                    1 => 255,
+                    2 if i % 16 != 0 => 0,
+                    _ => a,
+                };
+                *top = [b, r, g, alpha];
+            }
+            for (side, iterations) in [(64, 1000), (512, 16), (4000, 1)] {
+                let rect = IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: side,
+                    y1: side,
+                };
+                let mut samples = Vec::new();
+                for run in 0..8 {
+                    let start = Instant::now();
+                    for _ in 0..iterations {
+                        black_box(&mut doc).recomposite(black_box(rect));
+                        black_box(&doc.composite);
+                    }
+                    if run > 0 {
+                        samples.push(start.elapsed() / iterations);
+                    }
+                }
+                samples.sort();
+                eprintln!("composite {name} {side}x{side}: median={:?}", samples[3]);
+            }
+        }
+    }
 }
