@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use eframe::egui::{self, vec2, Color32, PointerButton, Rect, Sense, Stroke, StrokeKind};
 
 use crate::ui::color_wheel::{rgba_unmultiplied_keep_rgb, ColorWheelState};
+use crate::ui::{icons, theme, widgets};
 
 /// SPEC §14 の 1 段目 12 色。
 pub const PALETTE_ROW1: [Color32; 12] = [
@@ -40,9 +41,11 @@ pub const PALETTE_ROW1: [Color32; 12] = [
 const PALETTE_PASTEL_WHITE_MIX: f32 = 0.55;
 
 const RECENT_SWATCH_SIZE: egui::Vec2 = vec2(20.0, 20.0);
-const PALETTE_SWATCH_SIZE: egui::Vec2 = vec2(14.0, 14.0);
-const ALPHA_SLIDER_SIZE: egui::Vec2 = vec2(150.0, 18.0);
-const SWATCH_BORDER: Color32 = Color32::from_gray(60);
+/// パレットの 1 行の個数(SPEC §14: 2 段 × 12)と、スウォッチ間のすき間。
+const PALETTE_COLUMNS: f32 = 12.0;
+const PALETTE_GAP: f32 = 4.0;
+const ALPHA_SLIDER_H: f32 = 14.0;
+const SWATCH_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
 
 /// `show` に渡すカラーパネルの状態一式(`app.rs` が各フィールドの持ち主
 /// から可変参照を集めて構築する、`OptionsBarCtx`/`LayersPanelAction` と
@@ -86,10 +89,17 @@ pub fn show(ui: &mut egui::Ui, ctx: ColorPanelCtx) {
         user_palette,
     } = ctx;
 
-    // v12 §50.1: 見出しは `side_panel.rs` の `CollapsingHeader`(「色」)が
-    // 描くため、パネル自身は中身だけを描く。
-    show_swatches(ui, primary, secondary);
-    ui.add_space(6.0);
+    // v12 §50.1: 見出しは `side_panel.rs` が描くため、パネル自身は中身だけを
+    // 描く。v13 §60: 先頭 1 行に「描画色/背景色・HEX・入れ替え」をまとめる。
+    let hex_invalid = show_swatches(ui, primary, secondary, hex_buffer, user_palette);
+    if hex_invalid {
+        ui.label(
+            egui::RichText::new("6桁または8桁の16進数を入力してください")
+                .size(theme::FONT_SMALL)
+                .color(Color32::from_rgb(0xff, 0x8a, 0x80)),
+        );
+    }
+    ui.add_space(4.0);
 
     // ARCHITECTURE.md §14.3: ドラッグ中でなければ primary から HSV を
     // 同期する(パレット/HEX/最近使った色/スポイト等、ホイール以外の
@@ -98,43 +108,85 @@ pub fn show(ui: &mut egui::Ui, ctx: ColorPanelCtx) {
     ui.vertical_centered(|ui| {
         wheel.ui(ui, primary);
     });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 
     ui.horizontal(|ui| {
-        ui.label("A:");
-        alpha_slider(ui, primary);
+        ui.label(
+            egui::RichText::new("不透明")
+                .size(theme::FONT_SMALL)
+                .color(theme::TEXT_FAINT),
+        );
+        let width = ui.available_width();
+        alpha_slider(ui, primary, width);
     });
-    ui.horizontal(|ui| {
-        ui.label("HEX:");
-        hex_input(ui, primary, hex_buffer);
-    });
-    ui.add_space(8.0);
+    ui.add_space(4.0);
 
     palette_section(ui, primary, secondary, user_palette);
-    ui.add_space(8.0);
 
     recent_colors_row(ui, recent_colors, primary);
 }
 
 /// SPEC §14 項目1: プライマリ/セカンダリの重ね表示 + 入替ボタン
 /// (X キーと同じ)。
-fn show_swatches(ui: &mut egui::Ui, primary: &mut Color32, secondary: &mut Color32) {
+/// 描画色・背景色の重なったスウォッチ + HEX 欄 + 入れ替えボタン。
+/// HEX が不正なら `true`(呼び出し側が説明を下に出す)。
+fn show_swatches(
+    ui: &mut egui::Ui,
+    primary: &mut Color32,
+    secondary: &mut Color32,
+    hex_buffer: &mut String,
+    user_palette: &mut Vec<Color32>,
+) -> bool {
+    let mut invalid = false;
     ui.horizontal(|ui| {
-        let (outer, _response) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-        let secondary_rect = Rect::from_min_size(outer.min + vec2(12.0, 12.0), vec2(26.0, 26.0));
-        let primary_rect = Rect::from_min_size(outer.min, vec2(26.0, 26.0));
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (outer, _response) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+        let secondary_rect = Rect::from_min_size(outer.min + vec2(16.0, 16.0), vec2(28.0, 28.0));
+        let primary_rect = Rect::from_min_size(outer.min, vec2(28.0, 28.0));
         if ui.is_rect_visible(outer) {
             draw_swatch_at(ui.painter(), secondary_rect, *secondary, 1.0);
-            draw_swatch_at(ui.painter(), primary_rect, *primary, 1.5);
+            draw_swatch_at(ui.painter(), primary_rect, *primary, 1.0);
+            ui.painter().rect_stroke(
+                primary_rect.expand(2.0),
+                5.0,
+                Stroke::new(2.0, theme::BG_PANEL),
+                StrokeKind::Inside,
+            );
         }
-        if ui
-            .button("入替")
-            .on_hover_text("プライマリ/セカンダリを入れ替え(X)")
+        ui.label(egui::RichText::new("#").color(theme::TEXT_FAINT));
+        invalid = hex_input(ui, primary, hex_buffer);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::icon_button(
+                ui,
+                vec2(28.0, 28.0),
+                15.0,
+                true,
+                false,
+                icons::paint_swap_icon,
+                "入れ替え",
+            )
+            .on_hover_text("描画色/背景色を入れ替え(X)")
             .clicked()
-        {
-            std::mem::swap(primary, secondary);
-        }
+            {
+                std::mem::swap(primary, secondary);
+            }
+            if widgets::icon_button(
+                ui,
+                vec2(28.0, 28.0),
+                13.0,
+                true,
+                false,
+                icons::paint_plus_icon,
+                "パレットに追加",
+            )
+            .on_hover_text("描画色をユーザーパレットに追加")
+            .clicked()
+            {
+                user_palette.push(*primary);
+            }
+        });
     });
+    invalid
 }
 
 /// SPEC §14 項目3: 「アルファスライダー(0–255、市松模様の下地付き)」。
@@ -152,8 +204,11 @@ fn show_swatches(ui: &mut egui::Ui, primary: &mut Color32, secondary: &mut Color
 ///     右クリック・右ドラッグでもプライマリのアルファが変わってしまって
 ///     いた(パレット等の「右=セカンダリ」の慣習と衝突する)。プライマリ
 ///     ボタンが押されている間だけ入力を受け付ける。
-fn alpha_slider(ui: &mut egui::Ui, primary: &mut Color32) {
-    let (rect, response) = ui.allocate_exact_size(ALPHA_SLIDER_SIZE, Sense::click_and_drag());
+fn alpha_slider(ui: &mut egui::Ui, primary: &mut Color32, width: f32) {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(width.max(40.0), ALPHA_SLIDER_H),
+        Sense::click_and_drag(),
+    );
     let primary_down = ui.input(|i| i.pointer.button_down(PointerButton::Primary));
     if primary_down {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -201,7 +256,8 @@ fn alpha_slider(ui: &mut egui::Ui, primary: &mut Color32) {
 }
 
 /// SPEC §14 項目3: 「HEX 入力欄(#RRGGBB / #RRGGBBAA、確定で反映)」。
-fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) {
+/// 不正な入力のままなら `true`。
+fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) -> bool {
     let id = egui::Id::new("darask_color_hex");
     let response = ui.add(
         egui::TextEdit::singleline(hex_buffer)
@@ -212,7 +268,7 @@ fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) 
     if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         *hex_buffer = format_hex(*primary);
         ui.memory_mut(|memory| memory.surrender_focus(id));
-        return;
+        return false;
     }
     // レイヤー名編集(`layers_panel.rs`)と同じパターン: `lost_focus` を
     // 「確定」の合図として使う(Enter・クリックで外れる、いずれも対応)。
@@ -229,14 +285,11 @@ fn hex_input(ui: &mut egui::Ui, primary: &mut Color32, hex_buffer: &mut String) 
             Stroke::new(1.5, Color32::from_rgb(220, 60, 60)),
             StrokeKind::Outside,
         );
-        ui.colored_label(
-            Color32::from_rgb(220, 60, 60),
-            "6桁または8桁の16進数を入力してください",
-        );
     } else if !response.has_focus() {
         // 正常な入力だけ現在値へ正規化する。無効な文字列は修正できるよう保持する。
         *hex_buffer = format_hex(*primary);
     }
+    invalid
 }
 
 /// SPEC §14 項目4: 定義済み 24 色 + ユーザーパレット。
@@ -246,7 +299,6 @@ fn palette_section(
     secondary: &mut Color32,
     user_palette: &mut Vec<Color32>,
 ) {
-    ui.label("パレット:");
     // SPEC §14: 「2 段 × 12」。既定の `item_spacing`(8pt)のままだと
     // 210px 幅の右パネルに 12 個が収まらず 3 行以上に折り返されるため、
     // 詰めて 1 段 12 個が収まるようにする(`horizontal_wrapped` 自体は
@@ -261,24 +313,30 @@ fn palette_section(
     // 新規/複製/削除等のボタン列、不透明度スライダー)まで水平間隔が
     // 8pt→2pt に詰まってしまっていた。`ui.scope()` で子スコープを作り、
     // 変更をこの関数の中だけに閉じ込める。
+    // v13 §60: 12 個がドック幅いっぱいに並ぶよう、幅から一辺を決める。
+    let side = palette_swatch_side(ui.available_width());
+    let size = vec2(side, side);
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+        ui.spacing_mut().item_spacing = vec2(PALETTE_GAP, PALETTE_GAP);
         ui.horizontal_wrapped(|ui| {
             for color in PALETTE_ROW1 {
-                fixed_palette_swatch(ui, color, primary, secondary);
+                fixed_palette_swatch(ui, size, color, primary, secondary);
             }
         });
         ui.horizontal_wrapped(|ui| {
             for color in palette_row2() {
-                fixed_palette_swatch(ui, color, primary, secondary);
+                fixed_palette_swatch(ui, size, color, primary, secondary);
             }
         });
 
-        ui.add_space(4.0);
+        // ユーザー色が無いときは行ごと出さない(追加ボタンは先頭行にある)。
+        if user_palette.is_empty() {
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             let mut remove_idx = None;
             for (idx, &color) in user_palette.iter().enumerate() {
-                let response = color_swatch(ui, PALETTE_SWATCH_SIZE, color, Sense::click())
+                let response = color_swatch(ui, size, color, Sense::click())
                     .on_hover_text("クリックでプライマリに設定、右クリックで削除メニュー");
                 if response.clicked() {
                     *primary = color;
@@ -294,13 +352,6 @@ fn palette_section(
                     }
                 });
             }
-            if ui
-                .button("＋")
-                .on_hover_text("プライマリ色をユーザーパレットに追加")
-                .clicked()
-            {
-                user_palette.push(*primary);
-            }
             if let Some(idx) = remove_idx {
                 if idx < user_palette.len() {
                     user_palette.remove(idx);
@@ -310,13 +361,21 @@ fn palette_section(
     });
 }
 
+/// パレットのスウォッチの一辺(12 個 + すき間 11 個が `width` に収まる)。
+fn palette_swatch_side(width: f32) -> f32 {
+    ((width - PALETTE_GAP * (PALETTE_COLUMNS - 1.0)) / PALETTE_COLUMNS)
+        .floor()
+        .clamp(10.0, 24.0)
+}
+
 fn fixed_palette_swatch(
     ui: &mut egui::Ui,
+    size: egui::Vec2,
     color: Color32,
     primary: &mut Color32,
     secondary: &mut Color32,
 ) {
-    let response = color_swatch(ui, PALETTE_SWATCH_SIZE, color, Sense::click())
+    let response = color_swatch(ui, size, color, Sense::click())
         .on_hover_text("クリックでプライマリに、右クリックでセカンダリに設定");
     if response.clicked() {
         *primary = color;
@@ -332,11 +391,16 @@ fn fixed_palette_swatch(
 /// v2 レビューで発見・修正したバグ: `palette_section` と同じ item_spacing
 /// 漏れ(`ui.scope()` 無し)があった。
 fn recent_colors_row(ui: &mut egui::Ui, recent: &VecDeque<Color32>, primary: &mut Color32) {
-    ui.label("最近使った色:");
+    // まだ無いときは見出しごと出さない(パネルの縦を節約する)。
     if recent.is_empty() {
-        ui.weak("(まだありません)");
         return;
     }
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("最近使った色")
+            .size(theme::FONT_SMALL)
+            .color(theme::TEXT_FAINT),
+    );
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
         ui.horizontal_wrapped(|ui| {
@@ -370,10 +434,10 @@ fn color_swatch(
 
 fn draw_swatch_at(painter: &egui::Painter, rect: Rect, color: Color32, border_width: f32) {
     draw_checker(painter, rect);
-    painter.rect_filled(rect, 2.0, color);
+    painter.rect_filled(rect, 3.0, color);
     painter.rect_stroke(
         rect,
-        2.0,
+        3.0,
         Stroke::new(border_width, SWATCH_BORDER),
         StrokeKind::Middle,
     );
@@ -472,6 +536,16 @@ pub fn format_hex(color: Color32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn twelve_palette_swatches_fill_the_dock_width() {
+        let width = 268.0;
+        let side = palette_swatch_side(width);
+        assert!(side * PALETTE_COLUMNS + PALETTE_GAP * (PALETTE_COLUMNS - 1.0) <= width);
+        assert!(side >= 18.0, "{side}");
+        // 極端に狭くても最小値を保つ(折り返しはするがパニックしない)。
+        assert_eq!(palette_swatch_side(40.0), 10.0);
+    }
 
     #[test]
     fn palette_row1_matches_spec_hex_values() {

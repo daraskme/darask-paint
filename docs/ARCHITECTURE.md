@@ -927,3 +927,22 @@ SPEC.md「v12 拡張仕様」(§50〜§57)に対応。実装は 7 フェーズ(P
 6. **プラグイン送信**: レイヤー全面の PNG/base64 化は 8192² で GiB 級 — 選択 bbox+128px のみ。応答は生画像バイト(base64 JSON ではない)。適用前に世代タプル全一致を検査。
 7. **ワーカー**: `thread::spawn` は生成失敗で panic し得る — `thread::Builder::spawn` + Result。BinaryHeap の f32 順序は `total_cmp`。
 8. **`.dpaint` v3**: reserved u16 の再解釈は decode 側の「非 0 拒否」を version 分岐にすること(v3 で拒否したままだと新ファイルが開けない)。
+
+# 23. v13 設計(UI 刷新・Linux ドロップ・クリップボード作成 — SPEC §60)
+
+## 23.1 モジュール
+
+- `ui/theme.rs`: 配色トークンを `pub const` で公開(自前描画の行・ボタンが `Visuals` を経由せず同じ値を使う)。`apply` は起動時 1 回。
+- `ui/widgets.rs`(新規): 共通部品。`icon_button`(通常は背景なし・ホバーで面・選択中はアクセント淡色+縁)、`track`(白いつまみ+アンバーの塗りの自前スライダー。egui の `Slider` はつまみ色がレールと同じ `inactive.bg_fill` で決まり再現できない)、`number_field`(`DragValue` を掘り込み欄風に)、`int_slider_field`/`float_slider_field`、`toggle_chip`、`segmented`、バッジ類。状態を持たず、再描画も要求しない。
+- `ui/menu.rs`: `MENUS`(テキストメニューの唯一のテーブル)+ `QUICK_ACTIONS`(右側の常時表示)。`egui::MenuBar` + `menu_button`。1 段に収まるかは文字幅の実測で決める(`fits_one_row` は純関数)。ドロップダウンの行幅は固定(ポップアップの利用可能幅に合わせると画面幅近くまで伸びる)。
+- `ui/drop_overlay.rs`(新規): `classify`/`hint`(純関数・テストあり)と `paint`。`app.rs` の `CentralPanel` の最後で `raw.hovered_files` を見て描く。
+- `ui/toolbar.rs`: `TOOL_GROUPS` と `tool_name`。下端の色チップは `ScrollArea` の外に固定(`UiBuilder::max_rect` で上下に分割)。
+- `ui/side_panel.rs`: 見出しに `HeaderExtra`(バッジ・レイヤーの「+ 追加」)。レイヤーの高さ割り当ては `layers_fill_height`(純関数)。各ブロックの高さを egui の一時メモリに前フレーム値として保存し、変わったフレームだけ `request_repaint`(数フレームで収束。アイドル時は呼ばれない)。
+- `ui/layers_panel.rs`: `LayersPanelCtx::fill_height` が `Some` のとき一覧を `ScrollArea`(`id_salt("darask_layer_list")`)で包む。`solo_visibility` は純関数。
+
+## 23.2 落とし穴
+
+1. **Wayland でドロップが届かない**: winit 0.30 の Wayland 実装に DnD が無い。eframe は winit の `EventLoopBuilderExtX11` を再公開しておらず winit を直接依存に足せない(CLAUDE.md)ため、`main` 冒頭(フォント読み込みスレッドを起こす前)で `WAYLAND_DISPLAY` を外して winit に X11 を選ばせる。スレッド生成後の環境変数の書き換えは避けること。
+2. **Ctrl+Shift+V / Ctrl+Alt+V**: egui-winit は `command+V` 系の押下をすべて文字列の `Event::Paste` に変換し Key を送らない。Ctrl+V と同じく **V のキー解放**で判定し、`ClipboardKeys` が押下時の修飾キーを覚えて解放イベントへ戻す。`matches_logically` は余分な Shift/Alt を無視するので、修飾キーの多いバインドから照合する(`PASTE_ACTIONS`)。
+3. **`DragValue` は `add_sized` の幅より広く描かれうる**(文字幅・余白次第)。狭いドックで並べるときは数値欄を右から先に置き、スライダーに残り幅を渡す(`layers_panel::show_active_layer_controls`)。
+4. **省略表示ラベルの後ろに部品を置かない**: `Label::truncate` は残り幅をすべて使うので、後ろの錠アイコンがはみ出す。錠は先に置く。

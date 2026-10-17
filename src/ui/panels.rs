@@ -21,8 +21,8 @@
 
 use eframe::egui::{pos2, vec2, Pos2, Rect, Vec2};
 
-/// SPEC §3/§58: ドックの固定幅(約 210px)。左右どちらのドックも同じ幅。
-pub const DOCK_WIDTH: f32 = 210.0;
+/// SPEC §3/§58/§60: ドックの固定幅(v13 で 210px から 288px へ)。左右どちらのドックも同じ幅。
+pub const DOCK_WIDTH: f32 = 288.0;
 
 /// フローティング時の既定寸法と、破損値をクランプする範囲。
 pub const DEFAULT_FLOAT_SIZE: Vec2 = vec2(DOCK_WIDTH, 300.0);
@@ -160,6 +160,12 @@ pub struct PanelLayout {
     entries: [PanelEntry; PANEL_COUNT],
 }
 
+/// v13 §60: 既定で折りたたむパネル。レイヤー一覧にドックの高さを回すため、
+/// 履歴とページは見出しだけにしておく(設定に保存された状態があればそちらが優先)。
+fn default_collapsed(kind: PanelKind) -> bool {
+    matches!(kind, PanelKind::History | PanelKind::Pages)
+}
+
 impl Default for PanelLayout {
     /// SPEC §58: 「既定は全パネル右ドック(順: 色→レイヤー→履歴)」。
     fn default() -> Self {
@@ -171,9 +177,12 @@ impl Default for PanelLayout {
             collapsed: false,
         }; PANEL_COUNT];
         for (order, kind) in PanelKind::ALL.iter().enumerate() {
-            entries[kind.index()].placement = PanelPlacement::Dock {
-                side: DockSide::Right,
-                order,
+            entries[kind.index()] = PanelEntry {
+                placement: PanelPlacement::Dock {
+                    side: DockSide::Right,
+                    order,
+                },
+                collapsed: default_collapsed(*kind),
             };
         }
         Self { entries }
@@ -418,7 +427,9 @@ pub fn parse(entries: &[(&str, &str)]) -> PanelLayout {
             // place 自体が無い・読めない → 既定配置(SPEC §58)。
             None => layout.placement(kind),
         };
-        let collapsed = value("collapsed").map(|v| v == "1").unwrap_or(false);
+        let collapsed = value("collapsed")
+            .map(|v| v == "1")
+            .unwrap_or_else(|| default_collapsed(kind));
         layout.entries[kind.index()] = PanelEntry {
             placement,
             collapsed,
@@ -519,8 +530,13 @@ mod tests {
         );
         assert!(layout.is_dock_empty(DockSide::Left));
         assert!(layout.floating().is_empty());
+        // v13 §60: 色とレイヤーは展開、履歴とページは見出しだけ。
         for kind in PanelKind::ALL {
-            assert!(!layout.collapsed(kind));
+            assert_eq!(
+                layout.collapsed(kind),
+                matches!(kind, PanelKind::History | PanelKind::Pages),
+                "{kind:?}"
+            );
         }
     }
 
@@ -782,15 +798,19 @@ panel.history.order\t0
 
     #[test]
     fn collapsed_state_survives_placement_changes_and_round_trip() {
+        // v13 §60: 既定で展開しているレイヤーで確かめる(履歴は既定で折りたたみ)。
         let mut layout = PanelLayout::default();
+        layout.toggle_collapsed(PanelKind::Layers);
+        layout.float_at(PanelKind::Layers, pos2(30.0, 40.0), DEFAULT_FLOAT_SIZE);
+        assert!(layout.collapsed(PanelKind::Layers));
+        layout.dock_at_slot(PanelKind::Layers, DockSide::Left, 0);
+        assert!(layout.collapsed(PanelKind::Layers));
+        assert!(round_trip(&layout).collapsed(PanelKind::Layers));
+        layout.toggle_collapsed(PanelKind::Layers);
+        assert!(!layout.collapsed(PanelKind::Layers));
+        // 既定で折りたたみの履歴も、展開した状態が往復で保たれる。
         layout.toggle_collapsed(PanelKind::History);
-        layout.float_at(PanelKind::History, pos2(30.0, 40.0), DEFAULT_FLOAT_SIZE);
-        assert!(layout.collapsed(PanelKind::History));
-        layout.dock_at_slot(PanelKind::History, DockSide::Left, 0);
-        assert!(layout.collapsed(PanelKind::History));
-        assert!(round_trip(&layout).collapsed(PanelKind::History));
-        layout.toggle_collapsed(PanelKind::History);
-        assert!(!layout.collapsed(PanelKind::History));
+        assert!(!round_trip(&layout).collapsed(PanelKind::History));
     }
 
     #[test]

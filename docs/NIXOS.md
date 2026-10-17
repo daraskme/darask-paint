@@ -23,6 +23,12 @@ portal 設定が使えます。その他の環境では `xdg.portal.enable` と�
 画像クリップボードには X11 と Wayland data-control のサポートを有効にしています。
 Wayland 側はコンポジターの data-control 対応に依存します。
 
+Wayland セッションでも、XWayland(`DISPLAY`)が使える場合は **X11 で起動します**。
+winit 0.30 の Wayland バックエンドがファイルのドラッグ&ドロップに対応していないためで、
+X11 で起動するとファイルマネージャーから画像をドロップしてレイヤーとして追加できます。
+ネイティブ Wayland で起動したい場合は `DARASK_WAYLAND=1 nix run .` を指定してください
+(この場合ドラッグ&ドロップは使えません)。
+
 日本語表示とテキストツールには IPAex ゴシックを Nix 依存として供給します。
 `DARASK_FONT_FILE=/absolute/path/font.ttf nix run .` で変更できます。
 Nix 以外からビルドした Linux バイナリは Fontconfig (`fc-match`) で日本語フォントを探索します。

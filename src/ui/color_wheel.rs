@@ -17,8 +17,8 @@
 use eframe::egui::{self, pos2, vec2, Color32, PointerButton, Pos2, Vec2};
 
 /// SPEC §14: 「直径約170px」。
-pub const DIAMETER: f32 = 170.0;
-const RING_THICKNESS: f32 = 18.0;
+pub const DIAMETER: f32 = 152.0;
+const RING_THICKNESS: f32 = 16.0;
 const TRIANGLE_GAP: f32 = 8.0;
 /// リング分割数(ARCHITECTURE.md §14.3: 「72 分割の三角形ストリップ」)。
 const RING_SEGMENTS: usize = 72;
