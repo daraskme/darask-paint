@@ -84,9 +84,10 @@ use crate::ui::menu::{MenuAction, MenuState};
 use crate::ui::options_bar::OptionsBarCtx;
 use crate::ui::pages_panel::PageThumbnailCache;
 use crate::ui::panels::PanelLayout;
+use crate::ui::status_bar::StatusBarAction;
 use crate::ui::tab_bar::{self, TabBarAction, TabInfo};
 use crate::ui::toolbar::{self, ToolbarAction};
-use crate::ui::{dialogs, menu, options_bar, side_panel, status_bar};
+use crate::ui::{dialogs, drop_overlay, menu, options_bar, side_panel, status_bar};
 
 /// SPEC §5: 最近使った色は最大 8 個。
 const MAX_RECENT_COLORS: usize = 8;
@@ -132,6 +133,9 @@ const DEFAULT_NEW_HEIGHT: u32 = 720;
 /// SPEC §30: 「タブ数の上限は 24」。超えて新規タブを作ろうとしたら作成せず
 /// トースト通知する(`tab_limit_toast_message`/`open_new_tab` 呼び出し元参照)。
 const MAX_TABS: usize = 24;
+
+/// 「レイヤーとして貼り付け」で作るレイヤーの名前。
+const CLIPBOARD_LAYER_NAME: &str = "貼り付け";
 
 /// SPEC §8: JPEG 品質のデフォルト値。
 const DEFAULT_JPEG_QUALITY: u8 = 90;
@@ -1762,6 +1766,8 @@ impl DaraskApp {
                 // v8 §38: 結合部分をコピー(Ctrl+Shift+C)。
                 Action::CopyMerged => self.copy_merged_selection_to_clipboard(),
                 Action::Paste => self.paste_from_clipboard(),
+                Action::PasteAsLayer => self.paste_clipboard_as_layer(),
+                Action::NewFromClipboard => self.new_tab_from_clipboard(),
                 Action::Delete => self.delete_selection(),
                 Action::SelectAll => self.select_all(),
                 Action::Deselect => self.commit_selection(),
@@ -3502,6 +3508,46 @@ impl DaraskApp {
         } else {
             self.begin_paste_floating(w, h, pixels);
         }
+    }
+
+    /// Ctrl+Shift+V「レイヤーとして貼り付け」: クリップボード画像をキャンバス
+    /// 中央の新規レイヤーとして追加する(画像ファイルのドロップと同じ経路。
+    /// 白紙でもドキュメントを置き換えず、浮動片も作らない。1 undo 単位)。
+    fn paste_clipboard_as_layer(&mut self) {
+        match io::read_clipboard_image() {
+            Ok((w, h, pixels)) => {
+                self.insert_raster_as_new_layer(CLIPBOARD_LAYER_NAME.to_owned(), w, h, pixels)
+            }
+            Err(e) => self.show_toast(format!("貼り付けに失敗しました: {e}")),
+        }
+    }
+
+    /// Ctrl+Alt+V「クリップボードから新規画像」: 切り取り・スクリーンショット
+    /// 等の画像を、その寸法の新規タブ(「背景」1 枚)として開く。
+    fn new_tab_from_clipboard(&mut self) {
+        // 上限ならクリップボードを読む前に断る(大きな画像の複製を避ける)。
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
+        match io::read_clipboard_image() {
+            Ok((w, h, pixels)) => self.open_pixels_in_new_tab(w, h, pixels),
+            Err(e) => self.show_toast(format!("クリップボードから作成できませんでした: {e}")),
+        }
+    }
+
+    /// `new_tab_from_clipboard` の OS クリップボードに触れない部分。
+    fn open_pixels_in_new_tab(&mut self, w: u32, h: u32, pixels: Vec<u8>) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.tabs.len() >= MAX_TABS {
+            self.show_toast(tab_limit_toast_message());
+            return;
+        }
+        let doc =
+            Document::from_duplicated_layers(w, h, vec![Layer::from_pixels("背景", pixels)], 0);
+        self.open_new_tab(doc);
     }
 
     /// SPEC §6: 白紙でない場合の貼り付け、クリップボード画像をビュー中央に
@@ -6918,6 +6964,7 @@ impl DaraskApp {
             // v8 レビュー修正②: 履歴に積まない操作(SPEC §13)も
             // commit-first 規則(同 §13 最終項)を通す。
             LayersPanelAction::SetVisible(idx, visible) => self.set_layer_visible(idx, visible),
+            LayersPanelAction::Solo(idx) => self.solo_layer(idx),
             LayersPanelAction::SetOpacity(opacity) => self.set_active_layer_opacity(opacity),
             LayersPanelAction::SetBlend(blend) => self.set_active_layer_blend(blend),
             LayersPanelAction::SetAlphaLock(locked) => self.set_active_layer_alpha_lock(locked),
@@ -6963,6 +7010,26 @@ impl DaraskApp {
                 tab.meta_dirty = true;
             }
         }
+    }
+
+    /// v13 §60: 目アイコンの Alt+クリック(単独表示)。表示切替と同じく
+    /// 履歴には積まず、commit-first を通す(`set_layer_visible` と同じ扱い)。
+    fn solo_layer(&mut self, idx: usize) {
+        self.commit_open_gesture();
+        let tab = self.active_tab_mut();
+        let current: Vec<bool> = tab.doc.layers.iter().map(|layer| layer.visible).collect();
+        let Some(next) = crate::ui::layers_panel::solo_visibility(&current, idx) else {
+            return;
+        };
+        if next == current {
+            return;
+        }
+        for (layer, visible) in tab.doc.layers.iter_mut().zip(next) {
+            layer.visible = visible;
+        }
+        tab.doc.mark_all_dirty();
+        tab.doc.modified = true;
+        tab.meta_dirty = true;
     }
 
     /// SPEC §13: アクティブレイヤーの不透明度(履歴には積まない)。
@@ -7103,6 +7170,8 @@ impl DaraskApp {
             // v8 §38: 「結合部分をコピー」(Ctrl+Shift+C と同じ処理)。
             MenuAction::CopyMerged => self.copy_merged_selection_to_clipboard(),
             MenuAction::Paste => self.paste_from_clipboard(),
+            MenuAction::PasteAsLayer => self.paste_clipboard_as_layer(),
+            MenuAction::NewFromClipboard => self.new_tab_from_clipboard(),
             // v9 §43: rfd はブロッキングなので次フレーム冒頭で開く
             // (ARCHITECTURE.md §12-9、他のダイアログと同じ)。
             MenuAction::PasteFromFile => {
@@ -7197,6 +7266,8 @@ impl DaraskApp {
         match action {
             TabBarAction::Activate(index) => self.switch_tab(index),
             TabBarAction::Close(index) => self.close_tab(index),
+            // v13 §60: タブ列の「+」(Ctrl+N と同じ)。
+            TabBarAction::New => self.begin_new_tab(),
         }
     }
 
@@ -7511,6 +7582,10 @@ impl DaraskApp {
 }
 
 impl eframe::App for DaraskApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        keymap::normalize_clipboard_input(ctx, input);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.ensure_tab_invariant();
 
@@ -7647,7 +7722,7 @@ impl eframe::App for DaraskApp {
             .as_ref()
             .filter(|job| !job.cancel.load(AtomicOrdering::Relaxed))
             .map(|job| job.kind.status_label());
-        let cancel_clicked = status_bar::show(
+        let status_action = status_bar::show(
             ui,
             &self.active_tab().doc,
             self.active_tab().view.hover_img(),
@@ -7656,15 +7731,31 @@ impl eframe::App for DaraskApp {
             toast_text.as_deref(),
             job_label,
         );
-        if cancel_clicked {
-            self.cancel_background_job();
+        match status_action {
+            Some(StatusBarAction::CancelJob) => self.cancel_background_job(),
+            // v13 §60: 右端のズーム操作部(表示メニューと同じ処理)。
+            Some(StatusBarAction::ZoomIn) => self.handle_menu_action(MenuAction::ZoomIn, ui.ctx()),
+            Some(StatusBarAction::ZoomOut) => {
+                self.handle_menu_action(MenuAction::ZoomOut, ui.ctx())
+            }
+            Some(StatusBarAction::Zoom100) => {
+                self.handle_menu_action(MenuAction::Zoom100, ui.ctx())
+            }
+            Some(StatusBarAction::FitWindow) => {
+                self.handle_menu_action(MenuAction::FitWindow, ui.ctx())
+            }
+            None => {}
         }
 
-        if let Some(action) = toolbar::show(ui, self.tool, self.lasso_mode) {
+        if let Some(action) =
+            toolbar::show(ui, self.tool, self.lasso_mode, self.primary, self.secondary)
+        {
             match action {
                 ToolbarAction::SelectTool(new_tool) => self.set_tool(new_tool),
                 // v6 §34: ツールバーの歯車ボタン(Ctrl+K と同じ)。
                 ToolbarAction::OpenPreferences => self.open_preferences_modal(),
+                // v13 §60: 色チップの入れ替え(X と同じ)。
+                ToolbarAction::SwapColors => std::mem::swap(&mut self.primary, &mut self.secondary),
             }
         }
 
@@ -7897,6 +7988,15 @@ impl eframe::App for DaraskApp {
                 // 即座に新しい編集を開始してしまう(ARCHITECTURE.md §15.6-1
                 // と同種の確定順序の罠)。
                 self.draw_text_edit_overlay(ui, &output.painter);
+                // v13 §60: ファイルをドラッグ中は、離したときに何が起きるかを
+                // キャンバス上に案内する(`HoveredFile` が届いている間だけ)。
+                let hovered = ui.ctx().input(|i| i.raw.hovered_files.clone());
+                let paths: Vec<&std::path::Path> =
+                    hovered.iter().filter_map(|f| f.path.as_deref()).collect();
+                let blocked = self.modal.is_some();
+                if let Some((title, detail)) = drop_overlay::hint(&paths, blocked) {
+                    drop_overlay::paint(ui, ui.max_rect(), &title, &detail, blocked);
+                }
             });
 
         self.show_modal(ui.ctx());
@@ -9912,6 +10012,69 @@ mod tests {
         assert_eq!(app.active_tab().doc.layers[0].opacity, 128);
         assert!(app.active_tab().doc.modified);
         assert!(app.active_tab().meta_dirty);
+    }
+
+    // -- v13 §60: 単独表示・クリップボードからの作成 --------------------------
+
+    #[test]
+    fn solo_shows_only_one_layer_and_a_second_solo_restores_all() {
+        let mut doc = Document::new(10, 10, Background::White);
+        assert!(doc.add_layer("A".to_owned()));
+        assert!(doc.add_layer("B".to_owned()));
+        let mut app = new_for_test(doc);
+        let undo_before = app.active_tab().history.undo_len();
+        app.handle_layers_panel_action(LayersPanelAction::Solo(1));
+        let visible: Vec<bool> = app
+            .active_tab()
+            .doc
+            .layers
+            .iter()
+            .map(|l| l.visible)
+            .collect();
+        assert_eq!(visible, vec![false, true, false]);
+        assert!(app.active_tab().doc.modified);
+        assert!(app.active_tab().meta_dirty);
+        assert_eq!(
+            app.active_tab().history.undo_len(),
+            undo_before,
+            "表示切替と同じく履歴に積まない"
+        );
+        app.handle_layers_panel_action(LayersPanelAction::Solo(1));
+        assert!(app.active_tab().doc.layers.iter().all(|l| l.visible));
+        // 範囲外は何もしない。
+        app.handle_layers_panel_action(LayersPanelAction::Solo(9));
+        assert!(app.active_tab().doc.layers.iter().all(|l| l.visible));
+    }
+
+    #[test]
+    fn clipboard_pixels_open_as_a_new_untitled_tab() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        let tabs_before = app.tabs.len();
+        app.open_pixels_in_new_tab(3, 2, vec![200; 3 * 2 * 4]);
+        assert_eq!(app.tabs.len(), tabs_before + 1);
+        let doc = &app.active_tab().doc;
+        assert_eq!((doc.width, doc.height), (3, 2));
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].name, "背景");
+        assert_eq!(doc.layers[0].pixels, vec![200; 3 * 2 * 4]);
+        assert!(doc.path.is_none());
+        assert!(doc.modified, "ファイルに存在しない新しい内容");
+        // 寸法 0 は作らない。
+        app.open_pixels_in_new_tab(0, 5, Vec::new());
+        assert_eq!(app.tabs.len(), tabs_before + 1);
+    }
+
+    #[test]
+    fn paste_as_layer_adds_a_layer_even_on_a_pristine_document() {
+        let mut app = new_for_test(Document::new(10, 10, Background::White));
+        assert!(app.doc_is_pristine());
+        app.insert_raster_as_new_layer(CLIPBOARD_LAYER_NAME.to_owned(), 4, 4, vec![255; 64]);
+        let doc = &app.active_tab().doc;
+        assert_eq!((doc.width, doc.height), (10, 10), "白紙でも置き換えない");
+        assert_eq!(doc.layers.len(), 2);
+        assert_eq!(doc.layers[1].name, CLIPBOARD_LAYER_NAME);
+        assert_eq!(doc.active_index(), 1);
+        assert!(app.active_tab().floating.is_none(), "浮動片は作らない");
     }
 
     // -- v8 §37: 選択範囲を反転(Ctrl+Shift+I) -------------------------------

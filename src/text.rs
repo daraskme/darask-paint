@@ -1739,8 +1739,8 @@ mod tests {
         }
     }
 
-    /// 先頭の句読点を半セル上げ、はみ出すフォントでは上端に収める。
-    /// IPAex のように元のインク位置が低いフォントでも全体を保持する。
+    /// 列の 1 セル目の句読点は、半セル上げるとフォントによって画像外へ出る。
+    /// はみ出すときだけ下げ、インクを失わないこと。
     #[test]
     fn leading_vertical_punctuation_is_not_clipped_at_the_top() {
         let Some(font) = load_test_font() else {
@@ -1753,13 +1753,14 @@ mod tests {
         let (vw, vh, vertical_px) =
             rasterize_text_vertical(&font, "。", 48.0, [0, 0, 0, 255], 0.0, 0.0).expect("ok");
         let (_, vy0, _, vy1) = ink_bounds(vw, vh, &vertical_px).expect("ink");
-        let font_ref = FontRef::try_from_slice(&font).expect("font");
+        let font_ref =
+            FontRef::try_from_slice_and_index(&font, FONT_COLLECTION_INDEX).expect("font");
         let scaled = font_ref.as_scaled(48.0);
-        let half_cell = (scaled.height() + scaled.line_gap()).max(1.0) / 2.0;
-        let expected_top = (hy0 as f32 - half_cell).max(0.0);
+        let cell_core = (scaled.height() + scaled.line_gap()).max(1.0);
+        let expected_top = (hy0 as f32 - cell_core / 2.0).max(0.0);
         assert!(
             (vy0 as f32 - expected_top).abs() <= 1.0,
-            "半セル上げて上端に収める"
+            "半セル上げ、はみ出した場合のみ上端へ補正: expected={expected_top}, actual={vy0}"
         );
         assert_eq!(
             vy1 - vy0,

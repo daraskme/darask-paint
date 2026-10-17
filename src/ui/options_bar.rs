@@ -12,8 +12,17 @@
 //! v3(SPEC §17、ARCHITECTURE.md §15.5 V3-M1)でペンの「アンチエイリアス」
 //! チェックボックスを廃止し、ブラシ(旧ペン)・消しゴム共通の硬さ・不透明度
 //! スライダーと鉛筆モードチェックボックスに置き換えた。
+//!
+//! v13 §60: 先頭に現在のツール(アイコン+名前+ショートカット)を出し、
+//! スライダーを「ラベル+アンバーのつまみ+数値欄」、択一を切り替えボタン、
+//! チェックボックスを角丸トグルにした。サイズはサイズを使うツール(ブラシ・
+//! 消しゴム・直線・矩形・楕円・選択ブラシ)のときだけ出す。幅が足りなければ
+//! 2 段に折り返す(段数は前フレームの実測で決め、変わったフレームだけ
+//! 再描画を 1 回予約する)。
 
 use eframe::egui;
+
+use crate::ui::{icons, theme, toolbar, widgets};
 
 use crate::keymap::{self, Action};
 use crate::raster::GradientKind;
@@ -98,14 +107,34 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
         select_brush_erase,
     } = state;
 
+    let rows_id = egui::Id::new("darask_options_bar_rows");
+    let rows: usize = ui
+        .ctx()
+        .data(|d| d.get_temp(rows_id))
+        .unwrap_or(1)
+        .clamp(1, 3);
+    let height = BAR_PAD_Y * 2.0 + ROW_H * rows as f32 + ROW_GAP * (rows - 1) as f32;
     egui::Panel::top("options_bar")
-        .exact_size(44.0)
+        .exact_size(height)
+        .frame(
+            egui::Frame::NONE
+                .fill(theme::BG_PANEL)
+                .inner_margin(egui::Margin::symmetric(14, BAR_PAD_Y as i8)),
+        )
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("サイズ:");
-                ui.add(egui::Slider::new(brush_size, 1.0..=64.0).suffix("px"));
-
-                ui.separator();
+            let full = ui.max_rect();
+            ui.painter().hline(
+                full.x_range().expand(14.0),
+                full.bottom() + BAR_PAD_Y - 0.5,
+                egui::Stroke::new(1.0, theme::LINE),
+            );
+            let content = ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, ROW_GAP);
+                tool_chip(ui, tool);
+                widgets::vertical_divider(ui, 20.0);
+                if uses_brush_size(tool) {
+                    widgets::float_slider_field(ui, "サイズ", brush_size, 1.0..=64.0, " px", 72.0);
+                }
                 show_tool_specific(
                     ui,
                     tool,
@@ -130,7 +159,51 @@ pub fn show(ui: &mut egui::Ui, state: OptionsBarCtx) {
                     select_brush_erase,
                 );
             });
+            let needed = ((content.response.rect.height() + ROW_GAP) / (ROW_H + ROW_GAP))
+                .round()
+                .max(1.0) as usize;
+            if needed != rows {
+                ui.ctx().data_mut(|d| d.insert_temp(rows_id, needed));
+                ui.ctx().request_repaint();
+            }
         });
+}
+
+const ROW_H: f32 = 24.0;
+const ROW_GAP: f32 = 6.0;
+const BAR_PAD_Y: f32 = 9.0;
+/// スライダーのレールの幅(サイズ以外)。
+const TRACK_W: f32 = 56.0;
+
+/// ブラシサイズを使うツール(`app.rs` の `ToolCtx::brush_size` を読むもの)。
+fn uses_brush_size(tool: ToolKind) -> bool {
+    matches!(
+        tool,
+        ToolKind::Pen
+            | ToolKind::Eraser
+            | ToolKind::Line
+            | ToolKind::Rect
+            | ToolKind::Ellipse
+            | ToolKind::SelectBrush
+    )
+}
+
+/// 先頭の「いまのツール」(アクセント色のアイコン+名前+ショートカット)。
+fn tool_chip(ui: &mut egui::Ui, tool: ToolKind) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(17.0, 17.0), egui::Sense::hover());
+        icons::paint_tool_icon(tool, ui.painter(), rect, theme::ACCENT);
+        ui.label(
+            egui::RichText::new(toolbar::tool_name(tool))
+                .strong()
+                .color(theme::TEXT),
+        );
+        let shortcut = keymap::tool_shortcut_label(tool);
+        if !shortcut.is_empty() {
+            widgets::shortcut_badge(ui, &shortcut);
+        }
+    });
 }
 
 /// SPEC §3 の「ツール固有」領域: 現在のツールに応じたオプションを出す。
@@ -171,154 +244,139 @@ fn show_tool_specific(
         }
         ToolKind::Rect | ToolKind::Ellipse => {
             if let Some(mode) = shape_mode {
-                ui.label("モード:");
-                ui.radio_value(mode, ShapeMode::Outline, ShapeMode::Outline.label());
-                ui.radio_value(mode, ShapeMode::Fill, ShapeMode::Fill.label());
-                ui.radio_value(mode, ShapeMode::Both, ShapeMode::Both.label());
+                widgets::field_label(ui, "モード");
+                widgets::segmented(
+                    ui,
+                    mode,
+                    &[
+                        (ShapeMode::Outline, ShapeMode::Outline.label()),
+                        (ShapeMode::Fill, ShapeMode::Fill.label()),
+                        (ShapeMode::Both, ShapeMode::Both.label()),
+                    ],
+                );
             }
         }
         ToolKind::Fill => {
-            ui.label("許容値:");
-            let mut tol = *fill_tolerance as i32;
-            if ui.add(egui::Slider::new(&mut tol, 0..=255)).changed() {
-                *fill_tolerance = tol.clamp(0, 255) as u8;
-            }
+            u8_slider(ui, "許容値", fill_tolerance, 0, 255, "", 120.0);
         }
-        // v4 §23: 「種類: 線形 / 円形」「色: プライマリ→セカンダリ /
-        // プライマリ→透明」(SPEC §23)。
         ToolKind::Gradient => {
-            ui.label("種類:");
-            ui.radio_value(gradient_kind, GradientKind::Linear, "線形");
-            ui.radio_value(gradient_kind, GradientKind::Radial, "円形");
-            ui.separator();
-            ui.label("色:");
-            ui.radio_value(
-                gradient_colors,
-                GradientColors::PrimaryToSecondary,
-                GradientColors::PrimaryToSecondary.label(),
+            widgets::field_label(ui, "種類");
+            widgets::segmented(
+                ui,
+                gradient_kind,
+                &[
+                    (GradientKind::Linear, "線形"),
+                    (GradientKind::Radial, "円形"),
+                ],
             );
-            ui.radio_value(
+            widgets::field_label(ui, "色");
+            widgets::segmented(
+                ui,
                 gradient_colors,
-                GradientColors::PrimaryToTransparent,
-                GradientColors::PrimaryToTransparent.label(),
+                &[
+                    (
+                        GradientColors::PrimaryToSecondary,
+                        GradientColors::PrimaryToSecondary.label(),
+                    ),
+                    (
+                        GradientColors::PrimaryToTransparent,
+                        GradientColors::PrimaryToTransparent.label(),
+                    ),
+                ],
             );
         }
-        // SPEC §19: 「オプションバー: フォントサイズ 8–144px(デフォルト 24)」。
-        // v12 §52: 縦書きチェック + 文字間 0〜50px + 行間 0〜100px
-        // (文字間・行間は横書きにも効く)。
         ToolKind::Text => {
-            ui.label("フォントサイズ:");
-            ui.add(egui::Slider::new(text_font_size, 8.0..=144.0).suffix("px"));
-            ui.separator();
-            ui.checkbox(text_vertical, "縦書き")
+            widgets::float_slider_field(ui, "文字サイズ", text_font_size, 8.0..=144.0, " px", 80.0);
+            widgets::toggle_chip(ui, text_vertical, "縦書き")
                 .on_hover_text("ON: 右の列から左へ縦に組む(改行で新しい列が左に増えます)");
-            ui.label("文字間:");
-            let mut chars = *text_char_spacing as i32;
-            if ui
-                .add(
-                    egui::Slider::new(&mut chars, 0..=settings::MAX_TEXT_CHAR_SPACING as i32)
-                        .suffix("px"),
-                )
-                .changed()
-            {
-                *text_char_spacing = chars.clamp(0, settings::MAX_TEXT_CHAR_SPACING as i32) as u8;
-            }
-            ui.label("行間:");
-            let mut lines = *text_line_spacing as i32;
-            if ui
-                .add(
-                    egui::Slider::new(&mut lines, 0..=settings::MAX_TEXT_LINE_SPACING as i32)
-                        .suffix("px"),
-                )
-                .changed()
-            {
-                *text_line_spacing = lines.clamp(0, settings::MAX_TEXT_LINE_SPACING as i32) as u8;
-            }
-            // v12 §52.2: 袋文字(縁取り)。色は 塗り=プライマリ /
-            // 縁=セカンダリ(新しい色状態は作らない)。どの色が縁になるか
-            // 分かるよう、現在のセカンダリ色の小さなスウォッチを併記する。
-            ui.separator();
-            ui.checkbox(text_outline, "袋文字")
+            u8_slider(
+                ui,
+                "文字間",
+                text_char_spacing,
+                0,
+                settings::MAX_TEXT_CHAR_SPACING,
+                " px",
+                TRACK_W,
+            );
+            u8_slider(
+                ui,
+                "行間",
+                text_line_spacing,
+                0,
+                settings::MAX_TEXT_LINE_SPACING,
+                " px",
+                TRACK_W,
+            );
+            widgets::toggle_chip(ui, text_outline, "袋文字")
                 .on_hover_text("ON: 文字の外側にセカンダリ色の縁を付ける(塗りはプライマリ色)");
-            ui.add_enabled_ui(*text_outline, |ui| {
-                ui.label("縁の太さ:");
-                let mut width = *text_outline_width as i32;
-                if ui
-                    .add(
-                        egui::Slider::new(
-                            &mut width,
-                            settings::MIN_TEXT_OUTLINE_WIDTH as i32
-                                ..=settings::MAX_TEXT_OUTLINE_WIDTH as i32,
-                        )
-                        .suffix("px"),
-                    )
-                    .changed()
-                {
-                    *text_outline_width = width.clamp(
-                        settings::MIN_TEXT_OUTLINE_WIDTH as i32,
-                        settings::MAX_TEXT_OUTLINE_WIDTH as i32,
-                    ) as u8;
-                }
-                ui.label("縁: セカンダリ色");
-                outline_color_swatch(ui, secondary_color);
+            let outline = *text_outline;
+            ui.add_enabled_ui(outline, |ui| {
+                ui.horizontal(|ui| {
+                    u8_slider(
+                        ui,
+                        "縁",
+                        text_outline_width,
+                        settings::MIN_TEXT_OUTLINE_WIDTH,
+                        settings::MAX_TEXT_OUTLINE_WIDTH,
+                        " px",
+                        TRACK_W,
+                    );
+                    outline_color_swatch(ui, secondary_color);
+                });
             });
         }
-        // v4 §22: なげなわのモードは Shift+L でだけ切り替える(ここは表示
-        // 専用。ARCHITECTURE.md §16.10-10 の「オプションバーの整合」)。
-        //
-        // v4 レビューで発見・修正したバグ: 以前はここに「Shift+L」を固定
-        // 文字列で埋め込んでいた。keymap.rs のモジュールコメントおよび
-        // ARCHITECTURE.md §15.4 は「メニュー表記・ツールチップは KEYMAP から
-        // 文字列生成する(表記と実挙動を構造的に乖離させない)」と定めて
-        // おり、toolbar.rs(`keymap::tool_shortcut_label`)・menu.rs
-        // (`keymap::menu_label`)は準拠しているのに、ここだけ
-        // `keymap::label_for(Action::CycleLassoMode)` を使っていなかった
-        // (将来 KEYMAP のバインドを変更しても、この文字列だけコンパイル
-        // エラーにもテスト失敗にもならず取り残される)。
         ToolKind::Lasso => {
-            ui.label(lasso_mode_label(lasso_mode));
-            ui.separator();
+            widgets::field_label(ui, &lasso_mode_label(lasso_mode));
             transparent_selection_checkbox(ui, transparent_selection);
         }
-        // v4 §22: 自動選択は塗りつぶしと同じ許容値スライダー。
         ToolKind::MagicWand => {
-            ui.label("許容値:");
-            let mut tol = *magic_wand_tolerance as i32;
-            if ui.add(egui::Slider::new(&mut tol, 0..=255)).changed() {
-                *magic_wand_tolerance = tol.clamp(0, 255) as u8;
-            }
-            ui.separator();
+            u8_slider(ui, "許容値", magic_wand_tolerance, 0, 255, "", 120.0);
             transparent_selection_checkbox(ui, transparent_selection);
         }
-        // v12 §51.2: 選択ブラシは「追加 / 消去」モード表示(Alt で消去)。
-        // サイズは共通のブラシサイズスライダー(上段)をそのまま使う。
         ToolKind::SelectBrush => {
-            ui.label(select_brush_mode_label(select_brush_erase));
-            ui.separator();
+            widgets::field_label(ui, &select_brush_mode_label(select_brush_erase));
             transparent_selection_checkbox(ui, transparent_selection);
         }
-        // v10 §46: 選択系・移動ツールは「透明な選択」トグルを持つ。
         ToolKind::Select | ToolKind::EllipseSelect | ToolKind::Move => {
             transparent_selection_checkbox(ui, transparent_selection);
         }
         ToolKind::Line | ToolKind::Picker | ToolKind::Pan | ToolKind::Zoom => {
-            ui.weak("(ツール固有オプションなし)");
+            ui.label(
+                egui::RichText::new("このツールに設定項目はありません").color(theme::TEXT_FAINT),
+            );
         }
     }
 }
 
-/// v10 §46: 「透明な選択」チェックボックス(MS ペイント準拠 — ON のとき
-/// 浮動化・貼り付けでセカンダリ色と RGB 一致する画素を選択から除外する)。
+/// `u8` の設定値を「ラベル+スライダー+数値欄」で編集する。
+fn u8_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u8,
+    min: u8,
+    max: u8,
+    suffix: &str,
+    track_width: f32,
+) {
+    let mut v = *value as i32;
+    if widgets::int_slider_field(
+        ui,
+        label,
+        &mut v,
+        min as i32..=max as i32,
+        suffix,
+        track_width,
+        true,
+    ) {
+        *value = v.clamp(min as i32, max as i32) as u8;
+    }
+}
+
 fn transparent_selection_checkbox(ui: &mut egui::Ui, value: &mut bool) {
-    ui.checkbox(value, "透明な選択")
+    widgets::toggle_chip(ui, value, "透明な選択")
         .on_hover_text("ON: セカンダリ色と一致する画素を持ち上げない(貼り付けにも適用)");
 }
 
-/// なげなわのオプションバー表示文字列(SPEC §22)。ショートカット表記を
-/// `keymap::label_for` から生成する(ARCHITECTURE.md §15.4: 「メニュー
-/// 表記・ツールチップは KEYMAP から文字列生成する」)。egui に依存しない
-/// 純関数として切り出してあるのでテストできる(`show` 内に埋め込んだままだと
-/// ハードコード化への逆行を検知できない、v4 レビューで発見・修正したバグの
 /// 再発防止)。
 fn lasso_mode_label(mode: LassoMode) -> String {
     let shortcut = keymap::label_for(Action::CycleLassoMode);
@@ -371,44 +429,39 @@ fn show_brush_engine_options(
 ) {
     // SPEC §17: 「鉛筆モード…硬さ無視」なので、鉛筆モード中は硬さスライダー
     // を無効化(グレーアウト)する。
-    ui.add_enabled_ui(!*pencil_mode, |ui| {
-        ui.label("硬さ:");
-        let mut hardness = *brush_hardness as i32;
-        if ui
-            .add(egui::Slider::new(&mut hardness, 0..=100).suffix("%"))
-            .changed()
-        {
-            *brush_hardness = hardness.clamp(0, 100) as u8;
-        }
-    });
+    let mut hardness = *brush_hardness as i32;
+    if widgets::int_slider_field(
+        ui,
+        "硬さ",
+        &mut hardness,
+        0..=100,
+        "%",
+        TRACK_W,
+        !*pencil_mode,
+    ) {
+        *brush_hardness = hardness.clamp(0, 100) as u8;
+    }
 
     // SPEC §17: 消しゴムでは同じ値を「強さ」というラベルで表示する。
     let opacity_label = if tool == ToolKind::Eraser {
-        "強さ:"
+        "強さ"
     } else {
-        "不透明度:"
+        "不透明度"
     };
-    ui.label(opacity_label);
     let mut opacity = *brush_opacity as i32;
-    if ui
-        .add(egui::Slider::new(&mut opacity, 1..=100).suffix("%"))
-        .changed()
-    {
+    if widgets::int_slider_field(ui, opacity_label, &mut opacity, 1..=100, "%", TRACK_W, true) {
         *brush_opacity = opacity.clamp(1, 100) as u8;
     }
 
-    ui.checkbox(pencil_mode, "鉛筆モード");
-
     // SPEC §25: 「スムージング(手ブレ補正)…ブラシ/消しゴム/鉛筆のオプション
     // に 0–100%」。鉛筆モードでも有効(硬さと違い、無視されない)。
-    ui.label("スムージング:");
     let mut smoothing = *brush_smoothing as i32;
-    if ui
-        .add(egui::Slider::new(&mut smoothing, 0..=100).suffix("%"))
-        .changed()
-    {
+    if widgets::int_slider_field(ui, "補正", &mut smoothing, 0..=100, "%", TRACK_W, true) {
         *brush_smoothing = smoothing.clamp(0, 100) as u8;
     }
+
+    widgets::toggle_chip(ui, pencil_mode, "鉛筆モード")
+        .on_hover_text("ON: アンチエイリアスなしの 1px 単位で描く(硬さは無視)");
 }
 
 #[cfg(test)]

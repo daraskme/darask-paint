@@ -31,6 +31,9 @@ use eframe::egui;
 fn main() -> eframe::Result {
     // SPEC §11: ベンチマークモードは main() 冒頭で計測を開始する。
     let process_start = Instant::now();
+    // スレッドを 1 本も起こしていないうちに行う(環境変数の書き換え)。
+    #[cfg(target_os = "linux")]
+    prefer_xwayland_for_file_drop();
     let bench_mode = std::env::var_os("DARASK_BENCH").is_some();
 
     // v4 §16.2(ARCHITECTURE.md): 日本語フォント読み込み(~10MB のファイル
@@ -113,4 +116,61 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+/// winit 0.30 の Wayland バックエンドはファイルのドラッグ&ドロップを実装して
+/// いない(`DroppedFile`/`HoveredFile` が一切届かない)。Wayland セッションでも
+/// XWayland(`DISPLAY`)が使えるなら X11 で起動し、画像のドロップ(SPEC §8)を
+/// 有効にする。`DARASK_WAYLAND=1` でネイティブ Wayland を強制できる。
+///
+/// eframe は winit の `EventLoopBuilderExtX11` を再公開しておらず、winit を
+/// 直接の依存に加えることもしない(CLAUDE.md)。winit は `WAYLAND_DISPLAY` が
+/// 空なら X11 を選ぶので、プロセス内のその値だけを外す。`main` の先頭
+/// (フォント読み込みスレッドを起こす前)で呼ぶこと。子プロセス(プラグインの
+/// xterm 等)も X11 側で動くが、いずれも XWayland で問題なく動作する。
+#[cfg(target_os = "linux")]
+fn prefer_xwayland_for_file_drop() {
+    let force_wayland = std::env::var_os("DARASK_WAYLAND");
+    let socket = std::env::var_os("WAYLAND_SOCKET");
+    if socket.is_none()
+        && prefer_x11(
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+            std::env::var_os("DISPLAY").as_deref(),
+            force_wayland.as_deref(),
+        )
+    {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
+/// X11 を選ぶのは「Wayland と X11 の両方がある」ときだけ。X11 のみなら winit が
+/// 元々 X11 を選び、`DISPLAY` が無ければ X11 は開けない。
+#[cfg(any(target_os = "linux", test))]
+fn prefer_x11(
+    wayland_display: Option<&std::ffi::OsStr>,
+    display: Option<&std::ffi::OsStr>,
+    force_wayland: Option<&std::ffi::OsStr>,
+) -> bool {
+    let set = |v: Option<&std::ffi::OsStr>| v.is_some_and(|v| !v.is_empty());
+    let forced = force_wayland.is_some_and(|v| !v.is_empty() && v != "0");
+    set(wayland_display) && set(display) && !forced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefer_x11;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn x11_is_preferred_only_when_xwayland_is_available_and_not_overridden() {
+        let s = |v: &'static str| Some(OsStr::new(v));
+        assert!(prefer_x11(s("wayland-0"), s(":0"), None));
+        assert!(prefer_x11(s("wayland-0"), s(":0"), s("0")));
+        assert!(prefer_x11(s("wayland-0"), s(":0"), s("")));
+        assert!(!prefer_x11(s("wayland-0"), s(":0"), s("1")));
+        assert!(!prefer_x11(s("wayland-0"), None, None));
+        assert!(!prefer_x11(s("wayland-0"), s(""), None));
+        assert!(!prefer_x11(None, s(":0"), None));
+        assert!(!prefer_x11(None, None, None));
+    }
 }

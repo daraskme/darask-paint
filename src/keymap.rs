@@ -153,6 +153,11 @@ pub enum Action {
     Cut,
     Copy,
     Paste,
+    /// クリップボード画像をキャンバス中央の新規レイヤーとして追加する
+    /// (白紙判定・浮動片を経由しない。1 undo 単位)。
+    PasteAsLayer,
+    /// クリップボード画像を新規タブ(唯一のレイヤー)として開く。
+    NewFromClipboard,
     Delete,
     SelectAll,
     Deselect,
@@ -305,6 +310,17 @@ pub const KEYMAP: &[Entry] = &[
         Action::CopyMerged,
     ),
     e(Modifiers::CTRL, Key::V, Action::Paste),
+    // 画像の貼り付け 3 種はいずれも V のキー解放で判定する(`poll` 参照)。
+    e(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::V,
+        Action::PasteAsLayer,
+    ),
+    e(
+        Modifiers::CTRL.plus(Modifiers::ALT),
+        Key::V,
+        Action::NewFromClipboard,
+    ),
     e(Modifiers::NONE, Key::Delete, Action::Delete),
     e(Modifiers::CTRL, Key::A, Action::SelectAll),
     e(Modifiers::CTRL, Key::D, Action::Deselect),
@@ -389,6 +405,65 @@ pub const KEYMAP: &[Entry] = &[
     e(Modifiers::CTRL, Key::K, Action::OpenPreferences),
 ];
 
+#[derive(Clone, Default)]
+struct ClipboardKeys {
+    ctrl_seen: bool,
+    /// V 押下時の修飾キー。解放時にこれへ戻すので、Shift/Alt を先に離しても
+    /// 押した時点の貼り付け種別(Ctrl+Shift+V など)のまま扱える。
+    v_press: Option<Modifiers>,
+}
+
+impl ClipboardKeys {
+    fn normalize(&mut self, input: &mut egui::RawInput) {
+        if !input.focused {
+            *self = Self::default();
+            return;
+        }
+        self.ctrl_seen |= input.modifiers.ctrl;
+        for event in &mut input.events {
+            match event {
+                egui::Event::WindowFocused(false) => *self = Self::default(),
+                egui::Event::Key {
+                    key: Key::ControlLeft | Key::ControlRight,
+                    pressed: true,
+                    ..
+                } => self.ctrl_seen = true,
+                egui::Event::Key {
+                    key: Key::V,
+                    pressed,
+                    modifiers,
+                    ..
+                } => {
+                    if *pressed {
+                        self.v_press = Some(*modifiers);
+                    } else {
+                        // winit が V 押下を消費した場合、Ctrl を先に離しても
+                        // 貼り付けとして扱う。通常の V 押下は区別しておく。
+                        match self.v_press.take() {
+                            Some(at_press) => {
+                                modifiers.ctrl = at_press.ctrl;
+                                modifiers.shift |= at_press.shift;
+                                modifiers.alt |= at_press.alt;
+                            }
+                            None => modifiers.ctrl |= self.ctrl_seen,
+                        }
+                        self.ctrl_seen = input.modifiers.ctrl;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// キー解放順の補正。文字入力中も押下状態だけは追跡し、egui に渡す前に呼ぶ。
+pub fn normalize_clipboard_input(ctx: &egui::Context, input: &mut egui::RawInput) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<ClipboardKeys>(egui::Id::new("darask-clipboard-keys"))
+            .normalize(input);
+    });
+}
+
 /// このフレームぶんのショートカットを消費し、発火した [`Action`] を
 /// 発火順(= `KEYMAP` を修飾キー数の降順に並べ替えた順)で返す。
 ///
@@ -412,11 +487,79 @@ pub fn poll(ctx: &egui::Context) -> Vec<Action> {
         for i in order {
             let entry = &KEYMAP[i];
             if input.consume_shortcut(&entry.binding.to_shortcut()) {
-                triggered.push(entry.action);
+                // 画像の貼り付けは下のキー解放イベントで一度だけ処理する。
+                if !PASTE_ACTIONS.contains(&entry.action) {
+                    triggered.push(entry.action);
+                }
             }
         }
+
+        // egui-winit は Ctrl+C/X の押下を Copy/Cut に変換し、Key を送らない。
+        // Ctrl+V も押下を消費するが、画像だけのクリップボードでは Paste
+        // (文字列専用)さえ届かない。常に届くキー解放から画像を貼り付ける。
+        // 呼び出し側は文字入力中・モーダル中には poll せず、TextEdit の
+        // Copy/Cut/Paste はそのまま egui に任せる。
+        // Shift を C より先に離しても、Copy が発生した時点まで巻き戻す。
+        let mut copy_shift = input.modifiers.shift;
+        for event in input.events.iter().rev() {
+            match event {
+                egui::Event::Copy => break,
+                egui::Event::Key {
+                    key: Key::ShiftLeft | Key::ShiftRight,
+                    pressed,
+                    ..
+                } => copy_shift = !pressed,
+                egui::Event::Key {
+                    key: Key::C,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => copy_shift |= modifiers.shift,
+                _ => {}
+            }
+        }
+        input.events.retain(|event| {
+            let action = match event {
+                egui::Event::Copy if copy_shift => Some(Action::CopyMerged),
+                egui::Event::Copy => Some(Action::Copy),
+                egui::Event::Cut => Some(Action::Cut),
+                egui::Event::Key {
+                    key,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => paste_action_for_release(*key, *modifiers),
+                _ => None,
+            };
+            if let Some(action) = action {
+                if !triggered.contains(&action) {
+                    triggered.push(action);
+                }
+                false
+            } else {
+                true
+            }
+        });
     });
     triggered
+}
+
+/// キー解放で判定する画像貼り付け系(修飾キーの多い順)。egui-winit は
+/// Ctrl+(Shift/Alt+)V の押下をすべて文字列の Paste に変換して Key を送らない。
+const PASTE_ACTIONS: [Action; 3] = [
+    Action::NewFromClipboard,
+    Action::PasteAsLayer,
+    Action::Paste,
+];
+
+/// V の解放イベントに対応する貼り付け操作。`matches_logically` は余分な
+/// Shift/Alt を無視するので、修飾キーの多いバインドから順に照合する。
+fn paste_action_for_release(key: Key, modifiers: Modifiers) -> Option<Action> {
+    PASTE_ACTIONS.into_iter().find(|&action| {
+        binding_for(action).is_some_and(|binding| {
+            key == binding.key && modifiers.matches_logically(binding.modifiers)
+        })
+    })
 }
 
 /// `action` に対応する最初のバインディング(`KEYMAP` の登場順)。
@@ -910,7 +1053,9 @@ mod tests {
         // v12 §51.2 でさらに 1 件追加: Shift+W(CycleWandTool。W 自体は
         // `SelectTool(MagicWand)` → `SelectLastWandTool` に置き換わっただけで
         // バインド数は変わらない) = 73 + 1 = 74。
-        assert_eq!(KEYMAP.len(), 76);
+        // v13 §60 でさらに 2 件追加: Ctrl+Shift+V(PasteAsLayer) +
+        // Ctrl+Alt+V(NewFromClipboard)。
+        assert_eq!(KEYMAP.len(), 78);
     }
 
     // -- v9 §41: 矢印キーのナッジ ---------------------------------------------
@@ -981,6 +1126,196 @@ mod tests {
         let ctrl_shift_z =
             Binding::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Z).specificity();
         assert!(ctrl_shift_z > ctrl_z);
+    }
+
+    fn poll_events(events: Vec<egui::Event>, modifiers: Modifiers) -> Vec<Action> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events,
+            modifiers,
+            ..Default::default()
+        });
+        let actions = poll(&ctx);
+        assert!(poll(&ctx).is_empty(), "consumed commands must not repeat");
+        let _ = ctx.end_pass();
+        actions
+    }
+
+    #[test]
+    fn native_clipboard_events_dispatch_copy_cut_and_copy_merged() {
+        for (event, modifiers, expected) in [
+            (egui::Event::Copy, Modifiers::CTRL, Action::Copy),
+            (
+                egui::Event::Copy,
+                Modifiers::CTRL.plus(Modifiers::SHIFT),
+                Action::CopyMerged,
+            ),
+            (egui::Event::Cut, Modifiers::CTRL, Action::Cut),
+        ] {
+            assert_eq!(poll_events(vec![event], modifiers), vec![expected]);
+        }
+        assert_eq!(
+            poll_events(
+                vec![
+                    egui::Event::Copy,
+                    egui::Event::Key {
+                        key: Key::C,
+                        physical_key: Some(Key::C),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::CTRL.plus(Modifiers::SHIFT),
+                    },
+                ],
+                Modifiers::NONE,
+            ),
+            vec![Action::CopyMerged]
+        );
+        assert_eq!(
+            poll_events(
+                vec![
+                    egui::Event::Copy,
+                    egui::Event::Key {
+                        key: Key::ShiftLeft,
+                        physical_key: Some(Key::ShiftLeft),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                Modifiers::NONE,
+            ),
+            vec![Action::CopyMerged]
+        );
+    }
+
+    fn paste_key(pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        }
+    }
+
+    #[test]
+    fn image_paste_dispatches_on_release_without_a_text_paste_event() {
+        assert_eq!(
+            poll_events(vec![paste_key(false)], Modifiers::CTRL),
+            vec![Action::Paste]
+        );
+        // キー押下も送るバックエンドでも、押下だけでは貼り付けない。
+        assert!(poll_events(vec![paste_key(true)], Modifiers::CTRL).is_empty());
+    }
+
+    #[test]
+    fn shift_and_alt_paste_variants_dispatch_on_release() {
+        let release = |modifiers| egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers,
+        };
+        let ctrl_shift = Modifiers::CTRL.plus(Modifiers::SHIFT);
+        let ctrl_alt = Modifiers::CTRL.plus(Modifiers::ALT);
+        assert_eq!(
+            poll_events(vec![release(ctrl_shift)], ctrl_shift),
+            vec![Action::PasteAsLayer]
+        );
+        assert_eq!(
+            poll_events(vec![release(ctrl_alt)], ctrl_alt),
+            vec![Action::NewFromClipboard]
+        );
+        // 押下時の修飾キーを覚えておき、Shift を先に離しても種別は変わらない。
+        let mut keys = ClipboardKeys::default();
+        keys.normalize(&mut egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::V,
+                physical_key: Some(Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl_shift,
+            }],
+            modifiers: ctrl_shift,
+            ..Default::default()
+        });
+        let mut input = egui::RawInput {
+            events: vec![release(Modifiers::CTRL)],
+            modifiers: Modifiers::CTRL,
+            ..Default::default()
+        };
+        keys.normalize(&mut input);
+        assert_eq!(
+            poll_events(input.events, input.modifiers),
+            vec![Action::PasteAsLayer]
+        );
+    }
+
+    #[test]
+    fn paste_text_and_key_events_do_not_duplicate_image_paste() {
+        assert_eq!(
+            poll_events(
+                vec![
+                    paste_key(true),
+                    egui::Event::Paste("clipboard text".to_owned()),
+                    paste_key(false),
+                ],
+                Modifiers::CTRL,
+            ),
+            vec![Action::Paste]
+        );
+    }
+
+    #[test]
+    fn image_paste_survives_ctrl_released_first_but_plain_v_does_not_paste() {
+        let mut keys = ClipboardKeys::default();
+        // 画像貼り付けでは V の押下イベントが来ない。
+        keys.normalize(&mut egui::RawInput {
+            modifiers: Modifiers::CTRL,
+            ..Default::default()
+        });
+        keys.normalize(&mut egui::RawInput::default()); // Ctrl を先に解放
+        let release = || egui::Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let mut input = egui::RawInput {
+            events: vec![release()],
+            ..Default::default()
+        };
+        keys.normalize(&mut input);
+        assert_eq!(
+            poll_events(input.events, input.modifiers),
+            vec![Action::Paste]
+        );
+
+        // Ctrl を押したことがあっても、普通の V は移動ツールのまま。
+        keys.ctrl_seen = true;
+        let mut press = release();
+        if let egui::Event::Key { pressed, .. } = &mut press {
+            *pressed = true;
+        }
+        keys.normalize(&mut egui::RawInput {
+            events: vec![press],
+            ..Default::default()
+        });
+        let mut input = egui::RawInput {
+            events: vec![release()],
+            ..Default::default()
+        };
+        keys.normalize(&mut input);
+        assert!(poll_events(input.events, input.modifiers).is_empty());
+
+        keys.ctrl_seen = true;
+        keys.normalize(&mut egui::RawInput {
+            focused: false,
+            ..Default::default()
+        });
+        assert!(!keys.ctrl_seen);
     }
 
     #[test]

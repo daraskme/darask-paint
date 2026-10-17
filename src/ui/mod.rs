@@ -8,6 +8,7 @@
 pub mod color_panel;
 pub mod color_wheel;
 pub mod dialogs;
+pub mod drop_overlay;
 pub mod history_panel;
 pub mod icons;
 pub mod layers_panel;
@@ -20,3 +21,4 @@ pub mod status_bar;
 pub mod tab_bar;
 pub mod theme;
 pub mod toolbar;
+pub mod widgets;

@@ -708,7 +708,7 @@ impl CanvasView {
         ppp: f32,
         events: &mut Vec<ToolEvent>,
     ) {
-        let (modifiers, pos, primary, secondary, middle) = ui.ctx().input(|i| {
+        let (modifiers, latest_pos, primary, secondary, middle) = ui.ctx().input(|i| {
             (
                 i.modifiers,
                 i.pointer.latest_pos(),
@@ -718,7 +718,13 @@ impl CanvasView {
             )
         });
 
-        let Some(pos) = pos else {
+        // release 後の PointerMoved/PointerGone が同じフレームへ届いても、
+        // ボタンイベント自身の座標でジェスチャを確定する。
+        let Some(pos) = latest_pos
+            .or(primary.released_pos)
+            .or(secondary.released_pos)
+            .or(middle.released_pos)
+        else {
             self.hover_img = None;
             return;
         };
@@ -730,7 +736,7 @@ impl CanvasView {
                 PointerButton::Middle => middle,
                 _ => ButtonState::default(),
             };
-            if state.down {
+            if state.down && state.released_pos.is_none() {
                 if gesture.is_pan {
                     self.pan += pos - self.last_pointer;
                 } else {
@@ -743,8 +749,11 @@ impl CanvasView {
                 }
                 self.last_pointer = pos;
             } else {
-                if !gesture.is_pan {
-                    let img = screen_to_img(pos, self.viewport.min, self.pan, self.zoom, ppp);
+                let end = state.released_pos.unwrap_or(pos);
+                if gesture.is_pan {
+                    self.pan += end - self.last_pointer;
+                } else {
+                    let img = screen_to_img(end, self.viewport.min, self.pan, self.zoom, ppp);
                     events.push(ToolEvent::Up {
                         img,
                         button: gesture.button,
@@ -752,51 +761,55 @@ impl CanvasView {
                 }
                 self.gesture = None;
             }
-            self.hover_img = Some(screen_to_img(
-                pos,
-                self.viewport.min,
-                self.pan,
-                self.zoom,
-                ppp,
-            ));
+            self.hover_img =
+                latest_pos.map(|p| screen_to_img(p, self.viewport.min, self.pan, self.zoom, ppp));
             return;
         }
 
-        if response.contains_pointer() {
-            if middle.pressed {
-                self.gesture = Some(Gesture {
-                    button: PointerButton::Middle,
-                    is_pan: true,
-                });
-                self.last_pointer = pos;
-            } else if primary.pressed {
-                let is_pan = force_pan || ui.ctx().input(|i| i.key_down(Key::Space));
-                self.gesture = Some(Gesture {
-                    button: PointerButton::Primary,
-                    is_pan,
-                });
-                self.last_pointer = pos;
-                if !is_pan {
-                    let img = screen_to_img(pos, self.viewport.min, self.pan, self.zoom, ppp);
-                    events.push(ToolEvent::Down {
-                        img,
-                        button: PointerButton::Primary,
-                        mods: modifiers,
-                    });
-                }
-            } else if secondary.pressed {
-                self.gesture = Some(Gesture {
-                    button: PointerButton::Secondary,
-                    is_pan: false,
-                });
-                self.last_pointer = pos;
-                let img = screen_to_img(pos, self.viewport.min, self.pan, self.zoom, ppp);
+        let pressed = [
+            (PointerButton::Middle, middle),
+            (PointerButton::Primary, primary),
+            (PointerButton::Secondary, secondary),
+        ]
+        .into_iter()
+        .find(|(_, state)| {
+            let start = state.pressed_pos.unwrap_or(pos);
+            state.pressed
+                && response.enabled()
+                && response.rect.contains(start)
+                && ui.ctx().layer_id_at(start) == Some(response.layer_id)
+        });
+        if let Some((button, state)) = pressed {
+            let start = state.pressed_pos.unwrap_or(pos);
+            let is_pan = button == PointerButton::Middle
+                || (button == PointerButton::Primary
+                    && (force_pan || ui.ctx().input(|i| i.key_down(Key::Space))));
+            self.gesture = Some(Gesture { button, is_pan });
+            self.last_pointer = start;
+            if !is_pan {
+                let img = screen_to_img(start, self.viewport.min, self.pan, self.zoom, ppp);
                 events.push(ToolEvent::Down {
                     img,
-                    button: PointerButton::Secondary,
+                    button,
                     mods: modifiers,
                 });
             }
+            // 素早いクリックでは Down と Up が同じフレームに入る。
+            // 次の入力を待たずに両方を送り、描画中の状態を残さない。
+            if !state.down {
+                let end = state.released_pos.unwrap_or(pos);
+                if is_pan {
+                    self.pan += end - start;
+                } else {
+                    let img = screen_to_img(end, self.viewport.min, self.pan, self.zoom, ppp);
+                    events.push(ToolEvent::Up { img, button });
+                }
+                self.gesture = None;
+            }
+            self.hover_img = latest_pos
+                .filter(|p| response.rect.contains(*p))
+                .map(|p| screen_to_img(p, self.viewport.min, self.pan, self.zoom, ppp));
+            return;
         }
 
         if self.gesture.is_none() && response.contains_pointer() {
@@ -813,14 +826,35 @@ impl CanvasView {
 struct ButtonState {
     pressed: bool,
     down: bool,
+    pressed_pos: Option<Pos2>,
+    released_pos: Option<Pos2>,
 }
 
 impl ButtonState {
     fn from_input(input: &egui::InputState, button: PointerButton) -> Self {
-        Self {
+        let mut state = Self {
             pressed: input.pointer.button_pressed(button),
             down: input.pointer.button_down(button),
+            ..Default::default()
+        };
+        for event in &input.events {
+            if let Event::PointerButton {
+                pos,
+                button: event_button,
+                pressed,
+                ..
+            } = event
+            {
+                if *event_button == button {
+                    if *pressed {
+                        state.pressed_pos = Some(*pos);
+                    } else {
+                        state.released_pos = Some(*pos);
+                    }
+                }
+            }
         }
+        state
     }
 }
 
@@ -834,6 +868,8 @@ fn texture_options() -> TextureOptions {
 }
 
 /// v2 §14.1: テクスチャは合成 1 枚のまま(レイヤーごとにテクスチャを持たない)。
+/// `rect` は呼び出し元で画像内へクランプ済み。変更領域を直接 Color32 へ
+/// 変換し、同じ大きさの RGBA 中間バッファの確保・コピーを省く。
 fn extract_sub_image(doc: &Document, rect: IRect) -> egui::ColorImage {
     let w = rect.width() as usize;
     let h = rect.height() as usize;
@@ -981,6 +1017,246 @@ mod tests {
         ));
         assert_eq!(uv.min, pos2(0.0, 0.5));
         assert_eq!(uv.max, pos2(1.5, 2.0));
+    }
+
+    fn pointer_frame(
+        view: &mut CanvasView,
+        ctx: &egui::Context,
+        input: Vec<Event>,
+    ) -> Vec<ToolEvent> {
+        let mut events = Vec::new();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                events: input,
+                ..Default::default()
+            },
+            |ui| {
+                let rect = ui.available_rect_before_wrap();
+                view.viewport = rect;
+                let response = ui.allocate_rect(rect, Sense::click_and_drag());
+                view.handle_pointer(ui, &response, false, 1.0, &mut events);
+            },
+        );
+        events
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn pointer_release_uses_release_position_before_later_motion_or_leaving() {
+        for leave in [false, true] {
+            let ctx = egui::Context::default();
+            let mut view = CanvasView::new();
+            pointer_frame(&mut view, &ctx, vec![]);
+            let start = pos2(50.0, 60.0);
+            let end = pos2(90.0, 100.0);
+            let down = pointer_frame(
+                &mut view,
+                &ctx,
+                vec![Event::PointerMoved(start), pointer_button(start, true)],
+            );
+            assert!(matches!(down.as_slice(), [ToolEvent::Down { .. }]));
+            let mut release = vec![
+                pointer_button(end, false),
+                Event::PointerMoved(pos2(350.0, 250.0)),
+            ];
+            if leave {
+                release.push(Event::PointerGone);
+            }
+            let up = pointer_frame(&mut view, &ctx, release);
+            let [ToolEvent::Up { img, .. }] = up.as_slice() else {
+                panic!("expected Up");
+            };
+            assert_eq!(view.img_to_screen_pos(*img), end);
+            assert!(view.gesture.is_none());
+        }
+    }
+
+    #[test]
+    fn quick_click_keeps_both_event_positions_and_finishes_in_one_frame() {
+        let ctx = egui::Context::default();
+        let mut view = CanvasView::new();
+        pointer_frame(&mut view, &ctx, vec![]);
+        let start = pos2(50.0, 60.0);
+        let end = pos2(90.0, 100.0);
+        let events = pointer_frame(
+            &mut view,
+            &ctx,
+            vec![
+                Event::PointerMoved(start),
+                pointer_button(start, true),
+                Event::PointerMoved(end),
+                pointer_button(end, false),
+                Event::PointerMoved(pos2(500.0, 350.0)),
+            ],
+        );
+        let [ToolEvent::Down { img: first, .. }, ToolEvent::Up { img: last, .. }] =
+            events.as_slice()
+        else {
+            panic!("expected Down followed by Up");
+        };
+        assert_eq!(view.img_to_screen_pos(*first), start);
+        assert_eq!(view.img_to_screen_pos(*last), end);
+        assert!(view.gesture.is_none());
+    }
+
+    #[test]
+    fn pan_release_uses_the_final_button_position() {
+        let ctx = egui::Context::default();
+        let mut view = CanvasView::new();
+        pointer_frame(&mut view, &ctx, vec![]);
+        let start = pos2(50.0, 60.0);
+        let end = pos2(90.0, 100.0);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Middle,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        assert!(pointer_frame(
+            &mut view,
+            &ctx,
+            vec![Event::PointerMoved(start), button(start, true)]
+        )
+        .is_empty());
+        assert!(pointer_frame(
+            &mut view,
+            &ctx,
+            vec![button(end, false), Event::PointerMoved(pos2(350.0, 250.0))]
+        )
+        .is_empty());
+        assert_eq!(view.pan, end - start);
+        assert!(view.gesture.is_none());
+    }
+
+    #[test]
+    fn press_outside_canvas_does_not_start_drawing_when_pointer_moves_inside() {
+        let ctx = egui::Context::default();
+        let mut view = CanvasView::new();
+        pointer_frame(&mut view, &ctx, vec![]);
+        let outside = pos2(500.0, 350.0);
+        let events = pointer_frame(
+            &mut view,
+            &ctx,
+            vec![
+                Event::PointerMoved(outside),
+                pointer_button(outside, true),
+                Event::PointerMoved(pos2(100.0, 100.0)),
+            ],
+        );
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, ToolEvent::Hover { .. })));
+        assert!(view.gesture.is_none());
+    }
+
+    /// 最適化前の、RGBA の中間バッファを作る変換経路。
+    fn reference_sub_image(doc: &Document, rect: IRect) -> egui::ColorImage {
+        let w = rect.width() as usize;
+        let h = rect.height() as usize;
+        let mut bytes = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let start = ((rect.y0 as usize + y) * doc.width as usize + rect.x0 as usize) * 4;
+            bytes[y * w * 4..(y + 1) * w * 4].copy_from_slice(&doc.composite[start..start + w * 4]);
+        }
+        egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes)
+    }
+
+    #[test]
+    fn extract_sub_image_matches_reference_for_offsets_edges_and_all_alpha_values() {
+        let mut doc = Document::new(19, 17, crate::document::Background::Transparent);
+        for (i, pixel) in doc.composite.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *pixel = [i as u8, (i * 73) as u8, (i * 151) as u8, i as u8];
+        }
+        for y0 in 0..doc.height as i32 {
+            for x0 in 0..doc.width as i32 {
+                for w in [0, 1, 3, doc.width as i32 - x0] {
+                    for h in [0, 1, 5, doc.height as i32 - y0] {
+                        let rect = IRect {
+                            x0,
+                            y0,
+                            x1: x0 + w,
+                            y1: y0 + h,
+                        }
+                        .clamp_to(doc.width, doc.height);
+                        let actual = extract_sub_image(&doc, rect);
+                        let expected = reference_sub_image(&doc, rect);
+                        assert_eq!(actual.size, expected.size, "{rect:?}");
+                        assert_eq!(actual.source_size, expected.source_size, "{rect:?}");
+                        assert_eq!(actual.pixels, expected.pixels, "{rect:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// CPU 側の部分更新画像の生成のみを計測(GPU 転送・再合成は含まない)。
+    #[test]
+    #[ignore = "manual release-mode benchmark"]
+    fn extract_sub_image_performance() {
+        use std::{hint::black_box, time::Instant};
+        let mut doc = Document::new(4000, 4000, crate::document::Background::Transparent);
+        for mixed_alpha in [false, true] {
+            for (i, pixel) in doc.composite.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *pixel = [
+                    i as u8,
+                    (i * 73) as u8,
+                    (i * 151) as u8,
+                    if mixed_alpha { i as u8 } else { 255 },
+                ];
+            }
+            for (size, offset, iterations) in [
+                (64, 173, 1000),
+                (512, 173, 16),
+                (2048, 173, 1),
+                (4000, 0, 1),
+            ] {
+                let rect = IRect {
+                    x0: offset,
+                    y0: offset,
+                    x1: offset + size,
+                    y1: offset + size,
+                };
+                let mut reference_samples = Vec::new();
+                let mut current_samples = Vec::new();
+                // 呼び出し順を交互に変え、初回は LUT・アロケータの準備として捨てる。
+                for sample in 0..8 {
+                    for pass in 0..2 {
+                        let reference = (sample + pass) % 2 == 0;
+                        let start = Instant::now();
+                        for _ in 0..iterations {
+                            black_box(if reference {
+                                reference_sub_image(black_box(&doc), black_box(rect))
+                            } else {
+                                extract_sub_image(black_box(&doc), black_box(rect))
+                            });
+                        }
+                        let elapsed = start.elapsed() / iterations;
+                        if sample > 0 {
+                            if reference {
+                                reference_samples.push(elapsed);
+                            } else {
+                                current_samples.push(elapsed);
+                            }
+                        }
+                    }
+                }
+                reference_samples.sort();
+                current_samples.sort();
+                eprintln!(
+                    "texture {size}x{size} mixed_alpha={mixed_alpha}: reference={:?}, current={:?}",
+                    reference_samples[3], current_samples[3]
+                );
+            }
+        }
     }
 
     // -- v3 レビューで発見・修正したバグ: ブラシ/消しゴム使用中の Space・

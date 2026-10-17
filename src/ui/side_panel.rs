@@ -47,11 +47,19 @@ use crate::ui::layers_panel::{
 };
 use crate::ui::pages_panel::{self, PageThumbnailCache};
 use crate::ui::panels::{self, DockSide, PanelKind, PanelLayout, PanelMove, PanelPlacement};
+use crate::ui::{icons, theme, widgets};
 
 /// ヘッダの折りたたみ矢印の一辺。
-const HEADER_ARROW_SIZE: f32 = 13.0;
-/// ヘッダ右端の「▾」ボタンの一辺。
-const HEADER_MENU_SIZE: f32 = 16.0;
+const HEADER_ARROW_SIZE: f32 = 16.0;
+/// ヘッダ右端の「…」ボタンの一辺。
+const HEADER_MENU_SIZE: f32 = 24.0;
+/// v13 §60: ヘッダの高さとパネル本体の左右余白。
+const HEADER_H: f32 = 34.0;
+const BODY_MARGIN_X: i8 = 10;
+const BODY_MARGIN_BOTTOM: f32 = 10.0;
+/// レイヤーパネル本体(プロパティ欄+一覧+操作ボタン)に最低限確保する高さ。
+/// ドックが低いときはこれ以上は縮めず、ドック全体のスクロールに任せる。
+const MIN_LAYERS_BODY_H: f32 = 230.0;
 /// ドラッグでフローティング化したとき、ポインタをヘッダのどのあたりに
 /// 置いたことにするか(見た目の飛びを減らすためだけの値)。
 const FLOAT_DROP_GRAB_Y: f32 = 12.0;
@@ -172,31 +180,63 @@ fn show_dock(
     panel
         .resizable(false)
         .exact_size(panels::DOCK_WIDTH)
+        .frame(egui::Frame::NONE.fill(theme::BG_PANEL))
         .show(ui, |ui| {
-            // SPEC §50.1: スクロールはドック全体の 1 本に集約する(パネルの
-            // 中に入れ子のスクロール領域を作らない)。
+            let full = ui.max_rect();
+            let edge = match side {
+                DockSide::Left => full.right() - 0.5,
+                DockSide::Right => full.left() + 0.5,
+            };
+            ui.painter()
+                .vline(edge, full.y_range(), egui::Stroke::new(1.0, theme::LINE));
+            // SPEC §50.1 / §60: スクロールは基本的にドック全体の 1 本。ただし
+            // 展開中のレイヤーパネルには「ドックの残りの高さ」を割り当て、一覧
+            // だけをその中でスクロールさせる(操作ボタンが常に見える)。他の
+            // パネルの高さは前フレームの実測を使う(変わったフレームだけ再描画を
+            // 1 回予約するので、数フレームで収束する)。
+            let dock_h = ui.available_height();
+            let heights_id = egui::Id::new(("darask_dock_block_heights", dock_tag(side)));
+            let last_heights: Vec<(PanelKind, f32)> = ui
+                .ctx()
+                .data(|d| d.get_temp(heights_id))
+                .unwrap_or_default();
+            let mut heights: Vec<(PanelKind, f32)> = Vec::new();
+            let docked = layout.docked(side);
             let mut blocks: Vec<egui::Rect> = Vec::new();
             egui::ScrollArea::vertical()
                 .id_salt(dock_tag(side))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for kind in layout.docked(side) {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for &kind in &docked {
+                        let extra = header_extra(kind, ctx);
+                        let fill = (kind == PanelKind::Layers && !layout.collapsed(kind))
+                            .then(|| layers_fill_height(dock_h, kind, &docked, &last_heights));
                         let block = ui
                             .scope(|ui| {
-                                let header = panel_header(ui, kind, layout, false, interactive);
+                                let header =
+                                    panel_header(ui, kind, layout, false, interactive, &extra);
                                 if header.toggle_collapse {
                                     layout.toggle_collapsed(kind);
                                 }
                                 if let Some(mv) = header.mv {
                                     sink.pending_move = Some((kind, mv));
                                 }
-                                if !layout.collapsed(kind) {
-                                    panel_body(ui, kind, ctx, &mut sink.out);
+                                if header.add_layer {
+                                    sink.out.layer_action = Some(LayersPanelAction::Add);
                                 }
-                                ui.add_space(4.0);
+                                if !layout.collapsed(kind) {
+                                    panel_body_framed(ui, kind, ctx, &mut sink.out, fill);
+                                }
                             })
                             .response
                             .rect;
+                        heights.push((kind, block.height()));
+                        ui.painter().hline(
+                            block.x_range(),
+                            block.bottom() - 0.5,
+                            egui::Stroke::new(1.0, theme::LINE),
+                        );
                         blocks.push(block);
                     }
                     if blocks.is_empty() {
@@ -207,7 +247,84 @@ fn show_dock(
             if dragging && handle_dock_drop(ui, side, layout, &blocks) {
                 sink.placement_changed = true;
             }
+            if !same_heights(&heights, &last_heights) {
+                ui.ctx().data_mut(|d| d.insert_temp(heights_id, heights));
+                ui.ctx().request_repaint();
+            }
         });
+}
+
+/// 展開中のレイヤーパネル本体に割り当てる高さ(純関数)。ドックの高さから、
+/// 他のパネルの前フレームの高さ(未計測なら見出しだけとみなす)と自分の見出し・
+/// 下余白を引く。
+fn layers_fill_height(
+    dock_h: f32,
+    layers: PanelKind,
+    docked: &[PanelKind],
+    last_heights: &[(PanelKind, f32)],
+) -> f32 {
+    let others: f32 = docked
+        .iter()
+        .filter(|kind| **kind != layers)
+        .map(|kind| {
+            last_heights
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map_or(HEADER_H, |(_, h)| *h)
+        })
+        .sum();
+    (dock_h - others - HEADER_H - BODY_MARGIN_BOTTOM).max(MIN_LAYERS_BODY_H)
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    #[test]
+    fn layers_get_the_rest_of_the_dock_but_never_less_than_the_minimum() {
+        let docked = [
+            PanelKind::Color,
+            PanelKind::Layers,
+            PanelKind::History,
+            PanelKind::Pages,
+        ];
+        let last = [
+            (PanelKind::Color, 340.0),
+            (PanelKind::Layers, 300.0),
+            (PanelKind::History, HEADER_H),
+            (PanelKind::Pages, HEADER_H),
+        ];
+        let fill = layers_fill_height(1000.0, PanelKind::Layers, &docked, &last);
+        assert_eq!(
+            fill,
+            1000.0 - 340.0 - HEADER_H * 2.0 - HEADER_H - BODY_MARGIN_BOTTOM
+        );
+        assert_eq!(
+            layers_fill_height(500.0, PanelKind::Layers, &docked, &last),
+            MIN_LAYERS_BODY_H
+        );
+        // 未計測のパネルは見出しだけとみなす。
+        let fill = layers_fill_height(1000.0, PanelKind::Layers, &docked, &[]);
+        assert_eq!(fill, 1000.0 - HEADER_H * 4.0 - BODY_MARGIN_BOTTOM);
+    }
+
+    #[test]
+    fn heights_compare_with_a_subpixel_tolerance() {
+        let a = [(PanelKind::Color, 100.0), (PanelKind::Layers, 50.0)];
+        let b = [(PanelKind::Color, 100.3), (PanelKind::Layers, 50.0)];
+        let c = [(PanelKind::Color, 101.0), (PanelKind::Layers, 50.0)];
+        assert!(same_heights(&a, &b));
+        assert!(!same_heights(&a, &c));
+        assert!(!same_heights(&a, &a[..1]));
+    }
+}
+
+/// 前フレームと同じ並び・高さか(サブピクセルの揺れは無視する)。
+fn same_heights(a: &[(PanelKind, f32)], b: &[(PanelKind, f32)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|((ka, ha), (kb, hb))| ka == kb && (ha - hb).abs() < 0.5)
 }
 
 /// ドックの上でのドロップ(並べ替え/他ドックからの移動)。挿入位置の
@@ -305,15 +422,21 @@ fn show_floating(
     let mut toggle_collapse = false;
     let mut mv = None;
     let mut drag_delta = egui::Vec2::ZERO;
+    let extra = header_extra(kind, ctx);
+    let mut add_layer = false;
     let response = window.show(ui.ctx(), |ui| {
-        let header = panel_header(ui, kind, layout, true, interactive);
+        let header = panel_header(ui, kind, layout, true, interactive, &extra);
         toggle_collapse = header.toggle_collapse;
         mv = header.mv;
         drag_delta = header.drag_delta;
+        add_layer = header.add_layer;
         if !collapsed {
-            panel_body(ui, kind, ctx, &mut sink.out);
+            panel_body_framed(ui, kind, ctx, &mut sink.out, None);
         }
     });
+    if add_layer {
+        sink.out.layer_action = Some(LayersPanelAction::Add);
+    }
 
     if let Some(response) = response {
         let rect = response.response.rect;
@@ -358,7 +481,13 @@ fn float_on_drop_outside_docks(ui: &egui::Ui, layout: &mut PanelLayout) -> bool 
 
 /// パネル本体。中身は従来のセクション関数そのままで、配置には依存しない。
 /// 将来パネルを増やすときはここに 1 行(`PanelKind` の追加と対で)足す。
-fn panel_body(ui: &mut egui::Ui, kind: PanelKind, ctx: &mut PanelsCtx<'_>, out: &mut PanelsOutput) {
+fn panel_body(
+    ui: &mut egui::Ui,
+    kind: PanelKind,
+    ctx: &mut PanelsCtx<'_>,
+    out: &mut PanelsOutput,
+    fill: Option<f32>,
+) {
     match kind {
         PanelKind::Color => color_panel::show(ui, ctx.color.reborrow()),
         PanelKind::Layers => {
@@ -368,6 +497,7 @@ fn panel_body(ui: &mut egui::Ui, kind: PanelKind, ctx: &mut PanelsCtx<'_>, out: 
                     doc: ctx.doc,
                     rename: ctx.rename,
                     thumbnails: ctx.thumbnails,
+                    fill_height: fill,
                 },
             );
             if action.is_some() {
@@ -390,17 +520,72 @@ fn panel_body(ui: &mut egui::Ui, kind: PanelKind, ctx: &mut PanelsCtx<'_>, out: 
     }
 }
 
+/// パネル本体を左右の余白付きで描く(v13 §60)。
+/// `fill` はレイヤーパネルに割り当てる本体の高さ(`layers_fill_height`)。
+fn panel_body_framed(
+    ui: &mut egui::Ui,
+    kind: PanelKind,
+    ctx: &mut PanelsCtx<'_>,
+    out: &mut PanelsOutput,
+    fill: Option<f32>,
+) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: BODY_MARGIN_X,
+            right: BODY_MARGIN_X,
+            top: 0,
+            bottom: BODY_MARGIN_BOTTOM as i8,
+        })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 5.0;
+            panel_body(ui, kind, ctx, out, fill);
+        });
+}
+
+/// 見出しに添える情報(個数バッジ・レイヤーの「追加」ボタン)。
+struct HeaderExtra {
+    badge: Option<String>,
+    /// `Some(有効か)` のときだけ「+ 追加」を出す(レイヤーパネル)。
+    add_layer: Option<bool>,
+}
+
+fn header_extra(kind: PanelKind, ctx: &PanelsCtx<'_>) -> HeaderExtra {
+    match kind {
+        PanelKind::Layers => HeaderExtra {
+            badge: Some(ctx.doc.layers.len().to_string()),
+            add_layer: Some(ctx.doc.layers.len() < crate::document::MAX_LAYERS),
+        },
+        PanelKind::History => HeaderExtra {
+            badge: Some(ctx.history.undo_len().to_string()),
+            add_layer: None,
+        },
+        PanelKind::Pages => HeaderExtra {
+            badge: ctx
+                .pages
+                .as_ref()
+                .map(|pages| pages.entries.len().to_string()),
+            add_layer: None,
+        },
+        PanelKind::Color => HeaderExtra {
+            badge: None,
+            add_layer: None,
+        },
+    }
+}
+
 /// ヘッダ行の結果(呼び出し側が `PanelLayout` へ適用する)。
 struct HeaderOutput {
     toggle_collapse: bool,
     mv: Option<PanelMove>,
     /// フローティング時のみ: このフレームのヘッダドラッグ量。
     drag_delta: egui::Vec2,
+    /// レイヤーパネルの「+ 追加」が押された。
+    add_layer: bool,
 }
 
-/// パネルのヘッダ(折りたたみ矢印 + タイトル(ドラッグ源) + 「▾」メニュー)。
+/// パネルのヘッダ(開閉矢印 + タイトル(ドラッグ源) + バッジ + [追加] + 「…」)。
 ///
-/// **矢印と「▾」はドラッグ源の外に置く**(モジュールドキュメントコメントの
+/// **矢印・追加・「…」はドラッグ源の外に置く**(モジュールドキュメントコメントの
 /// 落とし穴 2)。ドック中はドラッグ中の見た目(ゴースト)が欲しいので
 /// `dnd_drag_source` を使い、フローティング中はウィンドウ自体が動くので
 /// ゴーストを出さない `dnd_set_drag_payload` を使う。
@@ -414,6 +599,7 @@ fn panel_header(
     layout: &PanelLayout,
     floating: bool,
     interactive: bool,
+    extra: &HeaderExtra,
 ) -> HeaderOutput {
     let collapsed = layout.collapsed(kind);
     let placement = layout.placement(kind);
@@ -421,6 +607,7 @@ fn panel_header(
         toggle_collapse: false,
         mv: None,
         drag_delta: egui::Vec2::ZERO,
+        add_layer: false,
     };
     // モーダル中は「押せない」= hover しか sense しない(id は変えないので
     // レイアウト・テストからの参照はそのまま)。
@@ -429,113 +616,178 @@ fn panel_header(
     } else {
         egui::Sense::hover()
     };
-    egui::Frame::NONE
-        .fill(ui.visuals().faint_bg_color)
-        .inner_margin(egui::Margin::symmetric(3, 2))
-        .corner_radius(3.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // -- 折りたたみ矢印(ドラッグ源の外) ------------------------
-                let (arrow_rect, _) = ui.allocate_exact_size(
-                    egui::Vec2::splat(HEADER_ARROW_SIZE),
-                    egui::Sense::hover(),
-                );
-                let arrow = ui.interact(
-                    arrow_rect,
-                    egui::Id::new(("darask_panel_arrow", kind.tag())),
-                    click_sense,
-                );
-                let arrow = if interactive {
-                    arrow.on_hover_text(if collapsed {
-                        "展開する"
-                    } else {
-                        "折りたたむ"
-                    })
+    let add_w = if extra.add_layer.is_some() { 58.0 } else { 0.0 };
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), HEADER_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_height(HEADER_H);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add_space(6.0);
+            // -- 開閉矢印(ドラッグ源の外) --------------------------------
+            let (arrow_rect, _) =
+                ui.allocate_exact_size(egui::Vec2::splat(HEADER_ARROW_SIZE), egui::Sense::hover());
+            let arrow = ui.interact(
+                arrow_rect,
+                egui::Id::new(("darask_panel_arrow", kind.tag())),
+                click_sense,
+            );
+            let arrow = if interactive {
+                arrow.on_hover_text(if collapsed {
+                    "展開する"
                 } else {
-                    arrow
+                    "折りたたむ"
+                })
+            } else {
+                arrow
+            };
+            if ui.is_rect_visible(arrow_rect) {
+                let color = if arrow.hovered() {
+                    egui::Color32::WHITE
+                } else {
+                    theme::TEXT_FAINT
                 };
-                if ui.is_rect_visible(arrow_rect) {
-                    let color = if arrow.hovered() {
-                        ui.visuals().widgets.hovered.fg_stroke.color
-                    } else {
-                        ui.visuals().widgets.active.fg_stroke.color
-                    };
-                    paint_collapse_arrow(ui.painter(), arrow_rect, collapsed, color);
-                }
-                if arrow.clicked() {
-                    out.toggle_collapse = true;
-                }
+                icons::paint_disclosure_icon(ui.painter(), arrow_rect, color, !collapsed);
+            }
+            if arrow.clicked() {
+                out.toggle_collapse = true;
+            }
 
-                // -- タイトル(ドラッグ源) ---------------------------------
-                let title_width =
-                    (ui.available_width() - HEADER_MENU_SIZE - ui.spacing().item_spacing.x)
-                        .max(24.0);
-                let drag_id = egui::Id::new(("darask_panel_header", kind.tag()));
-                // ドラッグ源にする/しないで 2 回書かないための共通の中身。
-                let title_ui = |ui: &mut egui::Ui| {
-                    ui.scope(|ui| {
-                        ui.set_min_width(title_width);
-                        ui.label(egui::RichText::new(kind.title()).strong());
+            // -- タイトル(ドラッグ源) -------------------------------------
+            let title_width = (ui.available_width()
+                - HEADER_MENU_SIZE
+                - add_w
+                - ui.spacing().item_spacing.x * 2.0
+                - 4.0)
+                .max(24.0);
+            let drag_id = egui::Id::new(("darask_panel_header", kind.tag()));
+            let badge = extra.badge.clone();
+            // ドラッグ源にする/しないで 2 回書かないための共通の中身。
+            let title_ui = |ui: &mut egui::Ui| {
+                ui.scope(|ui| {
+                    ui.set_min_width(title_width);
+                    ui.set_max_width(title_width);
+                    ui.set_min_height(HEADER_H - 6.0);
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(kind.title())
+                                .strong()
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                        if let Some(badge) = &badge {
+                            widgets::count_badge(ui, badge);
+                        }
+                    });
+                })
+                .response
+                .rect
+            };
+            if !interactive {
+                // モーダル中: 見た目だけ(ドラッグ源にも押しボタンにも
+                // しない。ドラッグ量も取らないのでウィンドウも動かない)。
+                let rect = title_ui(ui);
+                let _ = ui.interact(rect, drag_id, egui::Sense::hover());
+            } else {
+                let drag_response = if floating {
+                    let rect = title_ui(ui);
+                    let response = ui.interact(rect, drag_id, egui::Sense::click_and_drag());
+                    response.dnd_set_drag_payload(kind);
+                    out.drag_delta = response.drag_delta();
+                    response
+                } else {
+                    ui.dnd_drag_source(drag_id, kind, |ui| {
+                        title_ui(ui);
                     })
                     .response
-                    .rect
+                    // クリック(=右クリックメニュー)も受けられるようにする。
+                    .interact(egui::Sense::click())
                 };
-                if !interactive {
-                    // モーダル中: 見た目だけ(ドラッグ源にも押しボタンにも
-                    // しない。ドラッグ量も取らないのでウィンドウも動かない)。
-                    let rect = title_ui(ui);
-                    let _ = ui.interact(rect, drag_id, egui::Sense::hover());
-                } else {
-                    let drag_response = if floating {
-                        let rect = title_ui(ui);
-                        let response = ui.interact(rect, drag_id, egui::Sense::click_and_drag());
-                        response.dnd_set_drag_payload(kind);
-                        out.drag_delta = response.drag_delta();
-                        response
-                    } else {
-                        ui.dnd_drag_source(drag_id, kind, |ui| {
-                            title_ui(ui);
-                        })
-                        .response
-                        // クリック(=右クリックメニュー)も受けられるようにする。
-                        .interact(egui::Sense::click())
-                    };
-                    let drag_response = drag_response
-                        .on_hover_cursor(egui::CursorIcon::Grab)
-                        .on_hover_text("ドラッグで移動(ドックの外へ出すとフローティング)");
-                    drag_response.context_menu(|ui| placement_menu(ui, placement, &mut out.mv));
-                }
+                let drag_response = drag_response
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text("ドラッグで移動(ドックの外へ出すとフローティング)");
+                drag_response.context_menu(|ui| placement_menu(ui, placement, &mut out.mv));
+            }
 
-                // -- 「▾」メニュー(ドラッグ源の外) -------------------------
-                let (menu_rect, _) = ui
-                    .allocate_exact_size(egui::Vec2::splat(HEADER_MENU_SIZE), egui::Sense::hover());
-                let menu_button = ui.interact(
-                    menu_rect,
-                    egui::Id::new(("darask_panel_menu", kind.tag())),
-                    click_sense,
-                );
-                let menu_button = if interactive {
-                    menu_button.on_hover_text("パネルの配置")
+            // -- 「+ 追加」(レイヤーパネルのみ。ドラッグ源の外) ------------
+            if let Some(enabled) = extra.add_layer {
+                if add_layer_button(ui, enabled && interactive) {
+                    out.add_layer = true;
+                }
+            }
+
+            // -- 「…」メニュー(ドラッグ源の外) ---------------------------
+            let (menu_rect, _) =
+                ui.allocate_exact_size(egui::Vec2::splat(HEADER_MENU_SIZE), egui::Sense::hover());
+            let menu_button = ui.interact(
+                menu_rect,
+                egui::Id::new(("darask_panel_menu", kind.tag())),
+                click_sense,
+            );
+            let menu_button = if interactive {
+                menu_button.on_hover_text("パネルの配置")
+            } else {
+                menu_button
+            };
+            if ui.is_rect_visible(menu_rect) {
+                let color = if menu_button.hovered() {
+                    ui.painter().rect_filled(menu_rect, 5.0, theme::BG_HOVER);
+                    egui::Color32::WHITE
                 } else {
-                    menu_button
+                    theme::TEXT_FAINT
                 };
-                if ui.is_rect_visible(menu_rect) {
-                    let color = if menu_button.hovered() {
-                        ui.visuals().widgets.hovered.fg_stroke.color
-                    } else {
-                        ui.visuals().widgets.active.fg_stroke.color
-                    };
-                    // 「▾」は環境のフォントに無いことがあるので自前で描く
-                    // (`ui/icons.rs` と同じ方針: 記号はベクター描画)。
-                    paint_collapse_arrow(ui.painter(), menu_rect, false, color);
-                }
-                if interactive {
-                    egui::Popup::menu(&menu_button)
-                        .show(|ui| placement_menu(ui, placement, &mut out.mv));
-                }
-            });
-        });
+                icons::paint_more_icon(ui.painter(), menu_rect.shrink(5.0), color);
+            }
+            if interactive {
+                egui::Popup::menu(&menu_button)
+                    .show(|ui| placement_menu(ui, placement, &mut out.mv));
+            }
+        },
+    );
     out
+}
+
+/// 見出しの「+ 追加」(アクセントの淡色ボタン)。押されたら `true`。
+fn add_layer_button(ui: &mut egui::Ui, enabled: bool) -> bool {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(52.0, 24.0), sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "新規レイヤー")
+    });
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let (fill, fg) = if !enabled {
+            (theme::BG_WIDGET, theme::TEXT_DISABLED)
+        } else if response.hovered() {
+            (theme::ACCENT_LINE, egui::Color32::WHITE)
+        } else {
+            (theme::ACCENT_SOFT, theme::ACCENT)
+        };
+        painter.rect_filled(rect, 6.0, fill);
+        icons::paint_plus_icon(
+            painter,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 13.0, rect.center().y),
+                egui::vec2(12.0, 12.0),
+            ),
+            fg,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 22.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "追加",
+            egui::FontId::proportional(11.5),
+            fg,
+        );
+    }
+    let shortcut = crate::keymap::label_for(crate::keymap::Action::LayerAdd);
+    response
+        .on_hover_text(format!("新規レイヤー ({shortcut})"))
+        .clicked()
 }
 
 /// 「右にドック / 左にドック / フローティング化」(SPEC §58)。
@@ -557,35 +809,6 @@ fn placement_menu(ui: &mut egui::Ui, placement: PanelPlacement, mv: &mut Option<
             ui.close();
         }
     }
-}
-
-/// 折りたたみ矢印(閉=右向き / 開=下向き)。egui の
-/// `CollapsingHeader` と同じ意匠を自前で描く。
-fn paint_collapse_arrow(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    collapsed: bool,
-    color: egui::Color32,
-) {
-    let r = rect.shrink(rect.width() * 0.3);
-    let points = if collapsed {
-        vec![
-            r.left_top(),
-            r.left_bottom(),
-            egui::pos2(r.right(), r.center().y),
-        ]
-    } else {
-        vec![
-            r.left_top(),
-            r.right_top(),
-            egui::pos2(r.center().x, r.bottom()),
-        ]
-    };
-    painter.add(egui::Shape::convex_polygon(
-        points,
-        color,
-        egui::Stroke::NONE,
-    ));
 }
 
 /// `egui::Id`・`ScrollArea` の salt に使う左右の識別子。
@@ -869,7 +1092,12 @@ mod tests {
         let ctx = egui::Context::default();
         let mut layout = PanelLayout::default();
         let mut state = Harness::new();
-        frame(&ctx, &mut layout, &mut state, Vec::new(), None);
+        // v13 §60: レイヤーの高さ割り当ては前フレームの実測を使うので、
+        // 2 フレーム目で配置が確定する(アプリは 1 回だけ再描画を予約する)。
+        // 確定した配置の当たり判定を読むため、もう 1 フレーム描いておく。
+        for _ in 0..3 {
+            frame(&ctx, &mut layout, &mut state, Vec::new(), None);
+        }
 
         let from = rect_of(&ctx, ("darask_panel_header", "history")).center();
         // 中央(キャンバス)へドロップ。
